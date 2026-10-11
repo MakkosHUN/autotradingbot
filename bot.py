@@ -1,18 +1,16 @@
 import alpaca_trade_api as tradeapi
 from textblob import TextBlob
-import os
 
-# 1. Connect using hidden GitHub Secrets
-API_KEY = os.environ.get('PKWYV456U5OTMCW3IY3XIIXVT6')
-SECRET_KEY = os.environ.get('AsFsMAeisVkLoxSKJCMnXAPGWkEfGGwpygc9kJjEgUkG')
+# Alpaca automatically finds APCA_API_KEY_ID and APCA_API_SECRET_KEY in the environment
 BASE_URL = 'https://paper-api.alpaca.markets'
+api = tradeapi.REST(base_url=BASE_URL, api_version='v2')
 
-api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
-
-# 2. Configuration & Target Asset
+# Configuration & Target Asset
 SYMBOL = 'AAPL'
 TRADE_QTY = 1
 BULLISH_THRESHOLD = 0.10   
+
+# ... (the rest of your bot code remains exactly the same below here) ...
 
 print(f"🤖 Auto-Trading Bot initialized for: {SYMBOL}")
 print("=" * 55)

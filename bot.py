@@ -6,19 +6,22 @@ import time
 BASE_URL = 'https://paper-api.alpaca.markets'
 api = tradeapi.REST(base_url=BASE_URL, api_version='v2')
 
-# Define your portfolio watchlist
 SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA']
 TRADE_QTY = 1
 BULLISH_THRESHOLD = 0.10
 BEARISH_THRESHOLD = -0.10
 
-print("🤖 Auto-Trading Bot initialized for Portfolio Watchlist")
+# 2. Risk Management Rules
+PROFIT_TARGET_PERCENT = 1.15  # Automatically sell and lock in profit if it goes up 15%
+STOP_LOSS_PERCENT = 0.95      # Automatically sell and cut losses if it drops 5%
+
+print("🤖 Auto-Trading Bot initialized with Risk Management")
 print("=" * 55)
 
 for symbol in SYMBOLS:
     print(f"\n➤ Analyzing {symbol}...")
     
-    # 2. Check if we already own the stock
+    # 3. Check portfolio
     try:
         position = api.get_position(symbol)
         we_own_stock = True
@@ -27,8 +30,7 @@ for symbol in SYMBOLS:
         we_own_stock = False
         print(f"💼 PORTFOLIO: We do not own {symbol}.")
 
-    # 3. Fetch news and calculate sentiment
-    print(f"📡 Fetching live news articles for {symbol}...")
+    # 4. Fetch news
     news_items = api.get_news(symbol, limit=5)
 
     if not news_items:
@@ -46,17 +48,32 @@ for symbol in SYMBOLS:
         avg_sentiment = total_polarity / valid_articles
         print(f"📊 Aggregated Market Sentiment: {avg_sentiment:+.3f}")
 
-        # 4. Buy & Sell Logic
+        # 5. Buy & Sell Logic with Bracket Orders
         if avg_sentiment >= BULLISH_THRESHOLD and not we_own_stock:
-            print(f"🟢 Signal: BULLISH -> BUYING {symbol}")
-            api.submit_order(symbol=symbol, qty=TRADE_QTY, side='buy', type='market', time_in_force='gtc')
+            print(f"🟢 Signal: BULLISH -> BUYING {symbol} with Bracket Order")
+            
+            # Fetch the live price of the stock right now
+            latest_trade = api.get_latest_trade(symbol)
+            current_price = latest_trade.price
+            
+            # Calculate the exact dollar amounts for our safety nets
+            target_price = round(current_price * PROFIT_TARGET_PERCENT, 2)
+            stop_price = round(current_price * STOP_LOSS_PERCENT, 2)
+            
+            print(f"🛡️ Safety Nets: Take-Profit at ${target_price} \vert{} Stop-Loss at${stop_price}")
+            
+            # Submit the master order with attached safety nets
+            api.submit_order(
+                symbol=symbol,
+                qty=TRADE_QTY,
+                side='buy',
+                type='market',
+                time_in_force='gtc',
+                order_class='bracket',
+                take_profit={'limit_price': target_price},
+                stop_loss={'stop_price': stop_price}
+            )
             
         elif avg_sentiment <= BEARISH_THRESHOLD and we_own_stock:
             print(f"🔴 Signal: BEARISH -> SELLING {symbol} TO CASH OUT")
             api.close_position(symbol)
-            
-        else:
-            print(f"🛡️ HOLD: No strong signal to change our position on {symbol}.")
-            
-    # 5. Respect API Rate Limits (Critical for the free plan)
-    time.sleep(2)

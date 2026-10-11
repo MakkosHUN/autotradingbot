@@ -1,28 +1,34 @@
 import alpaca_trade_api as tradeapi
 from textblob import TextBlob
 
-# Alpaca automatically finds APCA_API_KEY_ID and APCA_API_SECRET_KEY in the environment
+# 1. Setup connection
 BASE_URL = 'https://paper-api.alpaca.markets'
 api = tradeapi.REST(base_url=BASE_URL, api_version='v2')
 
-# Configuration & Target Asset
 SYMBOL = 'AAPL'
 TRADE_QTY = 1
-BULLISH_THRESHOLD = 0.10   
-
-# ... (the rest of your bot code remains exactly the same below here) ...
+BULLISH_THRESHOLD = 0.10
+BEARISH_THRESHOLD = -0.10
 
 print(f"🤖 Auto-Trading Bot initialized for: {SYMBOL}")
 print("=" * 55)
 
-# 3. Pipeline: Fetch the latest market news
+# 2. Check if we already own the stock
+try:
+    position = api.get_position(SYMBOL)
+    we_own_stock = True
+    print(f"💼 PORTFOLIO: We currently own {position.qty} share(s) of {SYMBOL}.")
+except:
+    we_own_stock = False
+    print(f"💼 PORTFOLIO: We do not currently own any shares of {SYMBOL}.")
+
+# 3. Fetch news and calculate sentiment
 print(f"📡 Fetching live news articles for {SYMBOL}...")
 news_items = api.get_news(SYMBOL, limit=5)
 
 if not news_items:
-    print("No recent headlines found. Halting execution.")
+    print("No recent headlines found. Halting.")
 else:
-    # 4. AI Engine: Quantify sentiment across all articles
     total_polarity = 0
     valid_articles = 0
 
@@ -37,15 +43,16 @@ else:
     print("=" * 55)
     print(f"📊 Aggregated Market Sentiment: {avg_sentiment:+.3f}")
 
-    # 5. Decision & Execution Logic
-    if avg_sentiment >= BULLISH_THRESHOLD:
-        print(f"🟢 Signal: BULLISH")
-        try:
-            order = api.submit_order(
-                symbol=SYMBOL, qty=TRADE_QTY, side='buy', type='market', time_in_force='gtc'
-            )
-            print(f"✅ Order submitted successfully! (Order ID: {order.id})")
-        except Exception as err:
-            print(f"❌ Execution error: {err}")
+    # 4. Buy & Sell Logic
+    if avg_sentiment >= BULLISH_THRESHOLD and not we_own_stock:
+        print("🟢 Signal: BULLISH & We don't own it -> BUYING")
+        api.submit_order(symbol=SYMBOL, qty=TRADE_QTY, side='buy', type='market', time_in_force='gtc')
+        print("✅ Buy order submitted!")
+        
+    elif avg_sentiment <= BEARISH_THRESHOLD and we_own_stock:
+        print("🔴 Signal: BEARISH & We own it -> SELLING TO CASH OUT")
+        api.close_position(SYMBOL)
+        print("✅ Sell order submitted! Position closed.")
+        
     else:
-        print("🛡️ Condition not met. Preserving capital, no trade placed.")
+        print("🛡️ HOLD: No strong signal to change our current position.")

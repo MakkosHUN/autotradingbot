@@ -2,7 +2,7 @@ name: Trading Bot Scheduler
 
 on:
   workflow_dispatch:
- schedule:
+  schedule:
     - cron: '30 13,19 * * 1-5'
 
 jobs:

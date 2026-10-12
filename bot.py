@@ -33,7 +33,7 @@ except Exception as e:
     print(f"Failed to connect to Google Sheets: {e}")
 
 # 3. Strategy Configuration
-SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA']
+SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
 TRADE_QTY = 1
 BULLISH_THRESHOLD = 0.10
 BEARISH_THRESHOLD = -0.10

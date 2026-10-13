@@ -34,7 +34,7 @@ except Exception as e:
 
 # 3. Strategy Configuration
 SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
-TRADE_QTY = 1
+# TRADE_QTY = 1  <-- Removed to allow dynamic sizing below
 BULLISH_THRESHOLD = 0.10
 BEARISH_THRESHOLD = -0.10
 PROFIT_TARGET_PERCENT = 1.05
@@ -84,6 +84,15 @@ for symbol in SYMBOLS:
 
     if avg_sentiment >= BULLISH_THRESHOLD and not we_own_stock:
         ai_decision = "BULLISH"
+        
+        # --- DYNAMIC POSITION SIZING LOGIC ---
+        if avg_sentiment >= 0.25:
+            dynamic_qty = 5  # Massive news, high conviction
+        elif avg_sentiment >= 0.15:
+            dynamic_qty = 3  # Strong news, medium conviction
+        else:
+            dynamic_qty = 1  # Standard news, low conviction
+            
         try:
             latest_trade = api.get_latest_trade(symbol)
             current_price = latest_trade.price
@@ -92,7 +101,7 @@ for symbol in SYMBOLS:
 
             api.submit_order(
                 symbol=symbol,
-                qty=TRADE_QTY,
+                qty=dynamic_qty,
                 side='buy',
                 type='market',
                 time_in_force='gtc',
@@ -100,9 +109,9 @@ for symbol in SYMBOLS:
                 take_profit={'limit_price': target_price},
                 stop_loss={'stop_price': stop_price}
             )
-            executed_action = f"Bought {TRADE_QTY} @ ~${current_price:.2f}"
+            executed_action = f"Bought {dynamic_qty} @ ~${current_price:.2f}"
             portfolio_impact = f"Entered position (Target: ${target_price}, Stop: ${stop_price})"
-            print(f"Buy bracket order submitted for {symbol}.")
+            print(f"Bullish signal ({sentiment_display}). AI selected {dynamic_qty} shares. Bracket order submitted for {symbol}.")
         except Exception as err:
             executed_action = f"Buy Failed: {err}"
             print(f"Error submitting buy order: {err}")

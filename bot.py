@@ -385,5 +385,20 @@ def run_bot():
     if summary_alerts:
         send_discord_alert("📊 **Bot v2.0 Scan Alert:**\n" + "\n".join(summary_alerts))
 
+    # End-of-Day Portfolio Summary for Discord
+    try:
+        portfolio_summary = (
+            f"🌙 **End-of-Day Portfolio Summary**\n"
+            f"💰 **Total Equity:** `${equity:,.2f}`\n"
+            f"📈 **Active Positions:** {len(positions)} open assets\n"
+        )
+        for sym, p in positions.items():
+            unrealized = float(p.unrealized_pl)
+            portfolio_summary += f"• **{sym}**: {p.qty} shares | P/L: `${unrealized:,.2f}`\n"
+        
+        send_discord_alert(portfolio_summary)
+    except Exception as e:
+        print(f"Summary alert error: {e}")
+
 if __name__ == "__main__":
     run_bot()

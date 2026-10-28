@@ -2,8 +2,6 @@ name: Trading Bot Scheduler
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '34 13,19 * * 1-5'
 
 jobs:
   run-bot:
@@ -17,14 +15,21 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Cache FinBERT Model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-finbert-cache-v2
+
       - name: Install Dependencies
         run: |
-          pip install alpaca-trade-api textblob gspread google-auth
-          python -m textblob.download_corpora
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
+          pip install alpaca-trade-api gspread google-auth yfinance pandas pandas-ta requests
 
       - name: Execute the Bot
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python bot.py

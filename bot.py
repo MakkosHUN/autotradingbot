@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import alpaca_trade_api as tradeapi
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 from transformers import pipeline
@@ -143,7 +143,7 @@ def check_macro_regime():
     return True, "Macro Normal"
 
 def get_technicals_and_atr(ticker):
-    """Upgrades #4, #5, #6, #7: 200-SMA, 20-EMA, 14-RSI, and 14-Day ATR"""
+    """Upgrades #4, #5, #6, #7: Native calculation of 200-SMA, 20-EMA, 14-RSI, and 14-Day ATR"""
     df = yf.Ticker(ticker).history(period="1y")
     if df.empty or len(df) < 200:
         return None
@@ -151,10 +151,23 @@ def get_technicals_and_atr(ticker):
     current_price = float(close.iloc[-1])
     sma200 = float(close.rolling(200).mean().iloc[-1])
     ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
-    rsi_series = ta.rsi(close, length=14)
-    rsi14 = float(rsi_series.iloc[-1]) if rsi_series is not None else 50.0
-    atr_series = ta.atr(df['High'], df['Low'], close, length=14)
-    atr14 = float(atr_series.iloc[-1]) if atr_series is not None else (current_price * 0.02)
+    
+    # Native RSI-14 Calculation
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi_series = 100 - (100 / (1 + rs))
+    rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
+
+    # Native ATR-14 Calculation
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - close.shift())
+    low_close = np.abs(df['Low'] - close.shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    atr_series = true_range.rolling(14).mean()
+    atr14 = float(atr_series.iloc[-1]) if not atr_series.empty and not pd.isna(atr_series.iloc[-1]) else (current_price * 0.02)
 
     return {
         "price": current_price,
@@ -282,7 +295,6 @@ def run_bot():
             else:
                 # Upgrade #9 / #23: The Break-Even Stop Ratchet (+2.5% Profit Shield)
                 if unrealized_pct >= 0.025:
-                    # Check if current stop order is still below entry price
                     ticker_stops = [o for o in open_orders if o.symbol == ticker and o.side == 'sell' and o.type == 'stop']
                     if ticker_stops:
                         stop_order = ticker_stops[0]
@@ -321,19 +333,16 @@ def run_bot():
                 elif tech['rsi14'] > 70.0:
                     decision = f"BULLISH (Blocked: RSI Overbought {tech['rsi14']:.1f})"
                 else:
-                    # All 23 Quantitative Shields Passed!
-                    # Upgrade #10: Risk-Parity Dollar Sizing (1%, 2%, or 3% of Equity)
                     if score >= 0.25:
-                        target_dollars = equity * 0.025  # High conviction (~$2,500)
+                        target_dollars = equity * 0.025
                     elif score >= 0.15:
-                        target_dollars = equity * 0.015  # Medium conviction (~$1,500)
+                        target_dollars = equity * 0.015
                     else:
-                        target_dollars = equity * 0.008  # Standard conviction (~$800)
+                        target_dollars = equity * 0.008
 
                     price = tech['price']
                     qty_to_buy = max(1, int(round(target_dollars / price)))
 
-                    # Upgrade #7: 14-Day ATR Dynamic Volatility Brackets
                     atr = max(tech['atr14'], price * 0.01)
                     stop_price = round(price - (1.5 * atr), 2)
                     target_price = round(price + (3.5 * atr), 2)
@@ -361,7 +370,6 @@ def run_bot():
             else:
                 decision = "HOLD"
 
-        # Log row to Google Sheet (matches your exact 6-column structure)
         row = [
             now_str,
             ticker,

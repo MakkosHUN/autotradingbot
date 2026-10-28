@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import alpaca_trade_api as tradeapi
 import yfinance as yf
 import pandas as pd
@@ -385,20 +386,36 @@ def run_bot():
     if summary_alerts:
         send_discord_alert("📊 **Bot v2.0 Scan Alert:**\n" + "\n".join(summary_alerts))
 
-    # End-of-Day Portfolio Summary for Discord
+    # Time-Aware, Highly Detailed Portfolio Report (Mid-Day vs End-of-Day)
     try:
-        portfolio_summary = (
-            f"🌙 **End-of-Day Portfolio Summary**\n"
-            f"💰 **Total Equity:** `${equity:,.2f}`\n"
-            f"📈 **Active Positions:** {len(positions)} open assets\n"
-        )
-        for sym, p in positions.items():
-            unrealized = float(p.unrealized_pl)
-            portfolio_summary += f"• **{sym}**: {p.qty} shares | P/L: `${unrealized:,.2f}`\n"
+        ny_time = datetime.now(ZoneInfo("America/New_York"))
+        is_midday = ny_time.hour < 12
         
-        send_discord_alert(portfolio_summary)
+        report_title = "☀️ **Mid-Day Market Briefing & Portfolio Status**" if is_midday else "🌙 **End-of-Day Portfolio Closeout Recap**"
+        cash = float(account.cash) if hasattr(account, 'cash') else 0.0
+        total_unrealized_pl = sum(float(p.unrealized_pl) for p in positions.values())
+        total_unrealized_pct = (total_unrealized_pl / (equity - total_unrealized_pl)) * 100 if (equity - total_unrealized_pl) > 0 else 0.0
+
+        detailed_report = (
+            f"{report_title}\n"
+            f"🕒 **Time (NY):** {ny_time.strftime('%Y-%m-%d %I:%M %p')}\n"
+            f"💰 **Total Equity:** `${equity:,.2f}` | 💵 **Cash:** `${cash:,.2f}`\n"
+            f"📊 **Open P/L:** `${total_unrealized_pl:+,.2f}` (`{total_unrealized_pct:+.2f}%`)\n"
+            f"📈 **Active Positions ({len(positions)}):**\n"
+        )
+        
+        for sym, p in positions.items():
+            qty = float(p.qty)
+            entry = float(p.avg_entry_price)
+            curr = float(p.current_price)
+            pl_dollar = float(p.unrealized_pl)
+            pl_pct = float(p.unrealized_plpc) * 100 if hasattr(p, 'unrealized_plpc') and p.unrealized_plpc else ((curr - entry) / entry) * 100
+            
+            detailed_report += f"• **{sym}** ({int(qty)} sh): Entry `${entry:.2f}` | Now `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`)\n"
+        
+        send_discord_alert(detailed_report)
     except Exception as e:
-        print(f"Summary alert error: {e}")
+        print(f"Detailed portfolio report error: {e}")
 
 if __name__ == "__main__":
     run_bot()

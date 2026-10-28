@@ -24,7 +24,7 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
-          pip install alpaca-trade-api gspread google-auth yfinance pandas pandas-ta requests
+          pip install alpaca-trade-api gspread google-auth yfinance pandas requests
 
       - name: Execute the Bot
         env:

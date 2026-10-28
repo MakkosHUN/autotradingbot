@@ -237,7 +237,7 @@ def run_bot():
 
     account = api.get_account()
     equity = float(account.equity)
-    daytrade_count = int(account.daytrade_count)
+    daytrade_count = int(getattr(account, 'daytrade_count', 0) or 0)
     pdt_restricted = daytrade_count >= 3  # Upgrade #15: Hard-Coded PDT Shield
 
     positions = {p.symbol: p for p in api.list_positions()}

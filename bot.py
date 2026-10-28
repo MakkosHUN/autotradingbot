@@ -1,155 +1,51 @@
-import os
-import json
-import time
-from datetime import datetime, timezone
-import alpaca_trade_api as tradeapi
-from textblob import TextBlob
-import gspread
-from google.oauth2.service_account import Credentials
+from transformers import pipeline
+import torch
 
-# 1. Broker Setup
-BASE_URL = 'https://paper-api.alpaca.markets'
-api = tradeapi.REST(base_url=BASE_URL, api_version='v2')
+# 1. Load FinBERT once when the script starts (runs 100% free on GitHub CPU)
+print("Loading ProsusAI/finbert financial AI model...")
+finbert = pipeline(
+    "sentiment-analysis",
+    model="ProsusAI/finbert",
+    tokenizer="ProsusAI/finbert",
+    top_k=None  # Returns all 3 probabilities: positive, negative, neutral
+)
 
-# 2. Google Sheets Setup
-SHEET_TITLE = "Auto-Trading Bot Log"
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+def get_finbert_sentiment(headlines):
+    """
+    Analyzes a list of financial headlines using ProsusAI/finbert.
+    Returns a net sentiment score between -1.00 and +1.00.
+    """
+    if not headlines:
+        return 0.0
 
-sheet = None
-try:
-    raw_creds = os.environ.get("GOOGLE_CREDENTIALS")
-    if raw_creds:
-        creds_dict = json.loads(raw_creds)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        sheet = client.open(SHEET_TITLE).sheet1
-        print("Connected to Google Sheets successfully.")
-    else:
-        print("GOOGLE_CREDENTIALS secret not found. Logging to Sheets will be skipped.")
-except Exception as e:
-    print(f"Failed to connect to Google Sheets: {e}")
+    # Truncate headlines to 512 characters max and run batch inference
+    clean_headlines = [h[:512] for h in headlines if h and len(h.strip()) > 10]
+    if not clean_headlines:
+        return 0.0
 
-# 3. Strategy Configuration
-SYMBOLS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
-# TRADE_QTY = 1  <-- Removed to allow dynamic sizing below
-BULLISH_THRESHOLD = 0.10
-BEARISH_THRESHOLD = -0.10
-PROFIT_TARGET_PERCENT = 1.05
-STOP_LOSS_PERCENT = 0.98
-
-print("Auto-Trading Bot initialized with Google Sheets Logging")
-print("=" * 60)
-
-for symbol in SYMBOLS:
-    print(f"\nAnalyzing {symbol}...")
+    results = finbert(clean_headlines)
     
-    # Portfolio Check
-    try:
-        position = api.get_position(symbol)
-        we_own_stock = True
-        current_holding = f"{position.qty} shares"
-    except Exception:
-        we_own_stock = False
-        current_holding = "0 shares"
-
-    # News & Sentiment
-    news_items = api.get_news(symbol, limit=5)
-    if not news_items:
-        print(f"No recent headlines found for {symbol}. Skipping.")
-        continue
-
-    total_polarity = 0
-    valid_articles = 0
-    for article in news_items:
-        content = article.summary if article.summary else article.headline
-        score = TextBlob(content).sentiment.polarity
-        total_polarity += score
-        valid_articles += 1
-
-    avg_sentiment = total_polarity / valid_articles if valid_articles else 0.0
-    sentiment_display = f"{avg_sentiment:+.3f}"
-    print(f"Market Sentiment: {sentiment_display}")
-
-    # Decision & Execution
-    now = datetime.now(timezone.utc)
-    date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M:%S UTC")
-
-    ai_decision = "HOLD"
-    executed_action = "None"
-    portfolio_impact = f"Holding {current_holding}"
-
-    if avg_sentiment >= BULLISH_THRESHOLD and not we_own_stock:
-        ai_decision = "BULLISH"
+    weighted_scores = []
+    for res in results:
+        # Convert list of dicts [{'label': 'positive', 'score': 0.85}, ...] into a clean dict
+        scores = {item['label']: item['score'] for item in res}
+        pos = scores.get('positive', 0.0)
+        neg = scores.get('negative', 0.0)
+        neu = scores.get('neutral', 0.0)
         
-        # --- DYNAMIC POSITION SIZING LOGIC ---
-        if avg_sentiment >= 0.25:
-            dynamic_qty = 5  # Massive news, high conviction
-        elif avg_sentiment >= 0.15:
-            dynamic_qty = 3  # Strong news, medium conviction
+        # Net directional score (-1.0 to +1.0)
+        net_score = pos - neg
+        
+        # Filter out pure fluff/neutral headlines so they don't dilute real breaking news
+        if neu < 0.80:
+            weighted_scores.append(net_score)
         else:
-            dynamic_qty = 1  # Standard news, low conviction
-            
-        try:
-            latest_trade = api.get_latest_trade(symbol)
-            current_price = latest_trade.price
-            target_price = round(current_price * PROFIT_TARGET_PERCENT, 2)
-            stop_price = round(current_price * STOP_LOSS_PERCENT, 2)
+            # Give very low weight (20%) to purely neutral announcements
+            weighted_scores.append(net_score * 0.2)
 
-            api.submit_order(
-                symbol=symbol,
-                qty=dynamic_qty,
-                side='buy',
-                type='market',
-                time_in_force='gtc',
-                order_class='bracket',
-                take_profit={'limit_price': target_price},
-                stop_loss={'stop_price': stop_price}
-            )
-            executed_action = f"Bought {dynamic_qty} @ ~${current_price:.2f}"
-            portfolio_impact = f"Entered position (Target: ${target_price}, Stop: ${stop_price})"
-            print(f"Bullish signal ({sentiment_display}). AI selected {dynamic_qty} shares. Bracket order submitted for {symbol}.")
-        except Exception as err:
-            executed_action = f"Buy Failed: {err}"
-            print(f"Error submitting buy order: {err}")
+    if not weighted_scores:
+        return 0.0
 
-    elif avg_sentiment <= BEARISH_THRESHOLD and we_own_stock:
-        ai_decision = "BEARISH"
-        try:
-            api.close_position(symbol)
-            executed_action = f"Closed position ({current_holding})"
-            portfolio_impact = "Liquidated to cash"
-            print(f"Closed position for {symbol}.")
-        except Exception as err:
-            executed_action = f"Sell Failed: {err}"
-            print(f"Error submitting sell order: {err}")
-    else:
-        if avg_sentiment >= BULLISH_THRESHOLD and we_own_stock:
-            ai_decision = "BULLISH (Already Owned)"
-        elif avg_sentiment <= BEARISH_THRESHOLD and not we_own_stock:
-            ai_decision = "BEARISH (Not Owned)"
-        print(f"Action: Hold. No state change required.")
-
-    # Write Entry to Google Sheet
-    if sheet:
-        try:
-            row_data = [
-                date_str,
-                time_str,
-                symbol,
-                sentiment_display,
-                ai_decision,
-                executed_action,
-                portfolio_impact
-            ]
-            sheet.append_row(row_data)
-            print(f"Logged {symbol} record to Google Sheet.")
-        except Exception as log_err:
-            print(f"Failed to append row to Google Sheet: {log_err}")
-
-    time.sleep(2)
-
-print("\nScan completed.")
+    # Calculate final average score across all fresh headlines
+    final_score = sum(weighted_scores) / len(weighted_scores)
+    return round(final_score, 3)

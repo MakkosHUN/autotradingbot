@@ -1,4 +1,5 @@
 import json
+import re
 import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -123,6 +124,31 @@ if not API_KEY or not API_SECRET:
     st.stop()
 
 @st.cache_resource
+def init_alpaca():
+    return tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+
+def repair_pem_key(pk_str):
+    """Automatically repairs newlines and missing Base64 '=' padding in PEM keys."""
+    pk_str = pk_str.replace("\\n", "\n").strip()
+    header = "-----BEGIN PRIVATE KEY-----"
+    footer = "-----END PRIVATE KEY-----"
+    if header in pk_str and footer in pk_str:
+        body = pk_str.split(header)[1].split(footer)[0]
+        # Remove all whitespace and invalid characters from base64 body
+        clean_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', body)
+        # Strip existing '=' and recalculate exact Base64 padding
+        clean_b64 = clean_b64.rstrip('=')
+        rem = len(clean_b64) % 4
+        if rem == 2:
+            clean_b64 += "=="
+        elif rem == 3:
+            clean_b64 += "="
+        # Re-chunk into standard 64-character PEM lines
+        lines = [clean_b64[i:i+64] for i in range(0, len(clean_b64), 64)]
+        return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
+    return pk_str
+
+@st.cache_resource
 def init_gsheets():
     if not GOOGLE_CREDS_RAW:
         return None
@@ -133,8 +159,7 @@ def init_gsheets():
             creds_dict = dict(GOOGLE_CREDS_RAW)
 
         if "private_key" in creds_dict:
-            pk = creds_dict["private_key"].replace("\\n", "\n")
-            creds_dict["private_key"] = pk
+            creds_dict["private_key"] = repair_pem_key(creds_dict["private_key"])
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -151,7 +176,7 @@ api = init_alpaca()
 spreadsheet = init_gsheets()
 
 # =====================================================================
-# 3. LIVE TELEMETRY FETCHERS
+# 3. LIVE TELEMETRY FETCHERS (UNPACKED TO AVOID RECURSION)
 # =====================================================================
 @st.cache_data(ttl=30)
 def fetch_alpaca_state():

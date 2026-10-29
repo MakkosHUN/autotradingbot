@@ -123,10 +123,6 @@ if not API_KEY or not API_SECRET:
     st.stop()
 
 @st.cache_resource
-def init_alpaca():
-    return tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
-
-@st.cache_resource
 def init_gsheets():
     if not GOOGLE_CREDS_RAW:
         return None
@@ -136,9 +132,9 @@ def init_gsheets():
         else:
             creds_dict = dict(GOOGLE_CREDS_RAW)
 
-        # Auto-heal private_key newlines to prevent MalformedFraming
         if "private_key" in creds_dict:
-            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            pk = creds_dict["private_key"].replace("\\n", "\n")
+            creds_dict["private_key"] = pk
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -148,7 +144,7 @@ def init_gsheets():
         gc = gspread.authorize(creds)
         return gc.open("Auto-Trading Bot Log")
     except Exception as e:
-        st.sidebar.error(f"Sheets Error: {e}")
+        st.sidebar.warning(f"Sheets status: {type(e).__name__} - {e}")
         return None
 
 api = init_alpaca()

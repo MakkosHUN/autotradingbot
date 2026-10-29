@@ -139,15 +139,15 @@ def init_gsheets():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
         return gc.open("Auto-Trading Bot Log")
-    except Exception as e:
-        st.sidebar.warning(f"Google Sheets note: {e}")
+    except Exception:
+        # Silently bypass sheet warnings to keep command center pristine
         return None
 
 api = init_alpaca()
 spreadsheet = init_gsheets()
 
 # =====================================================================
-# 3. LIVE TELEMETRY FETCHERS (UNPACKED TO AVOID RECURSION)
+# 3. LIVE TELEMETRY FETCHERS
 # =====================================================================
 @st.cache_data(ttl=30)
 def fetch_alpaca_state():

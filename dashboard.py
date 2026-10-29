@@ -131,7 +131,15 @@ def init_gsheets():
     if not GOOGLE_CREDS_RAW:
         return None
     try:
-        creds_dict = json.loads(GOOGLE_CREDS_RAW) if isinstance(GOOGLE_CREDS_RAW, str) else dict(GOOGLE_CREDS_RAW)
+        if isinstance(GOOGLE_CREDS_RAW, str):
+            creds_dict = json.loads(GOOGLE_CREDS_RAW, strict=False)
+        else:
+            creds_dict = dict(GOOGLE_CREDS_RAW)
+
+        # Auto-heal private_key newlines to prevent MalformedFraming
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
@@ -139,8 +147,8 @@ def init_gsheets():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
         return gc.open("Auto-Trading Bot Log")
-    except Exception:
-        # Silently bypass sheet warnings to keep command center pristine
+    except Exception as e:
+        st.sidebar.error(f"Sheets Error: {e}")
         return None
 
 api = init_alpaca()

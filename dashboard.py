@@ -134,24 +134,19 @@ def repair_pem_key(pk_str):
     footer = "-----END PRIVATE KEY-----"
     if header in pk_str and footer in pk_str:
         body = pk_str.split(header)[1].split(footer)[0]
-        # Remove all whitespace and invalid characters from base64 body
-        clean_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', body)
-        # Strip existing '=' and recalculate exact Base64 padding
-        clean_b64 = clean_b64.rstrip('=')
+        clean_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', body).rstrip('=')
         rem = len(clean_b64) % 4
         if rem == 2:
             clean_b64 += "=="
         elif rem == 3:
             clean_b64 += "="
-        # Re-chunk into standard 64-character PEM lines
         lines = [clean_b64[i:i+64] for i in range(0, len(clean_b64), 64)]
         return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
     return pk_str
 
-@st.cache_resource
-def init_gsheets():
+def connect_gsheets():
     if not GOOGLE_CREDS_RAW:
-        return None
+        return None, "GOOGLE_CREDENTIALS not found in Streamlit Secrets."
     try:
         if isinstance(GOOGLE_CREDS_RAW, str):
             creds_dict = json.loads(GOOGLE_CREDS_RAW, strict=False)
@@ -167,13 +162,13 @@ def init_gsheets():
         ]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
-        return gc.open("Auto-Trading Bot Log")
+        sh = gc.open("Auto-Trading Bot Log")
+        return sh, "Connected"
     except Exception as e:
-        st.sidebar.warning(f"Sheets status: {type(e).__name__} - {e}")
-        return None
+        return None, f"{type(e).__name__}: {e}"
 
 api = init_alpaca()
-spreadsheet = init_gsheets()
+spreadsheet, sheet_status = connect_gsheets()
 
 # =====================================================================
 # 3. LIVE TELEMETRY FETCHERS (UNPACKED TO AVOID RECURSION)
@@ -274,7 +269,17 @@ def fetch_sheet_logs():
     try:
         log_rows = spreadsheet.sheet1.get_all_values()
         if len(log_rows) > 1:
-            df_log = pd.DataFrame(log_rows[1:], columns=["Timestamp", "Ticker", "FinBERT Score", "Decision", "Action Taken", "Position Status"])
+            ncol = len(log_rows[0])
+            default_cols = ["Timestamp", "Ticker", "FinBERT Score", "Decision", "Action Taken", "Position Status"]
+            # Use header row if valid, otherwise map default column names dynamically
+            first_row = [str(c).strip() for c in log_rows[0]]
+            if "Ticker" in first_row or "Timestamp" in first_row:
+                cols = [c if c else f"Col_{i}" for i, c in enumerate(first_row)]
+                data_rows = log_rows[1:]
+            else:
+                cols = default_cols[:ncol] + [f"Extra_{i}" for i in range(max(0, ncol - len(default_cols)))]
+                data_rows = log_rows
+            df_log = pd.DataFrame(data_rows, columns=cols)
         else:
             df_log = pd.DataFrame()
     except Exception:
@@ -550,12 +555,14 @@ with tab3:
     st.subheader("🧠 Latest 12-Stock FinBERT Sentiment Radar")
     if not df_log.empty:
         latest_12 = df_log.tail(12).copy()
-        latest_12["Score_Num"] = pd.to_numeric(latest_12["FinBERT Score"], errors="coerce").fillna(0.0)
+        score_col = "FinBERT Score" if "FinBERT Score" in latest_12.columns else latest_12.columns[2]
+        ticker_col = "Ticker" if "Ticker" in latest_12.columns else latest_12.columns[1]
+        latest_12["Score_Num"] = pd.to_numeric(latest_12[score_col], errors="coerce").fillna(0.0)
 
         bar_colors = ["#00FFAA" if s >= 0.10 else ("#FF4B4B" if s <= -0.10 else "#64748B") for s in latest_12["Score_Num"]]
         fig_sent = go.Figure(go.Bar(
-            x=latest_12["Ticker"], y=latest_12["Score_Num"],
-            marker_color=bar_colors, text=latest_12["FinBERT Score"], textposition="outside"
+            x=latest_12[ticker_col], y=latest_12["Score_Num"],
+            marker_color=bar_colors, text=latest_12[score_col], textposition="outside"
         ))
         fig_sent.add_hline(y=0.10, line_dash="dash", line_color="#00FFAA", annotation_text="Buy Threshold (+0.10)")
         fig_sent.add_hline(y=-0.15, line_dash="dash", line_color="#FF4B4B", annotation_text="Bearish Exit (-0.15)")
@@ -577,7 +584,10 @@ with tab3:
             else:
                 st.info("No closed bracket exits logged yet.")
     else:
-        st.info("Connect `GOOGLE_CREDENTIALS` in Streamlit Secrets to view logs.")
+        if spreadsheet:
+            st.info("✅ Connected to Google Sheet `Auto-Trading Bot Log`, but it currently has 0 data rows. It will populate automatically on the next market-open scan!")
+        else:
+            st.warning(f"⚠️ Google Sheets Connection Status: `{sheet_status}`")
 
 with tab4:
     st.subheader("📜 Alpaca Order Book")

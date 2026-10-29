@@ -48,12 +48,25 @@ TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 
 # 2. HELPER FUNCTIONS (UPGRADES #1 TO #23)
 # =====================================================================
 def send_discord_alert(message):
-    """Upgrade #19: Optional Discord Mobile Push Notification"""
-    if DISCORD_WEBHOOK:
-        try:
+    """Upgrade #19: Discord Mobile Push Notification (auto-splits if > 1900 chars)"""
+    if not DISCORD_WEBHOOK:
+        return
+    try:
+        if len(message) <= 1950:
             requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=5)
-        except Exception as e:
-            print(f"Discord alert error: {e}")
+        else:
+            lines = message.split("\n")
+            chunk = ""
+            for line in lines:
+                if len(chunk) + len(line) + 1 > 1900:
+                    requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=5)
+                    chunk = line + "\n"
+                else:
+                    chunk += line + "\n"
+            if chunk:
+                requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=5)
+    except Exception as e:
+        print(f"Discord alert error: {e}")
 
 print("Loading ProsusAI/finbert financial AI model...")
 finbert = pipeline(
@@ -131,14 +144,17 @@ def check_macro_regime():
     try:
         spy = yf.Ticker("SPY").history(period="2d")
         vix = yf.Ticker("^VIX").history(period="2d")
+        spy_change = 0.0
+        vix_level = 0.0
         if len(spy) >= 2:
             spy_change = (spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]
             if spy_change <= -0.015:
-                return False, f"SPY down {spy_change*100:.2f}% intraday"
+                return False, f"SPY {spy_change*100:+.2f}% | VIX {vix_level:.1f} (PANIC BLOCK)"
         if not vix.empty:
-            vix_level = vix['Close'].iloc[-1]
+            vix_level = float(vix['Close'].iloc[-1])
             if vix_level > 28.0:
-                return False, f"VIX spike at {vix_level:.1f}"
+                return False, f"SPY {spy_change*100:+.2f}% | VIX {vix_level:.1f} (VIX BLOCK)"
+        return True, f"Normal (SPY {spy_change*100:+.2f}%, VIX {vix_level:.1f})"
     except Exception as e:
         print(f"Macro check warning: {e}")
     return True, "Macro Normal"
@@ -186,25 +202,43 @@ def was_stopped_out_last_24h(ticker, closed_orders):
     return False
 
 def has_upcoming_earnings_48h(ticker):
-    """Upgrade #16: 48-Hour Quarterly Earnings Blackout Shield"""
+    """Upgrade #16: 48-Hour Quarterly Earnings Blackout Shield (Handles dict & DataFrame)"""
     try:
         cal = yf.Ticker(ticker).calendar
+        now_date = datetime.now(timezone.utc).date()
         if isinstance(cal, dict) and 'Earnings Date' in cal:
-            dates = cal['Earnings Date']
-            now_date = datetime.now(timezone.utc).date()
-            for d in dates:
-                days_diff = abs((d - now_date).days)
-                if days_diff <= 2:
+            for d in cal['Earnings Date']:
+                if hasattr(d, 'date'):
+                    d = d.date()
+                if abs((d - now_date).days) <= 2:
+                    return True
+        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+            for val in cal.values.flatten():
+                if hasattr(val, 'date'):
+                    val = val.date()
+                if hasattr(val, 'year') and abs((val - now_date).days) <= 2:
                     return True
     except Exception:
         pass
     return False
 
+def get_all_orders_for_ticker(ticker, open_orders):
+    """Finds both top-level orders and nested bracket child legs for a ticker"""
+    matched = []
+    for o in open_orders:
+        if o.symbol == ticker:
+            matched.append(o)
+        if hasattr(o, 'legs') and o.legs:
+            for leg in o.legs:
+                if leg.symbol == ticker:
+                    matched.append(leg)
+    return matched
+
 def cancel_existing_orders_for_ticker(ticker, open_orders):
     """Upgrade #11: Bracket-Unlock Fix (Cancels open stop/limit legs before selling or updating)"""
     canceled = False
-    for o in open_orders:
-        if o.symbol == ticker:
+    for o in get_all_orders_for_ticker(ticker, open_orders):
+        if o.status in ['new', 'held', 'partially_filled', 'accepted']:
             try:
                 api.cancel_order(o.id)
                 canceled = True
@@ -214,17 +248,26 @@ def cancel_existing_orders_for_ticker(ticker, open_orders):
         time.sleep(1.5)
 
 def sync_recent_closed_sells(closed_orders):
-    """Upgrade #20: Log recent automated Stop-Loss / Take-Profit fills to Closed Trades tab"""
+    """Upgrade #20: Log recent automated Stop-Loss / Take-Profit fills & return new alerts"""
+    new_fill_alerts = []
     try:
         existing_ids = set(closed_sheet.col_values(6))
         for o in closed_orders:
             if o.side == 'sell' and o.status == 'filled' and o.id not in existing_ids:
                 filled_time = str(o.filled_at)[:19] if o.filled_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                fill_price = float(o.filled_avg_price) if o.filled_avg_price else 0.0
+                order_type = o.type.upper()
                 closed_sheet.append_row([
-                    filled_time, o.symbol, str(o.filled_qty), o.type.upper(), f"${float(o.filled_avg_price):.2f}", o.id
+                    filled_time, o.symbol, str(o.filled_qty), order_type, f"${fill_price:.2f}", o.id
                 ])
+                existing_ids.add(o.id)
+                if o.type in ['stop', 'stop_limit']:
+                    new_fill_alerts.append(f"🛑 **STOP-LOSS TRIGGERED ({o.symbol})**: Sold {o.filled_qty} sh @ `${fill_price:.2f}` ({filled_time} UTC)")
+                elif o.type == 'limit':
+                    new_fill_alerts.append(f"🎯 **TAKE-PROFIT HIT ({o.symbol})**: Sold {o.filled_qty} sh @ `${fill_price:.2f}` ({filled_time} UTC)")
     except Exception as e:
         print(f"Closed trades sheet sync warning: {e}")
+    return new_fill_alerts
 
 # =====================================================================
 # 3. MAIN EXECUTION ENGINE
@@ -242,21 +285,23 @@ def run_bot():
     pdt_restricted = daytrade_count >= 3  # Upgrade #15: Hard-Coded PDT Shield
 
     positions = {p.symbol: p for p in api.list_positions()}
-    open_orders = api.list_orders(status='open')
+    open_orders = api.list_orders(status='open', nested=True)
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     closed_orders_24h = api.list_orders(status='closed', after=since_24h, limit=100)
 
-    # Sync any stop-loss or take-profit fills from the past 24h
-    sync_recent_closed_sells(closed_orders_24h)
+    # Sync any stop-loss or take-profit fills from the past 24h & alert Discord
+    automated_exit_alerts = sync_recent_closed_sells(closed_orders_24h)
 
     macro_ok, macro_reason = check_macro_regime()
-    summary_alerts = []
+    summary_alerts = list(automated_exit_alerts)
+    scan_table_lines = []
 
     for ticker in TICKERS:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         headlines = get_fresh_dual_news(ticker)
         score = get_finbert_sentiment(headlines)
         tech = get_technicals_and_atr(ticker)
+        rsi_val = f"{tech['rsi14']:.1f}" if tech else "N/A"
 
         owned_qty = float(positions[ticker].qty) if ticker in positions else 0.0
         decision = "HOLD"
@@ -289,21 +334,22 @@ def run_bot():
                         decision = "BEARISH"
                         action_taken = f"Sold {int(owned_qty)} @ ~${current_price:.2f} (Sentiment Exit)"
                         owned_qty = 0
-                        summary_alerts.append(f"🔴 **SOLD {ticker}**: {action_taken} (Score: {score:+.3f})")
+                        summary_alerts.append(f"🔴 **SOLD {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`)")
                     except Exception as e:
                         decision = "BEARISH"
                         action_taken = f"Sell Failed: {e}"
             else:
                 # Upgrade #9 / #23: The Break-Even Stop Ratchet (+2.5% Profit Shield)
                 if unrealized_pct >= 0.025:
-                    ticker_stops = [o for o in open_orders if o.symbol == ticker and o.side == 'sell' and o.type == 'stop']
+                    ticker_orders = get_all_orders_for_ticker(ticker, open_orders)
+                    ticker_stops = [o for o in ticker_orders if o.side == 'sell' and o.type in ['stop', 'stop_limit']]
                     if ticker_stops:
                         stop_order = ticker_stops[0]
                         if float(stop_order.stop_price) < entry_price:
                             try:
                                 api.replace_order(stop_order.id, stop_price=round(entry_price, 2))
                                 action_taken = f"Ratcheted Stop to Break-Even (${entry_price:.2f})"
-                                summary_alerts.append(f"🛡️ **BREAK-EVEN SHIELD ({ticker})**: Stop moved up to ${entry_price:.2f} (+{unrealized_pct*100:.1f}% gain locked)")
+                                summary_alerts.append(f"🛡️ **BREAK-EVEN SHIELD ({ticker})**: Stop moved up to `${entry_price:.2f}` (`+{unrealized_pct*100:.1f}%` gain locked)")
                             except Exception as e:
                                 print(f"Break-even replace note for {ticker}: {e}")
 
@@ -362,7 +408,7 @@ def run_bot():
                         decision = "BULLISH"
                         action_taken = f"Bought {qty_to_buy} @ ~${price:.2f} | ATR Target: ${target_price:.2f}, ATR Stop: ${stop_price:.2f}"
                         owned_qty = qty_to_buy
-                        summary_alerts.append(f"🟢 **BUY {ticker}**: {action_taken} (FinBERT: {score:+.3f}, RSI: {tech['rsi14']:.1f})")
+                        summary_alerts.append(f"🟢 **BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, RSI: `{rsi_val}`)")
                     except Exception as e:
                         decision = "BULLISH"
                         action_taken = f"Buy Failed: {e}"
@@ -381,38 +427,72 @@ def run_bot():
         ]
         log_sheet.append_row(row)
         print(f"{ticker}: {score:+.3f} | {decision} | {action_taken}")
+        scan_table_lines.append(f"• **{ticker}**: FinBERT `{score:+.3f}` ({len(headlines)} news) | RSI `{rsi_val}` ➔ `{decision}`")
         time.sleep(1)
 
     if summary_alerts:
-        send_discord_alert("📊 **Bot v2.0 Scan Alert:**\n" + "\n".join(summary_alerts))
+        send_discord_alert("🚨 **Bot v2.0 Trade & Risk Execution Alert:**\n" + "\n".join(summary_alerts))
 
-    # Time-Aware, Highly Detailed Portfolio Report (Mid-Day vs End-of-Day)
+    # =====================================================================
+    # 4. POST-SCAN REFRESH & DETAILED DISCORD BRIEFING
+    # =====================================================================
     try:
+        # Wait 2 seconds for market orders to settle, then re-fetch fresh state!
+        time.sleep(2)
+        account = api.get_account()
+        equity = float(account.equity)
+        last_equity = float(getattr(account, 'last_equity', equity) or equity)
+        cash = float(getattr(account, 'cash', 0.0) or 0.0)
+        day_pl = equity - last_equity
+        day_pl_pct = (day_pl / last_equity) * 100 if last_equity > 0 else 0.0
+        total_pl = equity - 100000.0
+        total_pl_pct = (total_pl / 100000.0) * 100
+
+        positions = {p.symbol: p for p in api.list_positions()}
+        open_orders = api.list_orders(status='open', nested=True)
+
         ny_time = datetime.now(ZoneInfo("America/New_York"))
         is_midday = ny_time.hour < 12
-        
-        report_title = "☀️ **Mid-Day Market Briefing & Portfolio Status**" if is_midday else "🌙 **End-of-Day Portfolio Closeout Recap**"
-        cash = float(account.cash) if hasattr(account, 'cash') else 0.0
+        report_title = "☀️ **Mid-Day Market Briefing & Scan Report**" if is_midday else "🌙 **End-of-Day Portfolio & Scan Closeout**"
+
         total_unrealized_pl = sum(float(p.unrealized_pl) for p in positions.values())
-        total_unrealized_pct = (total_unrealized_pl / (equity - total_unrealized_pl)) * 100 if (equity - total_unrealized_pl) > 0 else 0.0
+        invested_val = sum(float(p.market_value) for p in positions.values())
 
         detailed_report = (
             f"{report_title}\n"
-            f"🕒 **Time (NY):** {ny_time.strftime('%Y-%m-%d %I:%M %p')}\n"
-            f"💰 **Total Equity:** `${equity:,.2f}` | 💵 **Cash:** `${cash:,.2f}`\n"
-            f"📊 **Open P/L:** `${total_unrealized_pl:+,.2f}` (`{total_unrealized_pct:+.2f}%`)\n"
-            f"📈 **Active Positions ({len(positions)}):**\n"
+            f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🌍 **Macro:** `{macro_reason}`\n"
+            f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
+            f"📅 **Today's Change:** `${day_pl:+,.2f}` (`{day_pl_pct:+.2f}%`) | 📊 **Open P/L:** `${total_unrealized_pl:+,.2f}`\n"
+            f"💵 **Cash:** `${cash:,.2f}` | 💼 **Invested:** `${invested_val:,.2f}` ({len(positions)} positions)\n\n"
+            f"📈 **Active Portfolio Breakdown ({len(positions)}):**\n"
         )
-        
-        for sym, p in positions.items():
+
+        for sym, p in sorted(positions.items()):
             qty = float(p.qty)
             entry = float(p.avg_entry_price)
             curr = float(p.current_price)
+            mkt_val = float(p.market_value)
             pl_dollar = float(p.unrealized_pl)
             pl_pct = float(p.unrealized_plpc) * 100 if hasattr(p, 'unrealized_plpc') and p.unrealized_plpc else ((curr - entry) / entry) * 100
-            
-            detailed_report += f"• **{sym}** ({int(qty)} sh): Entry `${entry:.2f}` | Now `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`)\n"
-        
+
+            # Find active Stop & Target prices for this position
+            sym_orders = get_all_orders_for_ticker(sym, open_orders)
+            stop_str = "None"
+            tp_str = "None"
+            for o in sym_orders:
+                if o.side == 'sell':
+                    if o.type in ['stop', 'stop_limit'] and o.stop_price:
+                        stop_str = f"${float(o.stop_price):.2f}"
+                    elif o.type == 'limit' and o.limit_price:
+                        tp_str = f"${float(o.limit_price):.2f}"
+
+            detailed_report += (
+                f"• **{sym}** ({int(qty)} sh | `${mkt_val:,.0f}`): "
+                f"`${entry:.2f}` ➔ `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`) | "
+                f"🎯 TP: `{tp_str}` | 🛑 SL: `{stop_str}`\n"
+            )
+
+        detailed_report += "\n🧠 **12-Ticker AI & Technical Scan Summary:**\n" + "\n".join(scan_table_lines)
         send_discord_alert(detailed_report)
     except Exception as e:
         print(f"Detailed portfolio report error: {e}")

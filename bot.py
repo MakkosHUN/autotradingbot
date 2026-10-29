@@ -222,28 +222,39 @@ def has_upcoming_earnings_48h(ticker):
         pass
     return False
 
-def get_all_orders_for_ticker(ticker, open_orders):
-    """Finds both top-level orders and nested bracket child legs for a ticker"""
-    matched = []
-    for o in open_orders:
-        if o.symbol == ticker:
-            matched.append(o)
-        if hasattr(o, 'legs') and o.legs:
-            for leg in o.legs:
-                if leg.symbol == ticker:
-                    matched.append(leg)
-    return matched
+def fetch_active_and_held_orders():
+    """Fetches both 'open' orders and 'held' stop-loss child legs attached to filled bracket parents"""
+    active = {}
+    try:
+        for o in api.list_orders(status='open', nested=True, limit=200):
+            active[o.id] = o
+            if hasattr(o, 'legs') and o.legs:
+                for leg in o.legs:
+                    if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
+                        active[leg.id] = leg
+        # Also inspect recent filled parent orders whose child stop-loss legs are in 'held' status
+        for o in api.list_orders(status='closed', nested=True, limit=200):
+            if hasattr(o, 'legs') and o.legs:
+                for leg in o.legs:
+                    if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
+                        active[leg.id] = leg
+    except Exception as e:
+        print(f"Order fetch warning: {e}")
+    return list(active.values())
 
-def cancel_existing_orders_for_ticker(ticker, open_orders):
-    """Upgrade #11: Bracket-Unlock Fix (Cancels open stop/limit legs before selling or updating)"""
+def get_all_orders_for_ticker(ticker, active_orders):
+    """Returns all active/held orders for a specific ticker"""
+    return [o for o in active_orders if o.symbol == ticker and o.status in ['new', 'held', 'accepted', 'partially_filled']]
+
+def cancel_existing_orders_for_ticker(ticker, active_orders):
+    """Upgrade #11: Bracket-Unlock Fix (Cancels open/held stop & limit legs before selling)"""
     canceled = False
-    for o in get_all_orders_for_ticker(ticker, open_orders):
-        if o.status in ['new', 'held', 'partially_filled', 'accepted']:
-            try:
-                api.cancel_order(o.id)
-                canceled = True
-            except Exception as e:
-                print(f"Cancel order warning for {ticker}: {e}")
+    for o in get_all_orders_for_ticker(ticker, active_orders):
+        try:
+            api.cancel_order(o.id)
+            canceled = True
+        except Exception as e:
+            print(f"Cancel order warning for {ticker}: {e}")
     if canceled:
         time.sleep(1.5)
 
@@ -285,7 +296,7 @@ def run_bot():
     pdt_restricted = daytrade_count >= 3  # Upgrade #15: Hard-Coded PDT Shield
 
     positions = {p.symbol: p for p in api.list_positions()}
-    open_orders = api.list_orders(status='open', nested=True)
+    active_orders = fetch_active_and_held_orders()
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     closed_orders_24h = api.list_orders(status='closed', after=since_24h, limit=100)
 
@@ -323,7 +334,7 @@ def run_bot():
                     action_taken = "Skipped sell to prevent PDT lock"
                 else:
                     try:
-                        cancel_existing_orders_for_ticker(ticker, open_orders)
+                        cancel_existing_orders_for_ticker(ticker, active_orders)
                         api.submit_order(
                             symbol=ticker,
                             qty=owned_qty,
@@ -341,7 +352,7 @@ def run_bot():
             else:
                 # Upgrade #9 / #23: The Break-Even Stop Ratchet (+2.5% Profit Shield)
                 if unrealized_pct >= 0.025:
-                    ticker_orders = get_all_orders_for_ticker(ticker, open_orders)
+                    ticker_orders = get_all_orders_for_ticker(ticker, active_orders)
                     ticker_stops = [o for o in ticker_orders if o.side == 'sell' and o.type in ['stop', 'stop_limit']]
                     if ticker_stops:
                         stop_order = ticker_stops[0]
@@ -437,7 +448,6 @@ def run_bot():
     # 4. POST-SCAN REFRESH & DETAILED DISCORD BRIEFING
     # =====================================================================
     try:
-        # Wait 2 seconds for market orders to settle, then re-fetch fresh state!
         time.sleep(2)
         account = api.get_account()
         equity = float(account.equity)
@@ -449,7 +459,7 @@ def run_bot():
         total_pl_pct = (total_pl / 100000.0) * 100
 
         positions = {p.symbol: p for p in api.list_positions()}
-        open_orders = api.list_orders(status='open', nested=True)
+        active_orders = fetch_active_and_held_orders()
 
         ny_time = datetime.now(ZoneInfo("America/New_York"))
         is_midday = ny_time.hour < 12
@@ -475,8 +485,7 @@ def run_bot():
             pl_dollar = float(p.unrealized_pl)
             pl_pct = float(p.unrealized_plpc) * 100 if hasattr(p, 'unrealized_plpc') and p.unrealized_plpc else ((curr - entry) / entry) * 100
 
-            # Find active Stop & Target prices for this position
-            sym_orders = get_all_orders_for_ticker(sym, open_orders)
+            sym_orders = get_all_orders_for_ticker(sym, active_orders)
             stop_str = "None"
             tp_str = "None"
             for o in sym_orders:

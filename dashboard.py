@@ -24,7 +24,6 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Global Terminal Styling */
     .stApp {
         background: radial-gradient(circle at top right, #0d1527 0%, #07090e 60%);
     }
@@ -32,7 +31,6 @@ st.markdown("""
         padding-top: 1.5rem;
         padding-bottom: 2rem;
     }
-    /* Glassmorphic Metric Cards */
     div[data-testid="stMetric"] {
         background: linear-gradient(145deg, rgba(17, 22, 34, 0.92), rgba(11, 14, 23, 0.92));
         border: 1px solid rgba(255, 255, 255, 0.07);
@@ -53,7 +51,6 @@ st.markdown("""
         font-weight: 700;
         font-size: 1.75rem !important;
     }
-    /* Custom Header Banner */
     .terminal-header {
         background: linear-gradient(90deg, rgba(17,22,34,0.95) 0%, rgba(0,255,170,0.06) 100%);
         border: 1px solid rgba(0, 255, 170, 0.2);
@@ -150,15 +147,34 @@ api = init_alpaca()
 spreadsheet = init_gsheets()
 
 # =====================================================================
-# 3. LIVE TELEMETRY FETCHERS
+# 3. LIVE TELEMETRY FETCHERS (UNPACKED TO AVOID RECURSION)
 # =====================================================================
 @st.cache_data(ttl=30)
 def fetch_alpaca_state():
-    clock = api.get_clock()
-    account = api.get_account()
-    positions = api.list_positions()
+    clock_obj = api.get_clock()
+    is_open = bool(clock_obj.is_open)
 
-    # Fetch both open and held bracket child orders
+    account_obj = api.get_account()
+    account_data = {
+        "equity": float(account_obj.equity),
+        "last_equity": float(getattr(account_obj, 'last_equity', account_obj.equity) or account_obj.equity),
+        "cash": float(getattr(account_obj, 'cash', 0.0) or 0.0),
+        "daytrade_count": int(getattr(account_obj, 'daytrade_count', 0) or 0)
+    }
+
+    positions_raw = api.list_positions()
+    positions_data = []
+    for p in positions_raw:
+        positions_data.append({
+            "symbol": str(p.symbol),
+            "qty": float(p.qty),
+            "avg_entry_price": float(p.avg_entry_price),
+            "current_price": float(p.current_price),
+            "market_value": float(p.market_value),
+            "unrealized_pl": float(p.unrealized_pl),
+            "unrealized_plpc": float(getattr(p, 'unrealized_plpc', 0.0) or 0.0)
+        })
+
     active_orders = {}
     for o in api.list_orders(status='open', nested=True, limit=200):
         active_orders[o.id] = o
@@ -172,13 +188,40 @@ def fetch_alpaca_state():
                 if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
                     active_orders[leg.id] = leg
 
-    recent_orders = api.list_orders(status='all', limit=60)
+    orders_data = []
+    for o in list(active_orders.values()):
+        orders_data.append({
+            "id": str(o.id),
+            "symbol": str(o.symbol),
+            "side": str(o.side),
+            "type": str(o.type),
+            "status": str(o.status),
+            "stop_price": float(o.stop_price) if getattr(o, 'stop_price', None) else None,
+            "limit_price": float(o.limit_price) if getattr(o, 'limit_price', None) else None
+        })
+
+    recent_orders_raw = api.list_orders(status='all', limit=60)
+    recent_data = []
+    for o in recent_orders_raw:
+        recent_data.append({
+            "submitted_at": str(o.submitted_at),
+            "symbol": str(o.symbol),
+            "side": str(o.side),
+            "type": str(o.type),
+            "qty": str(o.qty),
+            "filled_qty": str(getattr(o, 'filled_qty', '0')),
+            "filled_avg_price": float(o.filled_avg_price) if getattr(o, 'filled_avg_price', None) else None,
+            "limit_price": float(o.limit_price) if getattr(o, 'limit_price', None) else None,
+            "stop_price": float(o.stop_price) if getattr(o, 'stop_price', None) else None,
+            "status": str(o.status)
+        })
+
     try:
         hist = api.get_portfolio_history(period="1M", timeframe="1D").df
     except Exception:
         hist = pd.DataFrame()
 
-    return clock, account, positions, list(active_orders.values()), recent_orders, hist
+    return is_open, account_data, positions_data, orders_data, recent_data, hist
 
 @st.cache_data(ttl=120)
 def fetch_macro_telemetry():
@@ -220,7 +263,7 @@ def fetch_sheet_logs():
 
     return df_log, df_closed
 
-clock, account, positions, active_orders, recent_orders, port_hist = fetch_alpaca_state()
+is_open, account, positions, active_orders, recent_orders, port_hist = fetch_alpaca_state()
 macro_ok, spy_chg, vix_val = fetch_macro_telemetry()
 df_log, df_closed = fetch_sheet_logs()
 
@@ -241,7 +284,7 @@ with st.sidebar:
     st.caption("Fires `.github/workflows/schedule.yml` on GitHub Actions immediately.")
     if st.button("⚡ Trigger FinBERT Scan Now", use_container_width=True):
         if not GITHUB_PAT:
-            st.warning("Add `GITHUB_PAT` (Personal Access Token) to Streamlit Secrets to enable 1-click remote workflow triggers, or trigger from GitHub Actions.")
+            st.warning("Add `GITHUB_PAT` (Personal Access Token) to Streamlit Secrets to enable 1-click remote triggers.")
         else:
             resp = requests.post(
                 "https://api.github.com/repos/MakkosHUN/autotradingbot/actions/workflows/schedule.yml/dispatches",
@@ -256,7 +299,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🛡️ System Safeguards")
-    daytrades = int(getattr(account, 'daytrade_count', 0) or 0)
+    daytrades = int(account.get('daytrade_count', 0))
     st.progress(min(daytrades / 3.0, 1.0), text=f"PDT Counter: {daytrades} / 3 Day Trades")
     st.markdown(f"**SPY 24h:** `{spy_chg:+.2f}%`  \n**CBOE VIX:** `{vix_val:.1f}`")
 
@@ -278,7 +321,7 @@ with st.sidebar:
 # =====================================================================
 # 5. TOP TERMINAL HEADER & KPI CARDS
 # =====================================================================
-mkt_badge = '<span class="status-pill pill-green">● NYSE OPEN</span>' if clock.is_open else '<span class="status-pill pill-amber">● NYSE CLOSED</span>'
+mkt_badge = '<span class="status-pill pill-green">● NYSE OPEN</span>' if is_open else '<span class="status-pill pill-amber">● NYSE CLOSED</span>'
 macro_badge = '<span class="status-pill pill-green">🛡️ MACRO NORMAL</span>' if macro_ok else '<span class="status-pill pill-red">⚠️ MACRO CRASH SHIELD</span>'
 pdt_badge = f'<span class="status-pill pill-green">PDT: {daytrades}/3 SAFE</span>' if daytrades < 3 else '<span class="status-pill pill-red">PDT LOCKED (3/3)</span>'
 
@@ -296,15 +339,15 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-equity = float(account.equity)
-last_equity = float(getattr(account, 'last_equity', equity) or equity)
-cash = float(getattr(account, 'cash', 0.0) or 0.0)
+equity = float(account.get('equity', 0.0))
+last_equity = float(account.get('last_equity', equity))
+cash = float(account.get('cash', 0.0))
 day_pl = equity - last_equity
 day_pl_pct = (day_pl / last_equity) * 100 if last_equity > 0 else 0.0
 all_time_pl = equity - 100000.0
 all_time_pct = (all_time_pl / 100000.0) * 100.0
-open_pl = sum(float(p.unrealized_pl) for p in positions)
-invested = sum(float(p.market_value) for p in positions)
+open_pl = sum(p['unrealized_pl'] for p in positions)
+invested = sum(p['market_value'] for p in positions)
 exposure_pct = (invested / equity) * 100 if equity > 0 else 0.0
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -317,7 +360,7 @@ c5.metric("Available Cash Reserve", f"${cash:,.2f}", f"{100-exposure_pct:.1f}% D
 st.markdown("<br>", unsafe_allow_html=True)
 
 # =====================================================================
-# 6. MAIN TABS: POSITIONS, CHARTS, AI TELEMETRY, ORDERS
+# 6. MAIN TABS
 # =====================================================================
 tab1, tab2, tab3, tab4 = st.tabs([
     "💼 Live Positions & ATR Risk Matrix",
@@ -326,33 +369,28 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "📜 Live Order Book & Fill History"
 ])
 
-# ---------------------------------------------------------------------
-# TAB 1: LIVE POSITIONS & SL-TO-TP PROGRESS MATRIX
-# ---------------------------------------------------------------------
 with tab1:
     if not positions:
         st.info("No active positions currently open. Portfolio is 100% in cash.")
     else:
         pos_rows = []
-        for p in sorted(positions, key=lambda x: float(x.market_value), reverse=True):
-            sym = p.symbol
-            qty = int(float(p.qty))
-            entry = float(p.avg_entry_price)
-            curr = float(p.current_price)
-            mkt_val = float(p.market_value)
-            pl_dlr = float(p.unrealized_pl)
+        for p in sorted(positions, key=lambda x: x['market_value'], reverse=True):
+            sym = p['symbol']
+            qty = int(p['qty'])
+            entry = p['avg_entry_price']
+            curr = p['current_price']
+            mkt_val = p['market_value']
+            pl_dlr = p['unrealized_pl']
             pl_pct = ((curr - entry) / entry) * 100.0
 
-            # Locate Stop-Loss & Take-Profit orders
             sl_price, tp_price = None, None
             for o in active_orders:
-                if o.symbol == sym and o.side == 'sell':
-                    if o.type in ['stop', 'stop_limit'] and o.stop_price:
-                        sl_price = float(o.stop_price)
-                    elif o.type == 'limit' and o.limit_price:
-                        tp_price = float(o.limit_price)
+                if o['symbol'] == sym and o['side'] == 'sell':
+                    if o['type'] in ['stop', 'stop_limit'] and o['stop_price']:
+                        sl_price = o['stop_price']
+                    elif o['type'] == 'limit' and o['limit_price']:
+                        tp_price = o['limit_price']
 
-            # Calculate where current price sits between Stop-Loss (0%) and Take-Profit (100%)
             if sl_price and tp_price and tp_price > sl_price:
                 range_progress = max(0.0, min(100.0, ((curr - sl_price) / (tp_price - sl_price)) * 100.0))
             else:
@@ -406,65 +444,46 @@ with tab1:
                 "Value": [r["Market Value"] for r in pos_rows]
             })
             fig_pie = px.pie(
-                alloc_df,
-                values="Value",
-                names="Asset",
-                hole=0.62,
+                alloc_df, values="Value", names="Asset", hole=0.62,
                 color_discrete_sequence=px.colors.sequential.Tealgrn
             )
             fig_pie.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=10, b=10, l=10, r=10),
-                height=320,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=10, b=10, l=10, r=10), height=320,
                 legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5)
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
-        # P/L Bar Chart across open positions
         st.subheader("📊 Unrealized Profit / Loss by Position ($)")
         colors = ["#00FFAA" if x >= 0 else "#FF4B4B" for x in df_pos["Unrealized P/L ($)"]]
         fig_bar = go.Figure(go.Bar(
-            x=df_pos["Ticker"],
-            y=df_pos["Unrealized P/L ($)"],
+            x=df_pos["Ticker"], y=df_pos["Unrealized P/L ($)"],
             marker_color=colors,
             text=[f"${x:+.2f} ({p:+.2f}%)" for x, p in zip(df_pos["Unrealized P/L ($)"], df_pos["Return (%)"])],
             textposition="outside"
         ))
         fig_bar.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(17,22,34,0.5)",
-            height=300,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,22,34,0.5)", height=300,
             margin=dict(t=25, b=10, l=10, r=10),
             yaxis=dict(title="Unrealized P/L ($)", gridcolor="rgba(255,255,255,0.06)"),
             xaxis=dict(title="")
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-# ---------------------------------------------------------------------
-# TAB 2: EQUITY CURVE & INTERACTIVE TECHNICAL CANDLESTICK CHARTS
-# ---------------------------------------------------------------------
 with tab2:
     col_eq, col_chart = st.columns([1, 1.3])
-
     with col_eq:
         st.subheader("📈 30-Day Portfolio Equity Curve")
         if not port_hist.empty and "equity" in port_hist.columns:
             df_eq = port_hist[port_hist["equity"] > 0].copy()
             fig_eq = go.Figure()
             fig_eq.add_trace(go.Scatter(
-                x=df_eq.index,
-                y=df_eq["equity"],
-                mode="lines+markers",
-                line=dict(color="#00FFAA", width=2.5),
-                fill="tozeroy",
-                fillcolor="rgba(0, 255, 170, 0.08)",
-                name="Equity"
+                x=df_eq.index, y=df_eq["equity"], mode="lines+markers",
+                line=dict(color="#00FFAA", width=2.5), fill="tozeroy",
+                fillcolor="rgba(0, 255, 170, 0.08)", name="Equity"
             ))
             fig_eq.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(17,22,34,0.5)",
-                height=420,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,22,34,0.5)", height=420,
                 margin=dict(t=15, b=15, l=10, r=10),
                 yaxis=dict(title="Account Equity ($)", gridcolor="rgba(255,255,255,0.06)"),
                 xaxis=dict(gridcolor="rgba(255,255,255,0.04)")
@@ -474,7 +493,7 @@ with tab2:
             st.info("Portfolio history curve will populate as daily bars accumulate.")
 
     with col_chart:
-        st.subheader("🔬 Technical Trend Inspector (Price vs 20-EMA & 200-SMA)")
+        st.subheader("🔬 Technical Trend Inspector")
         selected_ticker = st.selectbox("Select Universe Ticker:", TICKERS, index=3)
         df_yf = yf.Ticker(selected_ticker).history(period="1y")
         if not df_yf.empty:
@@ -484,35 +503,20 @@ with tab2:
 
             fig_candle = go.Figure()
             fig_candle.add_trace(go.Candlestick(
-                x=df_plot.index,
-                open=df_plot["Open"], high=df_plot["High"],
-                low=df_plot["Low"], close=df_plot["Close"],
-                name=selected_ticker,
-                increasing_line_color="#00FFAA",
-                decreasing_line_color="#FF4B4B"
+                x=df_plot.index, open=df_plot["Open"], high=df_plot["High"],
+                low=df_plot["Low"], close=df_plot["Close"], name=selected_ticker,
+                increasing_line_color="#00FFAA", decreasing_line_color="#FF4B4B"
             ))
-            fig_candle.add_trace(go.Scatter(
-                x=df_plot.index, y=df_plot["EMA20"],
-                line=dict(color="#38BDF8", width=1.8), name="20-EMA (Momentum)"
-            ))
-            fig_candle.add_trace(go.Scatter(
-                x=df_plot.index, y=df_plot["SMA200"],
-                line=dict(color="#F59E0B", width=2.2, dash="dot"), name="200-SMA (Macro Trend)"
-            ))
+            fig_candle.add_trace(go.Scatter(x=df_plot.index, y=df_plot["EMA20"], line=dict(color="#38BDF8", width=1.8), name="20-EMA"))
+            fig_candle.add_trace(go.Scatter(x=df_plot.index, y=df_plot["SMA200"], line=dict(color="#F59E0B", width=2.2, dash="dot"), name="200-SMA"))
             fig_candle.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(17,22,34,0.5)",
-                height=370,
-                xaxis_rangeslider_visible=False,
-                margin=dict(t=10, b=10, l=10, r=10),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,22,34,0.5)", height=370,
+                xaxis_rangeslider_visible=False, margin=dict(t=10, b=10, l=10, r=10),
                 yaxis=dict(gridcolor="rgba(255,255,255,0.06)"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig_candle, use_container_width=True)
 
-# ---------------------------------------------------------------------
-# TAB 3: FINBERT AI BRAIN & GOOGLE SHEETS LOGS
-# ---------------------------------------------------------------------
 with tab3:
     st.subheader("🧠 Latest 12-Stock FinBERT Sentiment Radar")
     if not df_log.empty:
@@ -521,18 +525,13 @@ with tab3:
 
         bar_colors = ["#00FFAA" if s >= 0.10 else ("#FF4B4B" if s <= -0.10 else "#64748B") for s in latest_12["Score_Num"]]
         fig_sent = go.Figure(go.Bar(
-            x=latest_12["Ticker"],
-            y=latest_12["Score_Num"],
-            marker_color=bar_colors,
-            text=latest_12["FinBERT Score"],
-            textposition="outside"
+            x=latest_12["Ticker"], y=latest_12["Score_Num"],
+            marker_color=bar_colors, text=latest_12["FinBERT Score"], textposition="outside"
         ))
         fig_sent.add_hline(y=0.10, line_dash="dash", line_color="#00FFAA", annotation_text="Buy Threshold (+0.10)")
         fig_sent.add_hline(y=-0.15, line_dash="dash", line_color="#FF4B4B", annotation_text="Bearish Exit (-0.15)")
         fig_sent.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(17,22,34,0.5)",
-            height=310,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,22,34,0.5)", height=310,
             margin=dict(t=20, b=10, l=10, r=10),
             yaxis=dict(title="Net FinBERT Score (-1 to +1)", range=[-0.6, 0.9], gridcolor="rgba(255,255,255,0.06)")
         )
@@ -540,33 +539,21 @@ with tab3:
 
         col_l1, col_l2 = st.columns([1.6, 1])
         with col_l1:
-            st.markdown("#### 📋 Auto-Trading Bot Log (Most Recent 100 Scans)")
+            st.markdown("#### 📋 Auto-Trading Bot Log")
             st.dataframe(df_log.iloc[::-1].head(100), use_container_width=True, hide_index=True)
         with col_l2:
-            st.markdown("#### 🏆 Automated Exits (`Closed Trades` Tab)")
+            st.markdown("#### 🏆 Automated Exits (`Closed Trades`)")
             if not df_closed.empty:
                 st.dataframe(df_closed.iloc[::-1], use_container_width=True, hide_index=True)
             else:
-                st.info("No closed bracket exits logged in `Closed Trades` tab yet.")
+                st.info("No closed bracket exits logged yet.")
     else:
-        st.info("Connect `GOOGLE_CREDENTIALS` in Streamlit Secrets to stream your Google Sheet logs here.")
+        st.info("Connect `GOOGLE_CREDENTIALS` in Streamlit Secrets to view logs.")
 
-# ---------------------------------------------------------------------
-# TAB 4: LIVE ORDER BOOK & RECENT FILLS
-# ---------------------------------------------------------------------
 with tab4:
-    st.subheader("📜 Alpaca Order Book (Open / Held / Filled / Canceled)")
-    order_rows = []
-    for o in recent_orders:
-        price_disp = o.filled_avg_price or o.limit_price or o.stop_price or "Market"
-        order_rows.append({
-            "Submitted (UTC)": str(o.submitted_at)[:19],
-            "Ticker": o.symbol,
-            "Side": o.side.upper(),
-            "Type": o.type.upper(),
-            "Qty": o.qty,
-            "Filled Qty": o.filled_qty,
-            "Price / Trigger": f"${float(price_disp):.2f}" if str(price_disp).replace('.','',1).isdigit() else str(price_disp),
-            "Status": o.status.upper()
-        })
-    st.dataframe(pd.DataFrame(order_rows), use_container_width=True, hide_index=True)
+    st.subheader("📜 Alpaca Order Book")
+    if recent_orders:
+        df_orders = pd.DataFrame(recent_orders)
+        st.dataframe(df_orders, use_container_width=True, hide_index=True)
+    else:
+        st.info("No recent orders found.")

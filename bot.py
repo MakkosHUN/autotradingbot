@@ -11,6 +11,7 @@ import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 from transformers import pipeline
+import re
 
 # =====================================================================
 # 1. INITIALIZE CONNECTIONS & CREDENTIALS
@@ -22,8 +23,29 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-# Connect to Google Sheets
-creds_json = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
+def repair_pem_key(pk_str):
+    """Automatically repairs newlines and missing Base64 '=' padding in PEM keys."""
+    pk_str = pk_str.replace("\\n", "\n").strip()
+    header = "-----BEGIN PRIVATE KEY-----"
+    footer = "-----END PRIVATE KEY-----"
+    if header in pk_str and footer in pk_str:
+        body = pk_str.split(header)[1].split(footer)[0]
+        clean_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', body).rstrip('=')
+        rem = len(clean_b64) % 4
+        if rem == 2:
+            clean_b64 += "=="
+        elif rem == 3:
+            clean_b64 += "="
+        lines = [clean_b64[i:i+64] for i in range(0, len(clean_b64), 64)]
+        return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
+    return pk_str
+
+# Connect to Google Sheets with robust PEM sanitization
+raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}")
+creds_json = json.loads(raw_creds, strict=False)
+if "private_key" in creds_json:
+    creds_json["private_key"] = repair_pem_key(creds_json["private_key"])
+
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -33,7 +55,7 @@ gc = gspread.authorize(creds)
 spreadsheet = gc.open("Auto-Trading Bot Log")
 log_sheet = spreadsheet.sheet1
 
-# Upgrade #20: Ensure "Closed Trades" tab exists for Win Rate & P/L tracking
+# Ensure "Closed Trades" tab exists for Win Rate & P/L tracking
 try:
     closed_sheet = spreadsheet.worksheet("Closed Trades")
 except Exception:
@@ -45,10 +67,9 @@ except Exception:
 TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
 
 # =====================================================================
-# 2. HELPER FUNCTIONS (UPGRADES #1 TO #23)
+# 2. HELPER FUNCTIONS
 # =====================================================================
 def send_discord_alert(message):
-    """Upgrade #19: Discord Mobile Push Notification (auto-splits if > 1900 chars)"""
     if not DISCORD_WEBHOOK:
         return
     try:
@@ -77,12 +98,10 @@ finbert = pipeline(
 )
 
 def get_fresh_dual_news(ticker):
-    """Upgrades #2 & #3: Dual-Source News (Alpaca + yfinance) with 24-Hr Freshness & Deduplication"""
     headlines = []
     seen = set()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    # Source 1: Alpaca News API
     try:
         alpaca_news = api.get_news(ticker, limit=15)
         for item in alpaca_news:
@@ -97,7 +116,6 @@ def get_fresh_dual_news(ticker):
     except Exception as e:
         print(f"Alpaca news warning for {ticker}: {e}")
 
-    # Source 2: Yahoo Finance News API
     try:
         yf_news = yf.Ticker(ticker).news
         if yf_news:
@@ -115,7 +133,6 @@ def get_fresh_dual_news(ticker):
     return headlines
 
 def get_finbert_sentiment(headlines):
-    """Upgrade #1: Institutional Financial AI Sentiment Scoring"""
     if not headlines:
         return 0.0
     clean = [h[:512] for h in headlines if h and len(h.strip()) > 10]
@@ -140,7 +157,6 @@ def get_finbert_sentiment(headlines):
     return round(sum(weighted_scores) / len(weighted_scores), 3)
 
 def check_macro_regime():
-    """Upgrade #17: SPY (-1.5%) & VIX (> 28) Market Crash Master Switch"""
     try:
         spy = yf.Ticker("SPY").history(period="2d")
         vix = yf.Ticker("^VIX").history(period="2d")
@@ -160,7 +176,6 @@ def check_macro_regime():
     return True, "Macro Normal"
 
 def get_technicals_and_atr(ticker):
-    """Upgrades #4, #5, #6, #7: Native calculation of 200-SMA, 20-EMA, 14-RSI, and 14-Day ATR"""
     df = yf.Ticker(ticker).history(period="1y")
     if df.empty or len(df) < 200:
         return None
@@ -169,10 +184,10 @@ def get_technicals_and_atr(ticker):
     sma200 = float(close.rolling(200).mean().iloc[-1])
     ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
     
-    # Native RSI-14 Calculation
+    # Wilder's Exponentially Smoothed RSI-14 Calculation
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     rs = gain / loss
     rsi_series = 100 - (100 / (1 + rs))
     rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
@@ -195,14 +210,12 @@ def get_technicals_and_atr(ticker):
     }
 
 def was_stopped_out_last_24h(ticker, closed_orders):
-    """Upgrade #12: 24-Hour Stop-Loss Cooldown Shield"""
     for o in closed_orders:
         if o.symbol == ticker and o.side == 'sell' and o.type in ['stop', 'stop_limit'] and o.status == 'filled':
             return True
     return False
 
 def has_upcoming_earnings_48h(ticker):
-    """Upgrade #16: 48-Hour Quarterly Earnings Blackout Shield (Handles dict & DataFrame)"""
     try:
         cal = yf.Ticker(ticker).calendar
         now_date = datetime.now(timezone.utc).date()
@@ -223,7 +236,6 @@ def has_upcoming_earnings_48h(ticker):
     return False
 
 def fetch_active_and_held_orders():
-    """Fetches both 'open' orders and 'held' stop-loss child legs attached to filled bracket parents"""
     active = {}
     try:
         for o in api.list_orders(status='open', nested=True, limit=200):
@@ -232,7 +244,6 @@ def fetch_active_and_held_orders():
                 for leg in o.legs:
                     if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
                         active[leg.id] = leg
-        # Also inspect recent filled parent orders whose child stop-loss legs are in 'held' status
         for o in api.list_orders(status='closed', nested=True, limit=200):
             if hasattr(o, 'legs') and o.legs:
                 for leg in o.legs:
@@ -243,11 +254,9 @@ def fetch_active_and_held_orders():
     return list(active.values())
 
 def get_all_orders_for_ticker(ticker, active_orders):
-    """Returns all active/held orders for a specific ticker"""
     return [o for o in active_orders if o.symbol == ticker and o.status in ['new', 'held', 'accepted', 'partially_filled']]
 
 def cancel_existing_orders_for_ticker(ticker, active_orders):
-    """Upgrade #11: Bracket-Unlock Fix (Cancels open/held stop & limit legs before selling)"""
     canceled = False
     for o in get_all_orders_for_ticker(ticker, active_orders):
         try:
@@ -259,7 +268,6 @@ def cancel_existing_orders_for_ticker(ticker, active_orders):
         time.sleep(1.5)
 
 def sync_recent_closed_sells(closed_orders):
-    """Upgrade #20: Log recent automated Stop-Loss / Take-Profit fills & return new alerts"""
     new_fill_alerts = []
     try:
         existing_ids = set(closed_sheet.col_values(6))
@@ -284,7 +292,6 @@ def sync_recent_closed_sells(closed_orders):
 # 3. MAIN EXECUTION ENGINE
 # =====================================================================
 def run_bot():
-    # Upgrade #14: Market-Hours Gatekeeper (Prevents overnight/weekend queuing)
     clock = api.get_clock()
     if not clock.is_open:
         print("US Stock Market is currently CLOSED. Aborting scan to prevent blind order queuing.")
@@ -293,16 +300,14 @@ def run_bot():
     account = api.get_account()
     equity = float(account.equity)
     daytrade_count = int(getattr(account, 'daytrade_count', 0) or 0)
-    pdt_restricted = daytrade_count >= 3  # Upgrade #15: Hard-Coded PDT Shield
+    pdt_restricted = daytrade_count >= 3
 
     positions = {p.symbol: p for p in api.list_positions()}
     active_orders = fetch_active_and_held_orders()
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     closed_orders_24h = api.list_orders(status='closed', after=since_24h, limit=100)
 
-    # Sync any stop-loss or take-profit fills from the past 24h & alert Discord
     automated_exit_alerts = sync_recent_closed_sells(closed_orders_24h)
-
     macro_ok, macro_reason = check_macro_regime()
     summary_alerts = list(automated_exit_alerts)
     scan_table_lines = []
@@ -318,16 +323,12 @@ def run_bot():
         decision = "HOLD"
         action_taken = "None"
 
-        # -------------------------------------------------------------
-        # CASE A: POSITION ALREADY OWNED -> MANAGE EXIT OR RATCHET STOP
-        # -------------------------------------------------------------
         if owned_qty > 0:
             pos = positions[ticker]
             entry_price = float(pos.avg_entry_price)
             current_price = float(pos.current_price)
             unrealized_pct = (current_price - entry_price) / entry_price
 
-            # Upgrade #11: Bearish Exit with Bracket-Unlock + PDT Check
             if score <= -0.15:
                 if pdt_restricted:
                     decision = "BEARISH (PDT Shield Locked)"
@@ -350,7 +351,6 @@ def run_bot():
                         decision = "BEARISH"
                         action_taken = f"Sell Failed: {e}"
             else:
-                # Upgrade #9 / #23: The Break-Even Stop Ratchet (+2.5% Profit Shield)
                 if unrealized_pct >= 0.025:
                     ticker_orders = get_all_orders_for_ticker(ticker, active_orders)
                     ticker_stops = [o for o in ticker_orders if o.side == 'sell' and o.type in ['stop', 'stop_limit']]
@@ -368,10 +368,6 @@ def run_bot():
                     decision = "BULLISH (Already Owned)"
                 else:
                     decision = "HOLD"
-
-        # -------------------------------------------------------------
-        # CASE B: NOT OWNED -> EVALUATE VERSION 2.0 BUY FILTERS
-        # -------------------------------------------------------------
         else:
             if score >= 0.10:
                 if not macro_ok:
@@ -444,9 +440,6 @@ def run_bot():
     if summary_alerts:
         send_discord_alert("🚨 **Bot v2.0 Trade & Risk Execution Alert:**\n" + "\n".join(summary_alerts))
 
-    # =====================================================================
-    # 4. POST-SCAN REFRESH & DETAILED DISCORD BRIEFING
-    # =====================================================================
     try:
         time.sleep(2)
         account = api.get_account()

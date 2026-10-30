@@ -40,9 +40,15 @@ def repair_pem_key(pk_str):
         return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
     return pk_str
 
-# Connect to Google Sheets with robust PEM sanitization
-raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}")
-creds_json = json.loads(raw_creds, strict=False)
+# Connect to Google Sheets with robust JSON/TOML & whitespace sanitization
+raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}").replace("\xa0", " ").replace("\u00a0", " ").strip()
+try:
+    creds_json = json.loads(raw_creds, strict=False)
+except json.JSONDecodeError:
+    import tomllib
+    parsed = tomllib.loads(raw_creds)
+    creds_json = parsed.get("GOOGLE_CREDENTIALS", parsed)
+
 if "private_key" in creds_json:
     creds_json["private_key"] = repair_pem_key(creds_json["private_key"])
 

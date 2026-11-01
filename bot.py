@@ -17,26 +17,10 @@ from transformers import pipeline
 # =====================================================================
 # 1. INITIALIZE CONNECTIONS, CREDENTIALS & 3-TIER UNIVERSES
 # =====================================================================
-API_KEY = os.environ.get("APCA_API_KEY_ID") or "PK24UBUQJRV4IZBY2PEP2RJA7I"
-API_SECRET = os.environ.get("APCA_API_SECRET_KEY") or "DbZoPN5n93m5T1g3PH6aiENiNgQhhpoAoVBrABfVkx7H"
+API_KEY = os.environ.get("APCA_API_KEY_ID")
+API_SECRET = os.environ.get("APCA_API_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets"
-
-# Uses your GitHub Actions secret automatically, or you can paste your Discord URL in the quotes on the right:
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL") or "PASTE_DISCORD_WEBHOOK_URL_HERE_IF_NOT_IN_GITHUB_SECRETS"
-
-DEFAULT_GOOGLE_CREDS = {
-    "type": "service_account",
-    "project_id": "trading-bot-logger-511317",
-    "private_key_id": "16241fed957acbd53894d939b93bf99c2cc2cc55",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDUOBEo96vmYfI5\nPm//578PO18EPzdJppF8qZMQN8CHuEaMHQfe8NPApJpND5yYiAHuqAGji3qrlUPc\nwRB9EUTZT9Qf8h2gqYDMuMNhIcIqExbUiuUBqf7SB+eCWbQDJ6xTHgX9jUDUYRgB\nxggsO6eEelLjJuS9ZwmcgkppUeqdIciZSUfPxgPQOaYiMABwLXlX/kC8VJjjXMzZ\nX8qL1eOQzV8EVbP4XsmHOyYENUYHxsbIUjLkAYU1PK/0Jb3igmswqv7553UZ8DEG\nJlrHGntUhRfsb11r0Rt17En597BpYlz5CMYtAtcEQFdGF1l3M+zgLX+MAN3W97CN\nJqt3mm4dAgMBAAECggEAIXBWL9zarrn3N1LhxfJntgg2YA5v8UB4QyrbG96VDS2Z\nnCFE6LmMvBmToJnZpGUl3MuHOpRTN28VGtcm+HX8obtE4uW9CmA7BccFLixqEkQg\nwEvEat804jZRocXtqeOZ8RzVd87GjNBhvoHMLuAVdLfrkJRDzZ5LMuiKvg6kx65O\nAP0iAuEO552GLFbFiRHOR2wJbtpboB5c/FKc77wQGWK6gIn/q36UL/PuuuARWAYK\n4VaL0BHjv9qBNYRJBueJS1D7b7m3qSE3vAS1DLL+KqNECvZszeXRJWKYBvdQimSS\nDB4fPIZk6Zx88MziDALjtm98xkZduOgr4OWo1iqFpwKBgQD2ywD8mvnpy8wkUmTa\nyyQLMUN1TWet/mFFcgdVv3nIkGQXrb4lFBKXRJcN+1poPA2xCUHiycgXDBkB2bwE\ncxEwGYGyBHTcZENHg2D7EowIYOTdhJayujae3eKsRrXy0ctgIm0siCXjVrUfEzse\nr0I175unUSCePI8dXQu28cMpTwKBgQDcIt1PW73XCo2EV/6Q2wKHpIvk+5R9dP3I\nQ37zGQMmCOGqH0Jo41Mbv+rRIDmfe322wHQtlCOxhelu3KKOQf/lTmmmlYEW5cWu\naqa0yfZJqOJKY9GVGwW9+VwFqHbkNfMGMS0QA/G0AM4z0ORqDy54hXgrNcDTkkei\nMmjtnE3+0wKBgQComwxzh9WRmwA/GGN67yoS03dI3rckshP2g+7q8EPdeHhJjRPI\n9Su2WM/yZ3TenZilCLQQotammEdFcmH3kD1/5Q0sd8r2/zDP3LwXDBbLapcxl/H0\n7S9/3guMs0p/OEF/zkVUFTf9VzGqp1LOpeHQQ4DOEKj+MlV8NCNau1UgFQKBgFo2\nK21/EiAS4gWvLdJc/f9qTi4Lb0GudOXhyx+CS4kFsLzPzJ5BMmi30FndE+Aock83\nNSUMhUgVsaDN6AvWPjDRXnh24gzpIoakjCagcT6kZ//GQjgRd9vvWWe0Luy8sxgB\nhQ8AHsf+YIJZg5F3ITsgrys9/wR0+MgeUmO1Xz0jAoGBAK9LrgClrYJGtcmGs3Hb\nV4NqTo7wLUKcXhqDE3wPFSPH4Sr12UQ/PJ06LyKi2oYlwv9Z6DlZ5gXRPdog7tIl\nEl5Gis8s3yT7xb10uxG+A9UJOA1bQb1ZQhivBIEdON94DrtiyZhRs9PrSptHo7SR\nJFnweXaZbt8AiiRYiY6gRlyw\n-----END PRIVATE KEY-----\n",
-    "client_email": "bot-logger@trading-bot-logger-511317.iam.gserviceaccount.com",
-    "client_id": "112953992063609615267",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/bot-logger%40trading-bot-logger-511317.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com"
-}
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
@@ -57,14 +41,13 @@ def repair_pem_key(pk_str):
         return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
     return pk_str
 
-raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "").replace("\xa0", " ").replace("\u00a0", " ").strip()
-if raw_creds:
-    try:
-        creds_json = json.loads(raw_creds, strict=False)
-    except Exception:
-        creds_json = dict(DEFAULT_GOOGLE_CREDS)
-else:
-    creds_json = dict(DEFAULT_GOOGLE_CREDS)
+raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}").replace("\xa0", " ").replace("\u00a0", " ").strip()
+try:
+    creds_json = json.loads(raw_creds, strict=False)
+except json.JSONDecodeError:
+    import tomllib
+    parsed = tomllib.loads(raw_creds)
+    creds_json = parsed.get("GOOGLE_CREDENTIALS", parsed)
 
 if "private_key" in creds_json:
     creds_json["private_key"] = repair_pem_key(creds_json["private_key"])
@@ -104,7 +87,7 @@ CRYPTO_PAIRS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD']
 # 2. SHARED AI, NEWS & TECHNICAL HELPER FUNCTIONS
 # =====================================================================
 def send_discord_alert(message):
-    if not DISCORD_WEBHOOK or "PASTE_DISCORD" in DISCORD_WEBHOOK:
+    if not DISCORD_WEBHOOK:
         return
     try:
         if len(message) <= 1950:
@@ -510,6 +493,7 @@ def run_crypto_tranche(positions_map, active_orders, equity):
         decision = "HOLD"
         action_taken = "None"
 
+        # Dynamic 24/7 Crypto Risk Management (TP: +6.0%, SL: -3.0%, Sentiment Exit <= -0.15)
         if owned_qty > 0:
             entry_price = float(pos.avg_entry_price)
             current_price = float(pos.current_price)
@@ -553,11 +537,12 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                 else:
                     decision = "HOLD"
         else:
+            # 24/7 Crypto Entry Logic: Bullish Sentiment OR Oversold Momentum Reversal
             is_bullish_ai = (score >= 0.05) and (tech is not None and tech['price'] >= tech['ema20'] and tech['rsi14'] < 70.0)
             is_oversold_bounce = (score >= 0.0) and (tech is not None and tech['rsi14'] <= 35.0 and tech['price'] >= tech['sma200'] * 0.95)
 
             if is_bullish_ai or is_oversold_bounce:
-                target_dollars = equity * 0.020
+                target_dollars = equity * 0.020  # 2.0% allocation per crypto pair (10% max total crypto tranche)
                 price = tech['price']
                 qty_to_buy = round(target_dollars / price, 4)
 

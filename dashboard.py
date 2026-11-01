@@ -123,34 +123,23 @@ def classify_symbol(sym):
     return "CORE"
 
 # =====================================================================
-# 2. CREDENTIALS & CONNECTION INITIALIZATION (WITH BUILT-IN FALLBACKS)
+# 2. CREDENTIALS & CONNECTION INITIALIZATION
 # =====================================================================
-DEFAULT_GOOGLE_CREDS = {
-    "type": "service_account",
-    "project_id": "trading-bot-logger-511317",
-    "private_key_id": "16241fed957acbd53894d939b93bf99c2cc2cc55",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDUOBEo96vmYfI5\nPm//578PO18EPzdJppF8qZMQN8CHuEaMHQfe8NPApJpND5yYiAHuqAGji3qrlUPc\nwRB9EUTZT9Qf8h2gqYDMuMNhIcIqExbUiuUBqf7SB+eCWbQDJ6xTHgX9jUDUYRgB\nxggsO6eEelLjJuS9ZwmcgkppUeqdIciZSUfPxgPQOaYiMABwLXlX/kC8VJjjXMzZ\nX8qL1eOQzV8EVbP4XsmHOyYENUYHxsbIUjLkAYU1PK/0Jb3igmswqv7553UZ8DEG\nJlrHGntUhRfsb11r0Rt17En597BpYlz5CMYtAtcEQFdGF1l3M+zgLX+MAN3W97CN\nJqt3mm4dAgMBAAECggEAIXBWL9zarrn3N1LhxfJntgg2YA5v8UB4QyrbG96VDS2Z\nnCFE6LmMvBmToJnZpGUl3MuHOpRTN28VGtcm+HX8obtE4uW9CmA7BccFLixqEkQg\nwEvEat804jZRocXtqeOZ8RzVd87GjNBhvoHMLuAVdLfrkJRDzZ5LMuiKvg6kx65O\nAP0iAuEO552GLFbFiRHOR2wJbtpboB5c/FKc77wQGWK6gIn/q36UL/PuuuARWAYK\n4VaL0BHjv9qBNYRJBueJS1D7b7m3qSE3vAS1DLL+KqNECvZszeXRJWKYBvdQimSS\nDB4fPIZk6Zx88MziDALjtm98xkZduOgr4OWo1iqFpwKBgQD2ywD8mvnpy8wkUmTa\nyyQLMUN1TWet/mFFcgdVv3nIkGQXrb4lFBKXRJcN+1poPA2xCUHiycgXDBkB2bwE\ncxEwGYGyBHTcZENHg2D7EowIYOTdhJayujae3eKsRrXy0ctgIm0siCXjVrUfEzse\nr0I175unUSCePI8dXQu28cMpTwKBgQDcIt1PW73XCo2EV/6Q2wKHpIvk+5R9dP3I\nQ37zGQMmCOGqH0Jo41Mbv+rRIDmfe322wHQtlCOxhelu3KKOQf/lTmmmlYEW5cWu\naqa0yfZJqOJKY9GVGwW9+VwFqHbkNfMGMS0QA/G0AM4z0ORqDy54hXgrNcDTkkei\nMmjtnE3+0wKBgQComwxzh9WRmwA/GGN67yoS03dI3rckshP2g+7q8EPdeHhJjRPI\n9Su2WM/yZ3TenZilCLQQotammEdFcmH3kD1/5Q0sd8r2/zDP3LwXDBbLapcxl/H0\n7S9/3guMs0p/OEF/zkVUFTf9VzGqp1LOpeHQQ4DOEKj+MlV8NCNau1UgFQKBgFo2\nK21/EiAS4gWvLdJc/f9qTi4Lb0GudOXhyx+CS4kFsLzPzJ5BMmi30FndE+Aock83\nNSUMhUgVsaDN6AvWPjDRXnh24gzpIoakjCagcT6kZ//GQjgRd9vvWWe0Luy8sxgB\nhQ8AHsf+YIJZg5F3ITsgrys9/wR0+MgeUmO1Xz0jAoGBAK9LrgClrYJGtcmGs3Hb\nV4NqTo7wLUKcXhqDE3wPFSPH4Sr12UQ/PJ06LyKi2oYlwv9Z6DlZ5gXRPdog7tIl\nEl5Gis8s3yT7xb10uxG+A9UJOA1bQb1ZQhivBIEdON94DrtiyZhRs9PrSptHo7SR\nJFnweXaZbt8AiiRYiY6gRlyw\n-----END PRIVATE KEY-----\n",
-    "client_email": "bot-logger@trading-bot-logger-511317.iam.gserviceaccount.com",
-    "client_id": "112953992063609615267",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/bot-logger%40trading-bot-logger-511317.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com"
-}
-
 def get_secret(key, default=""):
     try:
-        val = st.secrets.get(key, default)
-        return val if val else default
+        return st.secrets.get(key, default)
     except Exception:
         return default
 
-API_KEY = get_secret("APCA_API_KEY_ID", "PK24UBUQJRV4IZBY2PEP2RJA7I")
-API_SECRET = get_secret("APCA_API_SECRET_KEY", "DbZoPN5n93m5T1g3PH6aiENiNgQhhpoAoVBrABfVkx7H")
-GOOGLE_CREDS_RAW = get_secret("GOOGLE_CREDENTIALS", DEFAULT_GOOGLE_CREDS)
-GITHUB_PAT = get_secret("GITHUB_PAT", "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")
+API_KEY = get_secret("APCA_API_KEY_ID")
+API_SECRET = get_secret("APCA_API_SECRET_KEY")
+GOOGLE_CREDS_RAW = get_secret("GOOGLE_CREDENTIALS")
+GITHUB_PAT = get_secret("GITHUB_PAT")
 BASE_URL = "https://paper-api.alpaca.markets"
+
+if not API_KEY or not API_SECRET:
+    st.error("⚠️ Missing Alpaca API keys in Streamlit Secrets. Add `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` in App Settings -> Secrets.")
+    st.stop()
 
 @st.cache_resource
 def init_alpaca():
@@ -173,6 +162,8 @@ def repair_pem_key(pk_str):
     return pk_str
 
 def connect_gsheets():
+    if not GOOGLE_CREDS_RAW:
+        return None, "GOOGLE_CREDENTIALS not found in Streamlit Secrets."
     try:
         if isinstance(GOOGLE_CREDS_RAW, str):
             creds_dict = json.loads(GOOGLE_CREDS_RAW, strict=False)
@@ -378,16 +369,19 @@ with st.sidebar:
     st.markdown("### 🚀 Remote Bot Trigger")
     st.caption("Dispatches all 3 engines on GitHub Actions immediately.")
     if st.button("⚡ Trigger 3-Engine Scan Now", use_container_width=True):
-        resp = requests.post(
-            "https://api.github.com/repos/MakkosHUN/autotradingbot/actions/workflows/schedule.yml/dispatches",
-            headers={"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github+json"},
-            json={"ref": "main"},
-            timeout=10
-        )
-        if resp.status_code == 204:
-            st.success("✅ 3-Engine Scan Dispatched! Completes in ~60s.")
+        if not GITHUB_PAT:
+            st.warning("Add `GITHUB_PAT` to Streamlit Secrets to enable 1-click remote triggers.")
         else:
-            st.error(f"GitHub API Error ({resp.status_code}): {resp.text}")
+            resp = requests.post(
+                "https://api.github.com/repos/MakkosHUN/autotradingbot/actions/workflows/schedule.yml/dispatches",
+                headers={"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github+json"},
+                json={"ref": "main"},
+                timeout=10
+            )
+            if resp.status_code == 204:
+                st.success("✅ 3-Engine Scan Dispatched! Completes in ~60s.")
+            else:
+                st.error(f"GitHub API Error ({resp.status_code}): {resp.text}")
 
     st.markdown("---")
     st.markdown("### 🛡️ System Safeguards")

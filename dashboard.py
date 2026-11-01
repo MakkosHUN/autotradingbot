@@ -262,6 +262,13 @@ def fetch_macro_telemetry():
     macro_ok = (spy_chg > -1.5) and (vix_val < 28.0)
     return macro_ok, spy_chg, vix_val
 
+@st.cache_data(ttl=300)
+def fetch_ticker_history(ticker):
+    try:
+        return yf.Ticker(ticker).history(period="1y")
+    except Exception:
+        return pd.DataFrame()
+
 @st.cache_data(ttl=60)
 def fetch_sheet_logs():
     if not spreadsheet:
@@ -489,13 +496,25 @@ def render_live_terminal():
                     "Value": [r["Market Value"] for r in pos_rows]
                 })
                 fig_pie = px.pie(
-                    alloc_df, values="Value", names="Asset", hole=0.62,
+                    alloc_df, values="Value", names="Asset", hole=0.65,
                     color_discrete_sequence=px.colors.sequential.Tealgrn
+                )
+                fig_pie.update_traces(
+                    textinfo="label+percent",
+                    hovertemplate="<b>%{label}</b><br>Invested: $%{value:,.2f}<br>Share of Invested: %{percent}<extra></extra>"
                 )
                 fig_pie.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     margin=dict(t=10, b=10, l=10, r=10), height=320,
-                    legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5)
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+                    annotations=[dict(
+                        text=(
+                            f"<span style='color:#8B949E; font-size:11px;'>INVESTED</span><br>"
+                            f"<b style='color:#FFFFFF; font-size:16px;'>${invested:,.2f}</b><br>"
+                            f"<span style='color:#00FFAA; font-size:11px;'>{exposure_pct:.1f}% of Equity</span>"
+                        ),
+                        x=0.5, y=0.5, font_size=13, showarrow=False
+                    )]
                 )
                 st.plotly_chart(fig_pie, use_container_width=True)
 
@@ -540,7 +559,7 @@ def render_live_terminal():
         with col_chart:
             st.subheader("🔬 Technical Trend Inspector")
             selected_ticker = st.selectbox("Select Universe Ticker:", TICKERS, index=3)
-            df_yf = yf.Ticker(selected_ticker).history(period="1y")
+            df_yf = fetch_ticker_history(selected_ticker).copy()
             if not df_yf.empty:
                 df_yf["SMA200"] = df_yf["Close"].rolling(200).mean()
                 df_yf["EMA20"] = df_yf["Close"].ewm(span=20, adjust=False).mean()

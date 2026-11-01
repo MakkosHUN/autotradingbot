@@ -666,8 +666,8 @@ def run_bot(mode="all"):
     if all_alerts:
         send_discord_alert("🚨 **Multi-Strategy Bot v3.0 Execution Alert:**\n" + "\n".join(all_alerts))
 
-    # =====================================================================
-    # 6. POST-SCAN MULTI-STRATEGY DISCORD BRIEFING
+   # =====================================================================
+    # 6. POST-SCAN MULTI-STRATEGY DETAILED DISCORD BRIEFING
     # =====================================================================
     try:
         time.sleep(2)
@@ -681,6 +681,7 @@ def run_bot(mode="all"):
         total_pl_pct = (total_pl / 100000.0) * 100
 
         positions_list = api.list_positions()
+        active_orders = fetch_active_and_held_orders()
         ny_time = datetime.now(ZoneInfo("America/New_York"))
         total_unrealized_pl = sum(float(p.unrealized_pl) for p in positions_list)
         invested_val = sum(float(p.market_value) for p in positions_list)
@@ -690,22 +691,48 @@ def run_bot(mode="all"):
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (Crypto 24/7 Active)'}` | 🌍 **Macro:** `{macro_reason}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
             f"📅 **Today's Change:** `${day_pl:+,.2f}` (`{day_pl_pct:+.2f}%`) | 📊 **Open P/L:** `${total_unrealized_pl:+,.2f}`\n"
-            f"💵 **Cash:** `${cash:,.2f}` | 💼 **Invested:** `${invested_val:,.2f}` ({len(positions_list)} total positions)\n"
+            f"💵 **Cash:** `${cash:,.2f}` | 💼 **Invested:** `${invested_val:,.2f}` ({len(positions_list)} total positions)\n\n"
+            f"📈 **Active Portfolio Breakdown ({len(positions_list)}):**\n"
         )
 
+        for p in sorted(positions_list, key=lambda x: float(x.market_value), reverse=True):
+            sym = CRYPTO_NORM.get(str(p.symbol), str(p.symbol))
+            qty = float(p.qty)
+            entry = float(p.avg_entry_price)
+            curr = float(p.current_price)
+            mkt_val = float(p.market_value)
+            pl_dollar = float(p.unrealized_pl)
+            pl_pct = float(p.unrealized_plpc) * 100 if hasattr(p, 'unrealized_plpc') and p.unrealized_plpc else ((curr - entry) / entry) * 100
+
+            sym_orders = get_all_orders_for_ticker(sym, active_orders)
+            stop_str = "None"
+            tp_str = "None"
+            tranche_tag = classify_symbol(sym)
+
+            if tranche_tag == "CRYPTO":
+                stop_str = f"${entry * 0.97:.2f}"
+                tp_str = f"${entry * 1.06:.2f}"
+            else:
+                for o in sym_orders:
+                    if o.side == 'sell':
+                        if o.type in ['stop', 'stop_limit'] and o.stop_price:
+                            stop_str = f"${float(o.stop_price):.2f}"
+                        elif o.type == 'limit' and o.limit_price:
+                            tp_str = f"${float(o.limit_price):.2f}"
+
+            detailed_report += (
+                f"• **{sym}** `({tranche_tag})` ({qty:.4f} if '{tranche_tag}'=='CRYPTO' else int(qty)} sh | `${mkt_val:,.0f}`): "
+                f"`${entry:.2f}` ➔ `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`) | "
+                f"🎯 TP: `{tp_str}` | 🛑 SL: `{stop_str}`\n"
+            )
+
         if core_lines:
-            detailed_report += "\n🛡️ **Engine 1 — Core Long-Term Scan:**\n" + "\n".join(core_lines) + "\n"
+            detailed_report += "\n🛡️ **Core Engine Scan:**\n" + "\n".join(core_lines) + "\n"
         if mom_lines:
-            detailed_report += "\n⚡ **Engine 2 — Short-Term Momentum Scan:**\n" + "\n".join(mom_lines) + "\n"
+            detailed_report += "\n⚡ **Momentum Engine Scan:**\n" + "\n".join(mom_lines) + "\n"
         if crypto_lines:
-            detailed_report += "\n🪙 **Engine 3 — 24/7 Crypto AI Scan:**\n" + "\n".join(crypto_lines) + "\n"
+            detailed_report += "\n🪙 **Crypto Engine Scan:**\n" + "\n".join(crypto_lines) + "\n"
 
         send_discord_alert(detailed_report)
     except Exception as e:
         print(f"Detailed portfolio report error: {e}")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default=os.environ.get("BOT_MODE", "all"), choices=["all", "core", "momentum", "crypto"])
-    args = parser.parse_args()
-    run_bot(mode=args.mode)

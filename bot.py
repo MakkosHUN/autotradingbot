@@ -666,7 +666,7 @@ def run_bot(mode="all"):
     if all_alerts:
         send_discord_alert("🚨 **Multi-Strategy Bot v3.0 Execution Alert:**\n" + "\n".join(all_alerts))
 
-   # =====================================================================
+    # =====================================================================
     # 6. POST-SCAN MULTI-STRATEGY DETAILED DISCORD BRIEFING
     # =====================================================================
     try:
@@ -710,9 +710,11 @@ def run_bot(mode="all"):
             tranche_tag = classify_symbol(sym)
 
             if tranche_tag == "CRYPTO":
+                qty_str = f"{qty:.4f} units"
                 stop_str = f"${entry * 0.97:.2f}"
                 tp_str = f"${entry * 1.06:.2f}"
             else:
+                qty_str = f"{int(qty)} sh"
                 for o in sym_orders:
                     if o.side == 'sell':
                         if o.type in ['stop', 'stop_limit'] and o.stop_price:
@@ -721,7 +723,7 @@ def run_bot(mode="all"):
                             tp_str = f"${float(o.limit_price):.2f}"
 
             detailed_report += (
-                f"• **{sym}** `({tranche_tag})` ({qty:.4f} if '{tranche_tag}'=='CRYPTO' else int(qty)} sh | `${mkt_val:,.0f}`): "
+                f"• **{sym}** `({tranche_tag})` ({qty_str} | `${mkt_val:,.0f}`): "
                 f"`${entry:.2f}` ➔ `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`) | "
                 f"🎯 TP: `{tp_str}` | 🛑 SL: `{stop_str}`\n"
             )
@@ -736,3 +738,9 @@ def run_bot(mode="all"):
         send_discord_alert(detailed_report)
     except Exception as e:
         print(f"Detailed portfolio report error: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default=os.environ.get("BOT_MODE", "all"), choices=["all", "core", "momentum", "crypto"])
+    args = parser.parse_args()
+    run_bot(mode=args.mode)

@@ -82,6 +82,17 @@ closed_sheet = get_or_create_worksheet(
 CORE_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
 MOMENTUM_TICKERS = ['AMD', 'PLTR', 'META', 'COIN', 'NFLX', 'AMZN', 'CRM', 'UBER']
 CRYPTO_PAIRS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD']
+CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_PAIRS}
+
+def classify_symbol(sym):
+    s_clean = sym.replace("/", "")
+    if sym in CORE_TICKERS:
+        return "CORE"
+    if sym in MOMENTUM_TICKERS:
+        return "MOMENTUM"
+    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM:
+        return "CRYPTO"
+    return "CORE"
 
 # =====================================================================
 # 2. SHARED AI, NEWS & TECHNICAL HELPER FUNCTIONS
@@ -493,7 +504,6 @@ def run_crypto_tranche(positions_map, active_orders, equity):
         decision = "HOLD"
         action_taken = "None"
 
-        # Dynamic 24/7 Crypto Risk Management (TP: +6.0%, SL: -3.0%, Sentiment Exit <= -0.15)
         if owned_qty > 0:
             entry_price = float(pos.avg_entry_price)
             current_price = float(pos.current_price)
@@ -537,12 +547,11 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                 else:
                     decision = "HOLD"
         else:
-            # 24/7 Crypto Entry Logic: Bullish Sentiment OR Oversold Momentum Reversal
             is_bullish_ai = (score >= 0.05) and (tech is not None and tech['price'] >= tech['ema20'] and tech['rsi14'] < 70.0)
             is_oversold_bounce = (score >= 0.0) and (tech is not None and tech['rsi14'] <= 35.0 and tech['price'] >= tech['sma200'] * 0.95)
 
             if is_bullish_ai or is_oversold_bounce:
-                target_dollars = equity * 0.020  # 2.0% allocation per crypto pair (10% max total crypto tranche)
+                target_dollars = equity * 0.020
                 price = tech['price']
                 qty_to_buy = round(target_dollars / price, 4)
 

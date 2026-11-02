@@ -15,17 +15,16 @@ from google.oauth2.service_account import Credentials
 from transformers import pipeline
 
 # =====================================================================
-# 1. INITIALIZE CONNECTIONS, CREDENTIALS & 3-TIER UNIVERSES
+# 1. INITIALIZE CONNECTIONS & SANITIZED CREDENTIALS
 # =====================================================================
-API_KEY = os.environ.get("APCA_API_KEY_ID")
-API_SECRET = os.environ.get("APCA_API_SECRET_KEY")
+API_KEY = os.environ.get("APCA_API_KEY_ID", "").strip()
+API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "").strip()
 BASE_URL = "https://paper-api.alpaca.markets"
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
 def repair_pem_key(pk_str):
-    """Automatically repairs newlines and missing Base64 '=' padding in PEM keys."""
     pk_str = pk_str.replace("\\n", "\n").strip()
     header = "-----BEGIN PRIVATE KEY-----"
     footer = "-----END PRIVATE KEY-----"
@@ -45,31 +44,43 @@ raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}").replace("\xa0", " ").repl
 try:
     creds_json = json.loads(raw_creds, strict=False)
 except json.JSONDecodeError:
-    import tomllib
-    parsed = tomllib.loads(raw_creds)
-    creds_json = parsed.get("GOOGLE_CREDENTIALS", parsed)
+    try:
+        import tomllib
+        parsed = tomllib.loads(raw_creds)
+        creds_json = parsed.get("GOOGLE_CREDENTIALS", parsed)
+    except Exception:
+        creds_json = {}
 
 if "private_key" in creds_json:
     creds_json["private_key"] = repair_pem_key(creds_json["private_key"])
 
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-gc = gspread.authorize(creds)
-spreadsheet = gc.open("Auto-Trading Bot Log")
+if creds_json:
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    try:
+        creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open("Auto-Trading Bot Log")
+    except Exception as e:
+        print(f"Google Sheets Auth Error: {e}")
+        spreadsheet = None
+else:
+    spreadsheet = None
 
 def get_or_create_worksheet(sh, title, headers):
+    if not sh:
+        return None
     try:
         ws = sh.worksheet(title)
     except Exception:
-        ws = sh.add_worksheet(title=title, rows="1500", cols="10")
+        ws = sh.add_worksheet(title=title, rows="2000", cols="10")
         ws.append_row(headers)
     return ws
 
 LOG_HEADERS = ["Timestamp", "Ticker", "FinBERT Score", "Decision", "Action Taken", "Position Status"]
-core_sheet = spreadsheet.sheet1
+core_sheet = spreadsheet.sheet1 if spreadsheet else None
 momentum_sheet = get_or_create_worksheet(spreadsheet, "Momentum Log", LOG_HEADERS)
 crypto_sheet = get_or_create_worksheet(spreadsheet, "Crypto Log", LOG_HEADERS)
 closed_sheet = get_or_create_worksheet(
@@ -78,42 +89,122 @@ closed_sheet = get_or_create_worksheet(
     ["Closed At (UTC)", "Ticker", "Qty", "Exit Type", "Fill Price", "Order ID"]
 )
 
-# 3 Non-Overlapping Strategy Universes
-CORE_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
-MOMENTUM_TICKERS = ['AMD', 'PLTR', 'META', 'COIN', 'NFLX', 'AMZN', 'CRM', 'UBER']
-CRYPTO_PAIRS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD']
-CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_PAIRS}
+# =====================================================================
+# 2. EXPANDED 68-ASSET MASTER POOLS & DYNAMIC QUANT SCREENER
+# =====================================================================
+CORE_POOL = [
+    'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG',
+    'CAT', 'DIS', 'V', 'MA', 'UNH', 'HD', 'COST', 'ABBV', 'KO', 'PEP',
+    'AVGO', 'ORCL', 'CVX', 'MRK', 'BAC', 'LLY', 'MCD', 'TMO', 'CSCO', 'ACN'
+]
+MOMENTUM_POOL = [
+    'AMD', 'PLTR', 'META', 'COIN', 'NFLX', 'AMZN', 'CRM', 'UBER', 'SHOP', 'XYZ',
+    'SNOW', 'CRWD', 'PANW', 'DKNG', 'ROKU', 'HOOD', 'MARA', 'RIOT', 'SOFI', 'ARM',
+    'SMCI', 'MU', 'INTC', 'MSTR'
+]
+CRYPTO_POOL = [
+    'BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'DOGE/USD', 'XRP/USD',
+    'LTC/USD', 'UNI/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD', 'SUI/USD'
+]
+CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_POOL}
+
+def to_yf_symbol(ticker):
+    return ticker.replace("/", "-")
+
+def to_alpaca_pos_symbol(ticker):
+    return ticker.replace("/", "")
 
 def classify_symbol(sym):
     s_clean = sym.replace("/", "")
-    if sym in CORE_TICKERS:
+    if sym in CORE_POOL:
         return "CORE"
-    if sym in MOMENTUM_TICKERS:
+    if sym in MOMENTUM_POOL:
         return "MOMENTUM"
-    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM:
+    if sym in CRYPTO_POOL or s_clean in CRYPTO_NORM or sym.endswith("/USD") or sym.endswith("USD"):
         return "CRYPTO"
     return "CORE"
 
+def screen_top_candidates(pool, top_n, owned_symbols, mode="core"):
+    always_include = []
+    for t in pool:
+        if t in owned_symbols or to_alpaca_pos_symbol(t) in owned_symbols:
+            always_include.append(t)
+
+    remaining_pool = [t for t in pool if t not in always_include]
+    slots_left = max(0, top_n - len(always_include))
+    if slots_left == 0 or not remaining_pool:
+        return always_include[:top_n]
+
+    yf_map = {to_yf_symbol(t): t for t in remaining_pool}
+    yf_list = list(yf_map.keys())
+
+    scored = []
+    try:
+        data = yf.download(yf_list, period="5d", interval="1d", group_by="ticker", threads=True, progress=False)
+        for yf_sym, orig_t in yf_map.items():
+            try:
+                df_t = data[yf_sym] if len(yf_list) > 1 else data
+                df_t = df_t.dropna(subset=["Close"])
+                if len(df_t) < 2:
+                    continue
+                close_now = float(df_t["Close"].iloc[-1])
+                close_prev = float(df_t["Close"].iloc[-2])
+                ret_1d = (close_now - close_prev) / close_prev if close_prev > 0 else 0.0
+
+                vol_now = float(df_t["Volume"].iloc[-1]) if "Volume" in df_t.columns else 1.0
+                vol_avg = float(df_t["Volume"].mean()) if "Volume" in df_t.columns and float(df_t["Volume"].mean()) > 0 else 1.0
+                rel_vol = vol_now / vol_avg
+
+                if mode == "momentum":
+                    rank_score = (abs(ret_1d) * 100.0) * (1.0 + min(rel_vol, 3.0))
+                elif mode == "crypto":
+                    rank_score = (abs(ret_1d) * 100.0) + (rel_vol * 1.5)
+                else:
+                    rank_score = (ret_1d * 50.0) + rel_vol
+
+                scored.append((rank_score, orig_t))
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Screener batch warning ({mode}): {e}")
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = [t for _, t in scored[:slots_left]]
+
+    for t in remaining_pool:
+        if len(always_include) + len(selected) >= top_n:
+            break
+        if t not in selected:
+            selected.append(t)
+
+    final_list = always_include + selected
+    print(f"[AI SCREENER - {mode.upper()}] Filtered {len(pool)} pool -> {len(final_list)} active candidates: {final_list}")
+    return final_list
+
 # =====================================================================
-# 2. SHARED AI, NEWS & TECHNICAL HELPER FUNCTIONS
+# 3. SHARED AI, NEWS & TECHNICAL HELPER FUNCTIONS
 # =====================================================================
 def send_discord_alert(message):
     if not DISCORD_WEBHOOK:
+        print("Discord alert skipped: DISCORD_WEBHOOK_URL is empty.")
         return
     try:
         if len(message) <= 1950:
-            requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=5)
+            r = requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=10)
+            if r.status_code >= 400:
+                print(f"Discord HTTP {r.status_code}: {r.text}")
         else:
             lines = message.split("\n")
             chunk = ""
             for line in lines:
                 if len(chunk) + len(line) + 1 > 1900:
-                    requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=5)
+                    requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
+                    time.sleep(0.5)
                     chunk = line + "\n"
                 else:
                     chunk += line + "\n"
             if chunk:
-                requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=5)
+                requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
     except Exception as e:
         print(f"Discord alert error: {e}")
 
@@ -125,14 +216,7 @@ finbert = pipeline(
     top_k=None
 )
 
-def to_yf_symbol(ticker):
-    return ticker.replace("/", "-")
-
-def to_alpaca_pos_symbol(ticker):
-    return ticker.replace("/", "")
-
 def get_fresh_dual_news(ticker):
-    """Fetches 24h news from Alpaca + Yahoo Finance with a 72h fallback for quiet blue-chips."""
     headlines = []
     seen = set()
     now_utc = datetime.now(timezone.utc)
@@ -178,7 +262,6 @@ def get_fresh_dual_news(ticker):
 
     if not headlines and older_backup:
         headlines = older_backup[:5]
-
     return headlines
 
 def get_finbert_sentiment(headlines):
@@ -211,14 +294,14 @@ def check_macro_regime():
         vix = yf.Ticker("^VIX").history(period="2d")
         spy_change = 0.0
         vix_level = 0.0
+        if not vix.empty:
+            vix_level = float(vix['Close'].iloc[-1])
         if len(spy) >= 2:
             spy_change = (spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]
             if spy_change <= -0.015:
                 return False, f"SPY {spy_change*100:+.2f}% | VIX {vix_level:.1f} (PANIC BLOCK)"
-        if not vix.empty:
-            vix_level = float(vix['Close'].iloc[-1])
-            if vix_level > 28.0:
-                return False, f"SPY {spy_change*100:+.2f}% | VIX {vix_level:.1f} (VIX BLOCK)"
+        if vix_level > 28.0:
+            return False, f"SPY {spy_change*100:+.2f}% | VIX {vix_level:.1f} (VIX BLOCK)"
         return True, f"Normal (SPY {spy_change*100:+.2f}%, VIX {vix_level:.1f})"
     except Exception as e:
         print(f"Macro check warning: {e}")
@@ -227,16 +310,15 @@ def check_macro_regime():
 def get_technicals_and_atr(ticker):
     yf_sym = to_yf_symbol(ticker)
     df = yf.Ticker(yf_sym).history(period="1y")
-    if df.empty or len(df) < 50:
+    if df.empty or len(df) < 30:
         return None
     close = df['Close']
     current_price = float(close.iloc[-1])
     sma200 = float(close.rolling(200).mean().iloc[-1]) if len(df) >= 200 else float(close.mean())
-    sma50 = float(close.rolling(50).mean().iloc[-1])
+    sma50 = float(close.rolling(50).mean().iloc[-1]) if len(df) >= 50 else float(close.mean())
     ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
     ema9 = float(close.ewm(span=9, adjust=False).mean().iloc[-1])
 
-    # Wilder's Exponentially Smoothed RSI-14
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
@@ -244,7 +326,6 @@ def get_technicals_and_atr(ticker):
     rsi_series = 100 - (100 / (1 + rs))
     rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
 
-    # Native 14-Day ATR
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - close.shift())
     low_close = np.abs(df['Low'] - close.shift())
@@ -326,6 +407,8 @@ def cancel_existing_orders_for_ticker(ticker, active_orders):
         time.sleep(1.5)
 
 def sync_recent_closed_sells(closed_orders):
+    if not closed_sheet:
+        return []
     new_fill_alerts = []
     try:
         existing_ids = set(closed_sheet.col_values(6))
@@ -347,7 +430,7 @@ def sync_recent_closed_sells(closed_orders):
     return new_fill_alerts
 
 # =====================================================================
-# 3. ENGINE 1 & 2: EQUITY TRANCHE EXECUTOR (CORE & MOMENTUM)
+# 4. ENGINE 1 & 2: EQUITY TRANCHE EXECUTOR (24/7 RADAR + NYSE EXECUTION)
 # =====================================================================
 def run_equity_tranche(
     tranche_name,
@@ -360,6 +443,7 @@ def run_equity_tranche(
     pdt_restricted,
     macro_ok,
     macro_reason,
+    is_nyse_open,
     buy_score_min,
     exit_score_max,
     sl_atr_mult,
@@ -370,6 +454,7 @@ def run_equity_tranche(
 ):
     tranche_alerts = []
     scan_lines = []
+    rows_to_append = []
 
     for ticker in tickers:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -389,7 +474,10 @@ def run_equity_tranche(
             unrealized_pct = (current_price - entry_price) / entry_price
 
             if score <= exit_score_max:
-                if pdt_restricted:
+                if not is_nyse_open:
+                    decision = "BEARISH (NYSE Closed - Radar)"
+                    action_taken = "Awaiting NYSE Open for Exit"
+                elif pdt_restricted:
                     decision = "BEARISH (PDT Shield Locked)"
                     action_taken = "Skipped sell to prevent PDT lock"
                 else:
@@ -410,7 +498,7 @@ def run_equity_tranche(
                         decision = "BEARISH"
                         action_taken = f"Sell Failed: {e}"
             else:
-                if unrealized_pct >= ratchet_trigger_pct:
+                if is_nyse_open and unrealized_pct >= ratchet_trigger_pct:
                     ticker_orders = get_all_orders_for_ticker(ticker, active_orders)
                     ticker_stops = [o for o in ticker_orders if o.side == 'sell' and o.type in ['stop', 'stop_limit']]
                     if ticker_stops:
@@ -425,8 +513,19 @@ def run_equity_tranche(
 
                 decision = "BULLISH (Already Owned)" if score >= buy_score_min else "HOLD"
         else:
-            if score >= buy_score_min:
-                if not macro_ok:
+            tech_momentum_breakout = (
+                not require_sma200
+                and tech is not None
+                and score >= 0.0
+                and tech['price'] > tech['ema9'] > tech['ema20'] > tech['sma50']
+                and 45.0 <= tech['rsi14'] <= 70.0
+            )
+
+            if score >= buy_score_min or tech_momentum_breakout:
+                if not is_nyse_open:
+                    decision = "BULLISH (NYSE Closed - Radar)"
+                    action_taken = f"Pre-Market Target @ ~${tech['price']:.2f}" if tech else "Queued Radar"
+                elif not macro_ok:
                     decision = f"BULLISH (Blocked: {macro_reason})"
                 elif pdt_restricted:
                     decision = "BULLISH (Blocked: PDT Shield)"
@@ -439,7 +538,7 @@ def run_equity_tranche(
                 elif require_sma200 and tech['price'] < tech['sma200']:
                     decision = f"BULLISH (Blocked: Below 200-SMA ${tech['sma200']:.2f})"
                 elif not require_sma200 and tech['ema20'] < tech['sma50']:
-                    decision = f"BULLISH (Blocked: 20-EMA < 50-SMA)"
+                    decision = "BULLISH (Blocked: 20-EMA < 50-SMA)"
                 elif tech['price'] < tech['ema20']:
                     decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
                 elif tech['rsi14'] > 72.0:
@@ -477,21 +576,28 @@ def run_equity_tranche(
                 decision = "HOLD"
 
         row = [now_str, ticker, f"{score:+.3f}", decision, action_taken, f"Holding {int(owned_qty)} shares"]
-        sheet_ws.append_row(row)
+        rows_to_append.append(row)
         print(f"[{tranche_name}] {ticker}: {score:+.3f} | {decision} | {action_taken}")
         scan_lines.append(f"• **{ticker}**: FinBERT `{score:+.3f}` ({len(headlines)} news) | RSI `{rsi_val}` ➔ `{decision}`")
-        time.sleep(1)
+        time.sleep(0.5)
+
+    if rows_to_append and sheet_ws:
+        try:
+            sheet_ws.append_rows(rows_to_append)
+        except Exception as e:
+            print(f"Batch sheet write warning ({tranche_name}): {e}")
 
     return tranche_alerts, scan_lines
 
 # =====================================================================
-# 4. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR
+# 5. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR
 # =====================================================================
-def run_crypto_tranche(positions_map, active_orders, equity):
+def run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity):
     crypto_alerts = []
     scan_lines = []
+    rows_to_append = []
 
-    for pair in CRYPTO_PAIRS:
+    for pair in crypto_candidates:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         headlines = get_fresh_dual_news(pair)
         score = get_finbert_sentiment(headlines)
@@ -514,10 +620,10 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                 exit_reason = f"Crypto Take-Profit Hit (+{unrealized_pct*100:.2f}%)"
             elif unrealized_pct <= -0.030:
                 exit_reason = f"Crypto Stop-Loss Hit ({unrealized_pct*100:.2f}%)"
-            elif score <= -0.15:
+            elif score <= -0.20:
                 exit_reason = f"Bearish Crypto Sentiment ({score:+.3f})"
             elif tech and tech['rsi14'] > 78.0 and unrealized_pct > 0.02:
-                exit_reason = f"RSI Extreme Overbought Profit Lock (RSI {tech['rsi14']:.1f})"
+                exit_reason = f"RSI Overbought Profit Lock (RSI {tech['rsi14']:.1f})"
 
             if exit_reason:
                 try:
@@ -531,9 +637,10 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                     )
                     decision = "EXIT"
                     action_taken = f"Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
-                    closed_sheet.append_row([
-                        now_str[:19], pair, f"{owned_qty:.4f}", exit_reason, f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_MKT'))
-                    ])
+                    if closed_sheet:
+                        closed_sheet.append_row([
+                            now_str[:19], pair, f"{owned_qty:.4f}", exit_reason, f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_MKT'))
+                        ])
                     owned_qty = 0.0
                     crypto_alerts.append(f"🪙 **[CRYPTO EXIT] {pair}**: {action_taken}")
                 except Exception as e:
@@ -548,9 +655,10 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                     decision = "HOLD"
         else:
             is_bullish_ai = (score >= 0.05) and (tech is not None and tech['price'] >= tech['ema20'] and tech['rsi14'] < 70.0)
-            is_oversold_bounce = (score >= 0.0) and (tech is not None and tech['rsi14'] <= 35.0 and tech['price'] >= tech['sma200'] * 0.95)
+            is_tech_breakout = (score >= 0.0) and (tech is not None and tech['price'] > tech['ema9'] > tech['ema20'] and 48.0 <= tech['rsi14'] <= 68.0)
+            is_oversold_bounce = (score > -0.45) and (tech is not None and tech['rsi14'] <= 33.0)
 
-            if is_bullish_ai or is_oversold_bounce:
+            if is_bullish_ai or is_tech_breakout or is_oversold_bounce:
                 target_dollars = equity * 0.020
                 price = tech['price']
                 qty_to_buy = round(target_dollars / price, 4)
@@ -565,8 +673,8 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                             time_in_force='gtc'
                         )
                         decision = "BULLISH"
-                        trigger_lbl = "AI Breakout" if is_bullish_ai else "Oversold Bounce"
-                        action_taken = f"Bought {qty_to_buy:.4f} @ ~${price:.2f} ({trigger_lbl} | Dynamic TP +6% / SL -3%)"
+                        trigger_lbl = "AI Breakout" if is_bullish_ai else ("Tech Breakout" if is_tech_breakout else f"Oversold Bounce RSI {rsi_val}")
+                        action_taken = f"Bought {qty_to_buy:.4f} @ ~${price:.2f} ({trigger_lbl} | TP +6% / SL -3%)"
                         owned_qty = qty_to_buy
                         crypto_alerts.append(f"🪙 **[CRYPTO BUY] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, RSI: `{rsi_val}`)")
                     except Exception as e:
@@ -580,15 +688,21 @@ def run_crypto_tranche(positions_map, active_orders, equity):
                 decision = "HOLD"
 
         row = [now_str, pair, f"{score:+.3f}", decision, action_taken, f"Holding {owned_qty:.4f} units"]
-        crypto_sheet.append_row(row)
+        rows_to_append.append(row)
         print(f"[CRYPTO] {pair}: {score:+.3f} | {decision} | {action_taken}")
         scan_lines.append(f"• **{pair}**: FinBERT `{score:+.3f}` ({len(headlines)} news) | RSI `{rsi_val}` ➔ `{decision}`")
-        time.sleep(1)
+        time.sleep(0.5)
+
+    if rows_to_append and crypto_sheet:
+        try:
+            crypto_sheet.append_rows(rows_to_append)
+        except Exception as e:
+            print(f"Batch sheet write warning (CRYPTO): {e}")
 
     return crypto_alerts, scan_lines
 
 # =====================================================================
-# 5. MASTER ORCHESTRATOR
+# 6. MASTER ORCHESTRATOR
 # =====================================================================
 def run_bot(mode="all"):
     clock = api.get_clock()
@@ -601,9 +715,12 @@ def run_bot(mode="all"):
 
     raw_positions = api.list_positions()
     positions_map = {}
+    owned_symbols = set()
     for p in raw_positions:
         positions_map[p.symbol] = p
         positions_map[to_alpaca_pos_symbol(p.symbol)] = p
+        owned_symbols.add(p.symbol)
+        owned_symbols.add(to_alpaca_pos_symbol(p.symbol))
 
     active_orders = fetch_active_and_held_orders()
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -615,68 +732,70 @@ def run_bot(mode="all"):
     all_alerts = list(automated_exit_alerts)
     core_lines, mom_lines, crypto_lines = [], [], []
 
-    # 1. Execute 24/7 Crypto AI Quant Tranche (Always runs 24/7/365!)
+    # 1. Screen & Execute Engine 3: 24/7 Crypto AI Quant
     if mode in ["all", "crypto"]:
-        print("=== Running Engine 3: 24/7 Crypto AI Quant ===")
-        c_alerts, crypto_lines = run_crypto_tranche(positions_map, active_orders, equity)
+        print("=== Screening & Running Engine 3: 24/7 Crypto AI Quant ===")
+        crypto_candidates = screen_top_candidates(CRYPTO_POOL, top_n=6, owned_symbols=owned_symbols, mode="crypto")
+        c_alerts, crypto_lines = run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity)
         all_alerts.extend(c_alerts)
 
-    # 2. Execute Core & Momentum Equity Tranches (Requires NYSE Open)
-    if mode in ["all", "core", "momentum"]:
-        if not is_nyse_open:
-            print("NYSE is currently CLOSED. Skipped Equity engines (24/7 Crypto AI ran normally).")
-        else:
-            if mode in ["all", "core"]:
-                print("=== Running Engine 1: Core Long-Term Equities ===")
-                core_alerts, core_lines = run_equity_tranche(
-                    tranche_name="CORE",
-                    tickers=CORE_TICKERS,
-                    sheet_ws=core_sheet,
-                    positions_map=positions_map,
-                    active_orders=active_orders,
-                    closed_orders_24h=closed_orders_24h,
-                    equity=equity,
-                    pdt_restricted=pdt_restricted,
-                    macro_ok=macro_ok,
-                    macro_reason=macro_reason,
-                    buy_score_min=0.10,
-                    exit_score_max=-0.15,
-                    sl_atr_mult=1.5,
-                    tp_atr_mult=3.5,
-                    ratchet_trigger_pct=0.025,
-                    alloc_pct=0.020,
-                    require_sma200=True
-                )
-                all_alerts.extend(core_alerts)
+    # 2. Screen & Run Engine 1: Core Long-Term
+    if mode in ["all", "core"]:
+        print("=== Screening & Running Engine 1: Core Long-Term Equities ===")
+        core_candidates = screen_top_candidates(CORE_POOL, top_n=10, owned_symbols=owned_symbols, mode="core")
+        core_alerts, core_lines = run_equity_tranche(
+            tranche_name="CORE",
+            tickers=core_candidates,
+            sheet_ws=core_sheet,
+            positions_map=positions_map,
+            active_orders=active_orders,
+            closed_orders_24h=closed_orders_24h,
+            equity=equity,
+            pdt_restricted=pdt_restricted,
+            macro_ok=macro_ok,
+            macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open,
+            buy_score_min=0.10,
+            exit_score_max=-0.15,
+            sl_atr_mult=1.5,
+            tp_atr_mult=3.5,
+            ratchet_trigger_pct=0.025,
+            alloc_pct=0.020,
+            require_sma200=True
+        )
+        all_alerts.extend(core_alerts)
 
-            if mode in ["all", "momentum"]:
-                print("=== Running Engine 2: Short-Term Momentum Equities ===")
-                mom_alerts, mom_lines = run_equity_tranche(
-                    tranche_name="MOMENTUM",
-                    tickers=MOMENTUM_TICKERS,
-                    sheet_ws=momentum_sheet,
-                    positions_map=positions_map,
-                    active_orders=active_orders,
-                    closed_orders_24h=closed_orders_24h,
-                    equity=equity,
-                    pdt_restricted=pdt_restricted,
-                    macro_ok=macro_ok,
-                    macro_reason=macro_reason,
-                    buy_score_min=0.05,
-                    exit_score_max=-0.12,
-                    sl_atr_mult=1.0,
-                    tp_atr_mult=2.0,
-                    ratchet_trigger_pct=0.015,
-                    alloc_pct=0.015,
-                    require_sma200=False
-                )
-                all_alerts.extend(mom_alerts)
+    # 3. Screen & Run Engine 2: Short-Term Momentum
+    if mode in ["all", "momentum"]:
+        print("=== Screening & Running Engine 2: Short-Term Momentum Equities ===")
+        mom_candidates = screen_top_candidates(MOMENTUM_POOL, top_n=8, owned_symbols=owned_symbols, mode="momentum")
+        mom_alerts, mom_lines = run_equity_tranche(
+            tranche_name="MOMENTUM",
+            tickers=mom_candidates,
+            sheet_ws=momentum_sheet,
+            positions_map=positions_map,
+            active_orders=active_orders,
+            closed_orders_24h=closed_orders_24h,
+            equity=equity,
+            pdt_restricted=pdt_restricted,
+            macro_ok=macro_ok,
+            macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open,
+            buy_score_min=0.05,
+            exit_score_max=-0.12,
+            sl_atr_mult=1.0,
+            tp_atr_mult=2.0,
+            ratchet_trigger_pct=0.015,
+            alloc_pct=0.015,
+            require_sma200=False
+        )
+        all_alerts.extend(mom_alerts)
 
     if all_alerts:
-        send_discord_alert("🚨 **Multi-Strategy Bot v3.0 Execution Alert:**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **Multi-Strategy Bot v3.5 Execution Alert:**\n" + "\n".join(all_alerts))
 
     # =====================================================================
-    # 6. POST-SCAN MULTI-STRATEGY DETAILED DISCORD BRIEFING
+    # 7. POST-SCAN MULTI-STRATEGY DETAILED DISCORD BRIEFING
     # =====================================================================
     try:
         time.sleep(2)
@@ -696,8 +815,8 @@ def run_bot(mode="all"):
         invested_val = sum(float(p.market_value) for p in positions_list)
 
         detailed_report = (
-            f"🏛️ **Multi-Strategy Hedge Fund v3.0 Telemetry Report**\n"
-            f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (Crypto 24/7 Active)'}` | 🌍 **Macro:** `{macro_reason}`\n"
+            f"🏛️ **Multi-Strategy Hedge Fund v3.5 Telemetry Report (68-Asset AI Screener)**\n"
+            f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto Active)'}` | 🌍 **Macro:** `{macro_reason}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
             f"📅 **Today's Change:** `${day_pl:+,.2f}` (`{day_pl_pct:+.2f}%`) | 📊 **Open P/L:** `${total_unrealized_pl:+,.2f}`\n"
             f"💵 **Cash:** `${cash:,.2f}` | 💼 **Invested:** `${invested_val:,.2f}` ({len(positions_list)} total positions)\n\n"
@@ -738,11 +857,11 @@ def run_bot(mode="all"):
             )
 
         if core_lines:
-            detailed_report += "\n🛡️ **Core Engine Scan:**\n" + "\n".join(core_lines) + "\n"
+            detailed_report += "\n🛡️ **Engine 1 — Screened Core Blue-Chips:**\n" + "\n".join(core_lines) + "\n"
         if mom_lines:
-            detailed_report += "\n⚡ **Momentum Engine Scan:**\n" + "\n".join(mom_lines) + "\n"
+            detailed_report += "\n⚡ **Engine 2 — Screened Short-Term Momentum:**\n" + "\n".join(mom_lines) + "\n"
         if crypto_lines:
-            detailed_report += "\n🪙 **Crypto Engine Scan:**\n" + "\n".join(crypto_lines) + "\n"
+            detailed_report += "\n🪙 **Engine 3 — Screened 24/7 Crypto AI:**\n" + "\n".join(crypto_lines) + "\n"
 
         send_discord_alert(detailed_report)
     except Exception as e:

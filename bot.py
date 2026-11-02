@@ -21,6 +21,7 @@ API_KEY = os.environ.get("APCA_API_KEY_ID", "").strip()
 API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "").strip()
 BASE_URL = "https://paper-api.alpaca.markets"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://share.streamlit.io").strip().rstrip("/")
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
@@ -75,7 +76,7 @@ def get_or_create_worksheet(sh, title, headers):
     try:
         ws = sh.worksheet(title)
     except Exception:
-        ws = sh.add_worksheet(title=title, rows="2000", cols="10")
+        ws = sh.add_worksheet(title=title, rows="2500", cols="12")
         ws.append_row(headers)
     return ws
 
@@ -86,7 +87,7 @@ crypto_sheet = get_or_create_worksheet(spreadsheet, "Crypto Log", LOG_HEADERS)
 closed_sheet = get_or_create_worksheet(
     spreadsheet,
     "Closed Trades",
-    ["Closed At (UTC)", "Ticker", "Qty", "Exit Type", "Fill Price", "Order ID"]
+    ["Closed At (UTC)", "Ticker", "Qty", "Exit Type", "Fill Price", "Order ID", "Engine", "Entry Price", "Realized P/L ($)", "Return (%)"]
 )
 
 # =====================================================================
@@ -104,7 +105,7 @@ MOMENTUM_POOL = [
 ]
 CRYPTO_POOL = [
     'BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'DOGE/USD', 'XRP/USD',
-    'LTC/USD', 'UNI/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD', 'SUI/USD'
+    'LTC/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD'
 ]
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_POOL}
 
@@ -182,7 +183,135 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core"):
     return final_list
 
 # =====================================================================
-# 3. SHARED AI, NEWS & TECHNICAL HELPER FUNCTIONS
+# 3. MATHEMATICAL ARBITER MATRIX & ATR RISK-PARITY SIZING
+# =====================================================================
+def compute_arbiter_matrix(finbert_score, tech, base_buy_min=0.05, base_exit_max=-0.15):
+    """
+    Mathematical Arbiter Matrix:
+    Dynamically shifts decision weights between News Sentiment (FinBERT) and
+    Technicals (EMA/SMA/RSI/Volume) based on catalyst intensity and volume spikes.
+    Returns:
+      dict with regime_label, w_news, w_tech, composite_score, tp_mult_adj,
+      rsi_ceiling, should_buy, should_exit_profit_or_bearish
+    """
+    if tech is None:
+        return {
+            "regime": "NO-TECH",
+            "w_news": 1.0,
+            "w_tech": 0.0,
+            "composite": finbert_score,
+            "tp_adj": 1.0,
+            "rsi_max": 72.0,
+            "buy_signal": False,
+            "arbiter_exit_reason": None
+        }
+
+    rel_vol = tech.get("rel_vol", 1.0)
+    rsi = tech["rsi14"]
+    price = tech["price"]
+    ema9 = tech["ema9"]
+    ema20 = tech["ema20"]
+    sma50 = tech["sma50"]
+
+    # Compute normalized Technical Score in [-1.0, +1.0]
+    tech_score = 0.0
+    if price > ema9 > ema20:
+        tech_score += 0.45
+    elif price > ema20:
+        tech_score += 0.25
+    else:
+        tech_score -= 0.40
+
+    if ema20 > sma50:
+        tech_score += 0.25
+    else:
+        tech_score -= 0.20
+
+    # RSI contribution (oversold bounce bonus or overbought penalty)
+    if rsi <= 33.0:
+        tech_score += 0.45
+    elif 45.0 <= rsi <= 66.0:
+        tech_score += 0.20
+    elif rsi >= 76.0:
+        tech_score -= 0.45
+
+    tech_score = max(-1.0, min(1.0, tech_score))
+
+    abs_news = abs(finbert_score)
+
+    # Determine Regime Weighting (90/10 News, 50/50 Hybrid, or 10/90 Tech)
+    if abs_news >= 0.65 or (abs_news >= 0.45 and rel_vol >= 1.8):
+        regime = "NEWS-90/10"
+        w_news, w_tech = 0.90, 0.10
+        tp_adj = 1.45       # Widen Take-Profit by +45% to ride massive catalyst runner
+        rsi_max = 84.0      # Ignore standard overbought RSI during major news catalysts
+    elif abs_news >= 0.20 or rel_vol >= 1.35:
+        regime = "HYBRID-50/50"
+        w_news, w_tech = 0.50, 0.50
+        tp_adj = 1.00
+        rsi_max = 73.0
+    else:
+        regime = "TECH-10/90"
+        w_news, w_tech = 0.10, 0.90
+        tp_adj = 0.85       # Tighten Take-Profit by 15% for pure technical scalps
+        rsi_max = 69.0
+
+    composite = round((w_news * finbert_score) + (w_tech * tech_score), 3)
+
+    # Entry Arbiter Decision
+    buy_signal = False
+    if regime == "NEWS-90/10" and finbert_score >= max(base_buy_min, 0.40) and price >= ema20 * 0.985:
+        buy_signal = True
+    elif regime == "HYBRID-50/50" and composite >= max(base_buy_min, 0.12) and price >= ema20:
+        buy_signal = True
+    elif regime == "TECH-10/90" and (
+        (composite >= 0.22 and price > ema9 > ema20) or (rsi <= 32.5 and finbert_score > -0.25)
+    ):
+        buy_signal = True
+
+    # Profit-Taking & Exit Arbiter Decision
+    arbiter_exit_reason = None
+    if regime == "NEWS-90/10" and finbert_score <= base_exit_max:
+        arbiter_exit_reason = f"Arbiter 90/10 News Catalyst Reversal (FinBERT {finbert_score:+.3f})"
+    elif regime == "TECH-10/90" and rsi >= 74.0 and finbert_score < 0.25:
+        arbiter_exit_reason = f"Arbiter 10/90 Tech Overbought Profit-Take (RSI {rsi:.1f})"
+    elif regime == "HYBRID-50/50" and composite <= base_exit_max and price < ema9:
+        arbiter_exit_reason = f"Arbiter 50/50 Hybrid Breakdown (Comp {composite:+.3f})"
+
+    return {
+        "regime": regime,
+        "w_news": w_news,
+        "w_tech": w_tech,
+        "tech_score": round(tech_score, 3),
+        "composite": composite,
+        "tp_adj": tp_adj,
+        "rsi_max": rsi_max,
+        "buy_signal": buy_signal,
+        "arbiter_exit_reason": arbiter_exit_reason
+    }
+
+def compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult, risk_bps=0.0045, max_notional_pct=0.040, is_crypto=False):
+    """
+    ATR Volatility Risk-Parity Position Sizing:
+    Ensures every position risks the exact same dollar percentage (risk_bps) of total account equity
+    if its ATR Stop-Loss is hit, capped at max_notional_pct of total portfolio value.
+    """
+    if price <= 0 or equity <= 0:
+        return 0
+    safe_atr = max(atr, price * 0.01)
+    stop_distance_dollars = max(sl_atr_mult * safe_atr, price * 0.008)
+    dollar_risk_budget = equity * risk_bps
+
+    raw_qty = dollar_risk_budget / stop_distance_dollars
+    max_qty_by_notional = (equity * max_notional_pct) / price
+    target_qty = min(raw_qty, max_qty_by_notional)
+
+    if is_crypto:
+        return round(max(0.0001, target_qty), 4)
+    return max(1, int(round(target_qty)))
+
+# =====================================================================
+# 4. SHARED AI, NEWS & TECHNICAL HELPER FUNCTIONS
 # =====================================================================
 def send_discord_alert(message):
     if not DISCORD_WEBHOOK:
@@ -334,6 +463,11 @@ def get_technicals_and_atr(ticker):
     atr_series = true_range.rolling(14).mean()
     atr14 = float(atr_series.iloc[-1]) if not atr_series.empty and not pd.isna(atr_series.iloc[-1]) else (current_price * 0.02)
 
+    vol_series = df['Volume'] if 'Volume' in df.columns else pd.Series([1.0])
+    vol_20d = float(vol_series.tail(20).mean()) if len(vol_series) >= 5 and float(vol_series.tail(20).mean()) > 0 else 1.0
+    vol_now = float(vol_series.iloc[-1]) if len(vol_series) > 0 else 1.0
+    rel_vol = round(vol_now / vol_20d, 2) if vol_20d > 0 else 1.0
+
     return {
         "price": current_price,
         "sma200": sma200,
@@ -341,7 +475,8 @@ def get_technicals_and_atr(ticker):
         "ema20": ema20,
         "ema9": ema9,
         "rsi14": rsi14,
-        "atr14": atr14
+        "atr14": atr14,
+        "rel_vol": rel_vol
     }
 
 def was_stopped_out_last_24h(ticker, closed_orders):
@@ -406,6 +541,13 @@ def cancel_existing_orders_for_ticker(ticker, active_orders):
     if canceled:
         time.sleep(1.5)
 
+def find_last_buy_fill_price(symbol, closed_orders):
+    norm = to_alpaca_pos_symbol(symbol)
+    for o in closed_orders:
+        if to_alpaca_pos_symbol(o.symbol) == norm and o.side == 'buy' and o.status == 'filled' and getattr(o, 'filled_avg_price', None):
+            return float(o.filled_avg_price)
+    return 0.0
+
 def sync_recent_closed_sells(closed_orders):
     if not closed_sheet:
         return []
@@ -416,21 +558,39 @@ def sync_recent_closed_sells(closed_orders):
             if o.side == 'sell' and o.status == 'filled' and o.id not in existing_ids:
                 filled_time = str(o.filled_at)[:19] if o.filled_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 fill_price = float(o.filled_avg_price) if o.filled_avg_price else 0.0
+                qty_val = float(o.filled_qty) if o.filled_qty else 0.0
                 order_type = o.type.upper()
+                engine_tag = classify_symbol(o.symbol)
+                entry_est = find_last_buy_fill_price(o.symbol, closed_orders)
+                if entry_est > 0 and fill_price > 0:
+                    realized_pl = (fill_price - entry_est) * qty_val
+                    realized_pct = ((fill_price - entry_est) / entry_est) * 100.0
+                else:
+                    realized_pl, realized_pct = 0.0, 0.0
+
                 closed_sheet.append_row([
-                    filled_time, o.symbol, str(o.filled_qty), order_type, f"${fill_price:.2f}", o.id
+                    filled_time,
+                    o.symbol,
+                    str(o.filled_qty),
+                    order_type,
+                    f"${fill_price:.2f}",
+                    o.id,
+                    engine_tag,
+                    f"${entry_est:.2f}" if entry_est > 0 else "N/A",
+                    f"${realized_pl:+.2f}",
+                    f"{realized_pct:+.2f}%"
                 ])
                 existing_ids.add(o.id)
                 if o.type in ['stop', 'stop_limit']:
-                    new_fill_alerts.append(f"🛑 **STOP-LOSS TRIGGERED ({o.symbol})**: Sold {o.filled_qty} @ `${fill_price:.2f}` ({filled_time} UTC)")
+                    new_fill_alerts.append(f"🛑 **STOP-LOSS TRIGGERED ({o.symbol} | {engine_tag})**: Sold {o.filled_qty} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)")
                 elif o.type == 'limit':
-                    new_fill_alerts.append(f"🎯 **TAKE-PROFIT HIT ({o.symbol})**: Sold {o.filled_qty} @ `${fill_price:.2f}` ({filled_time} UTC)")
+                    new_fill_alerts.append(f"🎯 **TAKE-PROFIT HIT ({o.symbol} | {engine_tag})**: Sold {o.filled_qty} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)")
     except Exception as e:
         print(f"Closed trades sheet sync warning: {e}")
     return new_fill_alerts
 
 # =====================================================================
-# 4. ENGINE 1 & 2: EQUITY TRANCHE EXECUTOR (24/7 RADAR + NYSE EXECUTION)
+# 5. ENGINE 1 & 2: EQUITY TRANCHE EXECUTOR (ARBITER + ATR RISK PARITY)
 # =====================================================================
 def run_equity_tranche(
     tranche_name,
@@ -449,7 +609,7 @@ def run_equity_tranche(
     sl_atr_mult,
     tp_atr_mult,
     ratchet_trigger_pct,
-    alloc_pct,
+    risk_bps,
     require_sma200=True
 ):
     tranche_alerts = []
@@ -462,38 +622,51 @@ def run_equity_tranche(
         score = get_finbert_sentiment(headlines)
         tech = get_technicals_and_atr(ticker)
         rsi_val = f"{tech['rsi14']:.1f}" if tech else "N/A"
+        arb = compute_arbiter_matrix(score, tech, base_buy_min=buy_score_min, base_exit_max=exit_score_max)
+        regime_tag = arb["regime"]
 
         pos = positions_map.get(ticker)
         owned_qty = float(pos.qty) if pos else 0.0
-        decision = "HOLD"
+        decision = f"HOLD [{regime_tag}]"
         action_taken = "None"
 
         if owned_qty > 0:
             entry_price = float(pos.avg_entry_price)
             current_price = float(pos.current_price)
             unrealized_pct = (current_price - entry_price) / entry_price
+            unrealized_dlr = (current_price - entry_price) * owned_qty
 
-            if score <= exit_score_max:
+            # Arbiter Profit-Taking or Bearish Catalyst Exit
+            should_exit = (score <= exit_score_max) or (arb["arbiter_exit_reason"] is not None and unrealized_pct > 0.005)
+            exit_label = arb["arbiter_exit_reason"] or f"Bearish Sentiment ({score:+.3f})"
+
+            if should_exit:
                 if not is_nyse_open:
-                    decision = "BEARISH (NYSE Closed - Radar)"
-                    action_taken = "Awaiting NYSE Open for Exit"
+                    decision = f"EXIT QUEUED [{regime_tag}]"
+                    action_taken = f"Awaiting NYSE Open ({exit_label})"
                 elif pdt_restricted:
-                    decision = "BEARISH (PDT Shield Locked)"
+                    decision = "EXIT BLOCKED (PDT Shield)"
                     action_taken = "Skipped sell to prevent PDT lock"
                 else:
                     try:
                         cancel_existing_orders_for_ticker(ticker, active_orders)
-                        api.submit_order(
+                        sell_ord = api.submit_order(
                             symbol=ticker,
                             qty=owned_qty,
                             side='sell',
                             type='market',
                             time_in_force='gtc'
                         )
-                        decision = "BEARISH"
-                        action_taken = f"Sold {int(owned_qty)} @ ~${current_price:.2f} (Sentiment Exit)"
+                        decision = f"ARBITER EXIT [{regime_tag}]"
+                        action_taken = f"Sold {int(owned_qty)} @ ~${current_price:.2f} ({exit_label})"
+                        if closed_sheet:
+                            closed_sheet.append_row([
+                                now_str[:19], ticker, str(int(owned_qty)), exit_label[:28],
+                                f"${current_price:.2f}", str(getattr(sell_ord, 'id', 'EQ_MKT')),
+                                tranche_name, f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
+                            ])
                         owned_qty = 0
-                        tranche_alerts.append(f"🔴 **[{tranche_name}] SOLD {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`)")
+                        tranche_alerts.append(f"🔴 **[{tranche_name} | {regime_tag}] EXIT {ticker}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
                     except Exception as e:
                         decision = "BEARISH"
                         action_taken = f"Sell Failed: {e}"
@@ -511,20 +684,12 @@ def run_equity_tranche(
                             except Exception as e:
                                 print(f"Break-even replace note for {ticker}: {e}")
 
-                decision = "BULLISH (Already Owned)" if score >= buy_score_min else "HOLD"
+                decision = f"BULLISH (Owned | {regime_tag})" if arb["buy_signal"] else f"HOLD [{regime_tag}]"
         else:
-            tech_momentum_breakout = (
-                not require_sma200
-                and tech is not None
-                and score >= 0.0
-                and tech['price'] > tech['ema9'] > tech['ema20'] > tech['sma50']
-                and 45.0 <= tech['rsi14'] <= 70.0
-            )
-
-            if score >= buy_score_min or tech_momentum_breakout:
+            if arb["buy_signal"]:
                 if not is_nyse_open:
-                    decision = "BULLISH (NYSE Closed - Radar)"
-                    action_taken = f"Pre-Market Target @ ~${tech['price']:.2f}" if tech else "Queued Radar"
+                    decision = f"BULLISH (Radar | {regime_tag})"
+                    action_taken = f"Pre-Market Target @ ~${tech['price']:.2f} (Comp {arb['composite']:+.2f})" if tech else "Queued Radar"
                 elif not macro_ok:
                     decision = f"BULLISH (Blocked: {macro_reason})"
                 elif pdt_restricted:
@@ -537,20 +702,26 @@ def run_equity_tranche(
                     decision = "BULLISH (Blocked: No Tech Data)"
                 elif require_sma200 and tech['price'] < tech['sma200']:
                     decision = f"BULLISH (Blocked: Below 200-SMA ${tech['sma200']:.2f})"
-                elif not require_sma200 and tech['ema20'] < tech['sma50']:
+                elif not require_sma200 and tech['ema20'] < tech['sma50'] and regime_tag != "NEWS-90/10":
                     decision = "BULLISH (Blocked: 20-EMA < 50-SMA)"
-                elif tech['price'] < tech['ema20']:
-                    decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
-                elif tech['rsi14'] > 72.0:
-                    decision = f"BULLISH (Blocked: RSI Overbought {tech['rsi14']:.1f})"
+                elif tech[' rsi14' if ' rsi14' in tech else 'rsi14'] > arb["rsi_max"]:
+                    decision = f"BULLISH (Blocked: RSI {tech['rsi14']:.1f} > {arb['rsi_max']:.0f})"
                 else:
-                    target_dollars = equity * alloc_pct
                     price = tech['price']
-                    qty_to_buy = max(1, int(round(target_dollars / price)))
-
                     atr = max(tech['atr14'], price * 0.01)
+                    qty_to_buy = compute_atr_risk_parity_qty(
+                        equity=equity,
+                        price=price,
+                        atr=atr,
+                        sl_atr_mult=sl_atr_mult,
+                        risk_bps=risk_bps,
+                        max_notional_pct=0.040,
+                        is_crypto=False
+                    )
+
+                    adj_tp_mult = round(tp_atr_mult * arb["tp_adj"], 2)
                     stop_price = round(price - (sl_atr_mult * atr), 2)
-                    target_price = round(price + (tp_atr_mult * atr), 2)
+                    target_price = round(price + (adj_tp_mult * atr), 2)
 
                     try:
                         api.submit_order(
@@ -563,23 +734,23 @@ def run_equity_tranche(
                             take_profit={'limit_price': target_price},
                             stop_loss={'stop_price': stop_price}
                         )
-                        decision = "BULLISH"
-                        action_taken = f"Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f}, SL: ${stop_price:.2f}"
+                        decision = f"BULLISH [{regime_tag}]"
+                        action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}"
                         owned_qty = qty_to_buy
-                        tranche_alerts.append(f"🟢 **[{tranche_name}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, RSI: `{rsi_val}`)")
+                        tranche_alerts.append(f"🟢 **[{tranche_name} | {regime_tag}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.3f}`)")
                     except Exception as e:
-                        decision = "BULLISH"
+                        decision = f"BULLISH [{regime_tag}]"
                         action_taken = f"Buy Failed: {e}"
             elif score <= -0.10:
-                decision = "BEARISH (Not Owned)"
+                decision = f"BEARISH (Not Owned | {regime_tag})"
             else:
-                decision = "HOLD"
+                decision = f"HOLD [{regime_tag}]"
 
         row = [now_str, ticker, f"{score:+.3f}", decision, action_taken, f"Holding {int(owned_qty)} shares"]
         rows_to_append.append(row)
         print(f"[{tranche_name}] {ticker}: {score:+.3f} | {decision} | {action_taken}")
-        scan_lines.append(f"• **{ticker}**: FinBERT `{score:+.3f}` ({len(headlines)} news) | RSI `{rsi_val}` ➔ `{decision}`")
-        time.sleep(0.5)
+        scan_lines.append(f"• **{ticker}** `[{regime_tag}]`: FinBERT `{score:+.3f}` | Comp `{arb['composite']:+.2f}` | RSI `{rsi_val}` ➔ `{decision}`")
+        time.sleep(0.4)
 
     if rows_to_append and sheet_ws:
         try:
@@ -590,7 +761,7 @@ def run_equity_tranche(
     return tranche_alerts, scan_lines
 
 # =====================================================================
-# 5. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR
+# 6. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (ARBITER + RISK PARITY)
 # =====================================================================
 def run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity):
     crypto_alerts = []
@@ -603,27 +774,32 @@ def run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity):
         score = get_finbert_sentiment(headlines)
         tech = get_technicals_and_atr(pair)
         rsi_val = f"{tech['rsi14']:.1f}" if tech else "N/A"
+        arb = compute_arbiter_matrix(score, tech, base_buy_min=0.05, base_exit_max=-0.20)
+        regime_tag = arb["regime"]
 
         norm_sym = to_alpaca_pos_symbol(pair)
         pos = positions_map.get(norm_sym) or positions_map.get(pair)
         owned_qty = float(pos.qty) if pos else 0.0
-        decision = "HOLD"
+        decision = f"HOLD [{regime_tag}]"
         action_taken = "None"
 
         if owned_qty > 0:
             entry_price = float(pos.avg_entry_price)
             current_price = float(pos.current_price)
             unrealized_pct = (current_price - entry_price) / entry_price
+            unrealized_dlr = (current_price - entry_price) * owned_qty
 
+            # Dynamic Arbiter Target (+9.0% in 90/10 News Catalyst, +6.0% in Hybrid, +4.8% in 10/90 Tech)
+            dynamic_tp_pct = 0.060 * arb["tp_adj"]
             exit_reason = None
-            if unrealized_pct >= 0.060:
-                exit_reason = f"Crypto Take-Profit Hit (+{unrealized_pct*100:.2f}%)"
+            if unrealized_pct >= dynamic_tp_pct:
+                exit_reason = f"Arbiter Take-Profit Hit (+{unrealized_pct*100:.2f}% in {regime_tag})"
             elif unrealized_pct <= -0.030:
                 exit_reason = f"Crypto Stop-Loss Hit ({unrealized_pct*100:.2f}%)"
-            elif score <= -0.20:
-                exit_reason = f"Bearish Crypto Sentiment ({score:+.3f})"
-            elif tech and tech['rsi14'] > 78.0 and unrealized_pct > 0.02:
-                exit_reason = f"RSI Overbought Profit Lock (RSI {tech['rsi14']:.1f})"
+            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.005:
+                exit_reason = arb["arbiter_exit_reason"]
+            elif score <= -0.25:
+                exit_reason = f"Bearish Crypto Catalyst ({score:+.3f})"
 
             if exit_reason:
                 try:
@@ -635,33 +811,40 @@ def run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity):
                         type='market',
                         time_in_force='gtc'
                     )
-                    decision = "EXIT"
+                    decision = f"EXIT [{regime_tag}]"
                     action_taken = f"Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
                     if closed_sheet:
                         closed_sheet.append_row([
-                            now_str[:19], pair, f"{owned_qty:.4f}", exit_reason, f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_MKT'))
+                            now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28],
+                            f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_MKT')),
+                            "CRYPTO", f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
                         ])
                     owned_qty = 0.0
-                    crypto_alerts.append(f"🪙 **[CRYPTO EXIT] {pair}**: {action_taken}")
+                    crypto_alerts.append(f"🪙 **[CRYPTO EXIT | {regime_tag}] {pair}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
                 except Exception as e:
                     decision = "EXIT"
                     action_taken = f"Crypto Sell Failed: {e}"
             else:
                 if unrealized_pct >= 0.025:
-                    decision = "HOLD (🛡️ +2.5% Profit Trail Active)"
-                elif score >= 0.05:
-                    decision = "BULLISH (Holding)"
+                    decision = f"HOLD (🛡️ +2.5% Trail | {regime_tag})"
+                elif arb["buy_signal"]:
+                    decision = f"BULLISH (Holding | {regime_tag})"
                 else:
-                    decision = "HOLD"
+                    decision = f"HOLD [{regime_tag}]"
         else:
-            is_bullish_ai = (score >= 0.05) and (tech is not None and tech['price'] >= tech['ema20'] and tech['rsi14'] < 70.0)
-            is_tech_breakout = (score >= 0.0) and (tech is not None and tech['price'] > tech['ema9'] > tech['ema20'] and 48.0 <= tech['rsi14'] <= 68.0)
-            is_oversold_bounce = (score > -0.45) and (tech is not None and tech['rsi14'] <= 33.0)
-
-            if is_bullish_ai or is_tech_breakout or is_oversold_bounce:
-                target_dollars = equity * 0.020
+            if arb["buy_signal"] and tech is not None:
                 price = tech['price']
-                qty_to_buy = round(target_dollars / price, 4)
+                atr = max(tech['atr14'], price * 0.015)
+                qty_to_buy = compute_atr_risk_parity_qty(
+                    equity=equity,
+                    price=price,
+                    atr=atr,
+                    sl_atr_mult=1.2,
+                    risk_bps=0.0045,
+                    max_notional_pct=0.035,
+                    is_crypto=True
+                )
+                dyn_tp = round(6.0 * arb["tp_adj"], 1)
 
                 if qty_to_buy > 0:
                     try:
@@ -672,26 +855,23 @@ def run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity):
                             type='market',
                             time_in_force='gtc'
                         )
-                        decision = "BULLISH"
-                        trigger_lbl = "AI Breakout" if is_bullish_ai else ("Tech Breakout" if is_tech_breakout else f"Oversold Bounce RSI {rsi_val}")
-                        action_taken = f"Bought {qty_to_buy:.4f} @ ~${price:.2f} ({trigger_lbl} | TP +6% / SL -3%)"
+                        decision = f"BULLISH [{regime_tag}]"
+                        action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | TP +{dyn_tp}% / SL -3%)"
                         owned_qty = qty_to_buy
-                        crypto_alerts.append(f"🪙 **[CRYPTO BUY] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, RSI: `{rsi_val}`)")
+                        crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")
                     except Exception as e:
-                        decision = "BULLISH"
+                        decision = f"BULLISH [{regime_tag}]"
                         action_taken = f"Crypto Buy Failed: {e}"
-            elif score >= 0.05 and tech is not None and tech['price'] < tech['ema20']:
-                decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
             elif score <= -0.10:
-                decision = "BEARISH (Not Owned)"
+                decision = f"BEARISH (Not Owned | {regime_tag})"
             else:
-                decision = "HOLD"
+                decision = f"HOLD [{regime_tag}]"
 
         row = [now_str, pair, f"{score:+.3f}", decision, action_taken, f"Holding {owned_qty:.4f} units"]
         rows_to_append.append(row)
         print(f"[CRYPTO] {pair}: {score:+.3f} | {decision} | {action_taken}")
-        scan_lines.append(f"• **{pair}**: FinBERT `{score:+.3f}` ({len(headlines)} news) | RSI `{rsi_val}` ➔ `{decision}`")
-        time.sleep(0.5)
+        scan_lines.append(f"• **{pair}** `[{regime_tag}]`: FinBERT `{score:+.3f}` | Comp `{arb['composite']:+.2f}` | RSI `{rsi_val}` ➔ `{decision}`")
+        time.sleep(0.4)
 
     if rows_to_append and crypto_sheet:
         try:
@@ -702,7 +882,7 @@ def run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity):
     return crypto_alerts, scan_lines
 
 # =====================================================================
-# 6. MASTER ORCHESTRATOR
+# 7. MASTER ORCHESTRATOR & INTERACTIVE DISCORD TELEMETRY
 # =====================================================================
 def run_bot(mode="all"):
     clock = api.get_clock()
@@ -732,14 +912,12 @@ def run_bot(mode="all"):
     all_alerts = list(automated_exit_alerts)
     core_lines, mom_lines, crypto_lines = [], [], []
 
-    # 1. Screen & Execute Engine 3: 24/7 Crypto AI Quant
     if mode in ["all", "crypto"]:
         print("=== Screening & Running Engine 3: 24/7 Crypto AI Quant ===")
         crypto_candidates = screen_top_candidates(CRYPTO_POOL, top_n=6, owned_symbols=owned_symbols, mode="crypto")
         c_alerts, crypto_lines = run_crypto_tranche(crypto_candidates, positions_map, active_orders, equity)
         all_alerts.extend(c_alerts)
 
-    # 2. Screen & Run Engine 1: Core Long-Term
     if mode in ["all", "core"]:
         print("=== Screening & Running Engine 1: Core Long-Term Equities ===")
         core_candidates = screen_top_candidates(CORE_POOL, top_n=10, owned_symbols=owned_symbols, mode="core")
@@ -760,12 +938,11 @@ def run_bot(mode="all"):
             sl_atr_mult=1.5,
             tp_atr_mult=3.5,
             ratchet_trigger_pct=0.025,
-            alloc_pct=0.020,
+            risk_bps=0.0050,
             require_sma200=True
         )
         all_alerts.extend(core_alerts)
 
-    # 3. Screen & Run Engine 2: Short-Term Momentum
     if mode in ["all", "momentum"]:
         print("=== Screening & Running Engine 2: Short-Term Momentum Equities ===")
         mom_candidates = screen_top_candidates(MOMENTUM_POOL, top_n=8, owned_symbols=owned_symbols, mode="momentum")
@@ -786,16 +963,16 @@ def run_bot(mode="all"):
             sl_atr_mult=1.0,
             tp_atr_mult=2.0,
             ratchet_trigger_pct=0.015,
-            alloc_pct=0.015,
+            risk_bps=0.0040,
             require_sma200=False
         )
         all_alerts.extend(mom_alerts)
 
     if all_alerts:
-        send_discord_alert("🚨 **Multi-Strategy Bot v3.5 Execution Alert:**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **AETHER QUANT v5.0 Execution Alert (Arbiter + Risk Parity):**\n" + "\n".join(all_alerts))
 
     # =====================================================================
-    # 7. POST-SCAN MULTI-STRATEGY DETAILED DISCORD BRIEFING
+    # 8. POST-SCAN MULTI-STRATEGY BRIEFING + MOBILE COMMAND LINKS
     # =====================================================================
     try:
         time.sleep(2)
@@ -815,7 +992,7 @@ def run_bot(mode="all"):
         invested_val = sum(float(p.market_value) for p in positions_list)
 
         detailed_report = (
-            f"🏛️ **Multi-Strategy Hedge Fund v3.5 Telemetry Report (68-Asset AI Screener)**\n"
+            f"💠 **AETHER QUANT v5.0 Telemetry Report (Arbiter Matrix + ATR Risk Parity)**\n"
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto Active)'}` | 🌍 **Macro:** `{macro_reason}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
             f"📅 **Today's Change:** `${day_pl:+,.2f}` (`{day_pl_pct:+.2f}%`) | 📊 **Open P/L:** `${total_unrealized_pl:+,.2f}`\n"
@@ -862,6 +1039,16 @@ def run_bot(mode="all"):
             detailed_report += "\n⚡ **Engine 2 — Screened Short-Term Momentum:**\n" + "\n".join(mom_lines) + "\n"
         if crypto_lines:
             detailed_report += "\n🪙 **Engine 3 — Screened 24/7 Crypto AI:**\n" + "\n".join(crypto_lines) + "\n"
+
+        # Interactive Mobile Discord Command Bar
+        detailed_report += (
+            f"\n🎛️ **Mobile One-Tap Command Deck:**\n"
+            f"[🔄 Scan All]({DASHBOARD_URL}/?discord_cmd=scan_all)  |  "
+            f"[⚡ Scan Momentum]({DASHBOARD_URL}/?discord_cmd=scan_momentum)  |  "
+            f"[🪙 Scan Crypto]({DASHBOARD_URL}/?discord_cmd=scan_crypto)  |  "
+            f"[📊 Push Snapshot]({DASHBOARD_URL}/?discord_cmd=snapshot)  |  "
+            f"[🛑 Liquidate Crypto]({DASHBOARD_URL}/?discord_cmd=liquidate_crypto)"
+        )
 
         send_discord_alert(detailed_report)
     except Exception as e:

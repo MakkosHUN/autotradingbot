@@ -1418,7 +1418,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         default=os.environ.get("BOT_MODE", "auto"),
-        choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge"]
+        choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "smart_cron"]
     )
     args = parser.parse_args()
-    run_bot(mode=args.mode)
+
+    if args.mode == "smart_cron":
+        ny_now = datetime.now(ZoneInfo("America/New_York"))
+        is_weekday = ny_now.weekday() < 5
+        hr = ny_now.hour
+        mn = ny_now.minute
+
+        print(f"🕰️ Smart Cron Router Triggered at NY Time: {hr:02d}:{mn:02d}")
+
+        # 1. NYSE Open/Close (Fires at 9:30-9:45 AM and 3:30-3:45 PM NY Time) -> Runs FULL SUITE
+        if is_weekday and ((hr == 9 and 30 <= mn <= 45) or (hr == 15 and 30 <= mn <= 45)):
+            print("➡️ Routing to: AUTO (Full Suite including Core)")
+            run_bot(mode="auto")
+
+        # 2. Intraday Market Hours (10:00 AM to 3:00 PM NY Time) -> Runs HIGH-FREQ EQUITIES + CRYPTO
+        elif is_weekday and ((hr == 9 and mn > 45) or (10 <= hr <= 14) or (hr == 15 and mn < 30) or (hr == 16 and mn == 0)):
+            print("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery, excluding Core)")
+            run_bot(mode="intraday")
+
+        # 3. Overnight & Weekends -> Runs CRYPTO ONLY
+        else:
+            print("➡️ Routing to: CRYPTO (24/7 Digital Asset Quant)")
+            run_bot(mode="crypto")
+    else:
+        run_bot(mode=args.mode)

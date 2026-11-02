@@ -119,7 +119,7 @@ CRYPTO_ALTS = [
     "DOT/USD", "LTC/USD", "UNI/USD", "AAVE/USD", "BCH/USD", "PEPE/USD"
 ]
 CRYPTO_POOL = CRYPTO_MAJORS + CRYPTO_ALTS
-]
+
 # Disjoint Mean-Reversion Pool (Sector ETFs & Oversold Value Pullbacks - Zero overlap with CORE/MOMENTUM)
 MEAN_REV_POOL = [
     'QQQ', 'IWM', 'DIA', 'SMH', 'XLF', 'XLE', 'XLK', 'XLV', 'XBI', 'ARKK',
@@ -140,13 +140,13 @@ TAIL_HEDGE_POOL = ['SH', 'PSQ', 'GLD']
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_POOL}
 
 DEFAULT_ENGINE_CONFIG = {
-    "CORE":       {"enabled": True,  "cap": 0.35, "risk_bps": 0.0050, "desc": "S&P 500 Blue-Chip Trend Equities"},
-    "MOMENTUM":   {"enabled": True,  "cap": 0.25, "risk_bps": 0.0040, "desc": "High-Beta Tech & Growth Breakouts"},
-    "CRYPTO":     {"enabled": True,  "cap": 0.15, "risk_bps": 0.0045, "desc": "24/7 Digital Asset Quant (48x/Day)"},
-    "DISCOVERY":  {"enabled": True,  "cap": 0.15, "risk_bps": 0.0035, "desc": "Unconstrained Market-Wide News Catalyst Agent"},
-    "MEAN_REV":   {"enabled": False, "cap": 0.15, "risk_bps": 0.0035, "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
-    "SMALL_CAP":  {"enabled": False, "cap": 0.10, "risk_bps": 0.0030, "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
-    "TAIL_HEDGE": {"enabled": True,  "cap": 0.10, "risk_bps": 0.0050, "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"}
+    "CORE":       {"enabled": True, "cap": 0.35, "risk_bps": 0.0050, "desc": "S&P 500 Blue-Chip Trend Equities"},
+    "MOMENTUM":   {"enabled": True, "cap": 0.25, "risk_bps": 0.0040, "desc": "High-Beta Tech & Growth Breakouts"},
+    "CRYPTO":     {"enabled": True, "cap": 0.15, "risk_bps": 0.0045, "desc": "24/7 Digital Asset Quant (48x/Day)"},
+    "DISCOVERY":  {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Unconstrained Market-Wide News Catalyst Agent"},
+    "MEAN_REV":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
+    "SMALL_CAP":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
+    "TAIL_HEDGE": {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"}
 }
 
 def load_or_init_engine_config():
@@ -407,7 +407,7 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
     return final_list
 
 # =====================================================================
-# 6. MATHEMATICAL ARBITER MATRIX v8.5.1 (WITH L2 OBI + VWAP + MEAN-REV)
+# 6. MATHEMATICAL ARBITER MATRIX v8.5.2 (DUAL-MODE CRYPTO + L2 OBI)
 # =====================================================================
 def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05, base_exit_max=-0.15, strategy_mode="core"):
     if tech is None:
@@ -505,8 +505,34 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
     ):
         buy_signal = True
 
+    # --- v8.5.2 DUAL-MODE CRYPTO ARBITER (BREAKOUT + OVERSOLD LIQUIDITY SNIPE) ---
+    if strategy_mode == "crypto":
+        is_crypto_oversold_snipe = (
+            (rsi <= 32.0 or price <= bb_low * 1.005)
+            and obi_score >= -0.05
+            and finbert_score > -0.65
+        )
+        is_crypto_quiet_breakout = (
+            price > ema20
+            and 42.0 <= rsi <= 74.0
+            and obi_score >= -0.05
+            and finbert_score >= -0.05
+        )
+        if is_crypto_oversold_snipe:
+            regime = "CRYPTO-SNIPE"
+            composite = round(max(composite, 0.45), 3)
+            tp_adj = 0.85
+            rsi_max = 75.0
+            buy_signal = True
+        elif is_crypto_quiet_breakout and not buy_signal:
+            regime = "TECH-10/90"
+            composite = round(max(composite, 0.35), 3)
+            buy_signal = True
+
     arbiter_exit_reason = None
-    if regime == "NEWS-90/10" and finbert_score <= base_exit_max:
+    if regime == "CRYPTO-SNIPE" and rsi >= 60.0:
+        arbiter_exit_reason = f"Crypto Oversold Snapback Target (RSI {rsi:.1f})"
+    elif regime == "NEWS-90/10" and finbert_score <= base_exit_max:
         arbiter_exit_reason = f"Arbiter 90/10 News Reversal ({finbert_score:+.3f})"
     elif regime == "TECH-10/90" and rsi >= 74.0 and finbert_score < 0.25:
         arbiter_exit_reason = f"Arbiter 10/90 Tech Overbought Profit-Take (RSI {rsi:.1f})"
@@ -1062,7 +1088,7 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
     return hedge_alerts, hedge_lines
 
 # =====================================================================
-# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (48x/DAY + L2 OBI)
+# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (48x/DAY + L2 OBI + SNIPE)
 # =====================================================================
 def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, equity, macro_ok, macro_reason, risk_bps):
     crypto_alerts = []
@@ -1139,6 +1165,8 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                     decision = f"BULLISH (Blocked: {macro_reason})"
                 elif not corr_ok:
                     decision = f"BULLISH (Blocked: {corr_reason})"
+                elif regime_tag != "CRYPTO-SNIPE" and tech["price"] < tech["ema20"]:
+                    decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
                 else:
                     price = tech['price']
                     atr = max(tech['atr14'], price * 0.015)
@@ -1162,6 +1190,8 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                         except Exception as e:
                             decision = f"BULLISH [{regime_tag}]"
                             action_taken = f"Crypto Buy Failed: {e}"
+            elif tech is not None and score >= 0.15 and tech["price"] < tech["ema20"]:
+                decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
             elif score <= -0.10:
                 decision = f"BEARISH (Not Owned | {regime_tag})"
             else:
@@ -1238,7 +1268,9 @@ def run_bot(mode="auto"):
 
     if should_run("CRYPTO"):
         print("=== Running Engine 3: 24/7 Crypto AI Quant ===")
-        crypto_candidates = screen_top_candidates(CRYPTO_POOL, top_n=6, owned_symbols=owned_symbols, mode="crypto", tranche_name="CRYPTO")
+        # Pin all 4 Crypto Majors (BTC, ETH, SOL, DOGE) + top 4 active altcoins + any owned crypto
+        alt_candidates = screen_top_candidates(CRYPTO_ALTS, top_n=4, owned_symbols=owned_symbols, mode="crypto", tranche_name="CRYPTO")
+        crypto_candidates = list(dict.fromkeys(CRYPTO_MAJORS + alt_candidates))
         c_alerts, crypto_lines = run_crypto_tranche(
             crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps,
             active_orders, equity, macro_ok, macro_reason, engine_cfg["CRYPTO"]["risk_bps"]
@@ -1339,7 +1371,7 @@ def run_bot(mode="auto"):
             section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
 
     if all_alerts:
-        send_discord_alert("🚨 **AETHER QUANT v8.5.1 Execution Alert (7-Engine Suite • L2 OBI • RL Meta-Allocator):**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **AETHER QUANT v8.5.2 Execution Alert (7-Engine Suite • L2 OBI • RL Meta-Allocator):**\n" + "\n".join(all_alerts))
 
     try:
         time.sleep(2)
@@ -1360,7 +1392,7 @@ def run_bot(mode="auto"):
         enabled_list = [k for k, v in engine_cfg.items() if v["enabled"]]
 
         detailed_report = (
-            f"💠 **AETHER QUANT v8.5.1 OMEGA Telemetry (7-Engine Suite • L2 OBI • GEX • RL Meta)**\n"
+            f"💠 **AETHER QUANT v8.5.2 OMEGA Telemetry (7-Engine Suite • L2 OBI • GEX • RL Meta)**\n"
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}`\n"
             f"🎛️ **Active Engines ({len(enabled_list)}/7):** `{', '.join(enabled_list)}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"

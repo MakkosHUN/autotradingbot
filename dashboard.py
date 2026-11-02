@@ -329,6 +329,7 @@ SMALL_CAP_TICKERS = [
     'IONQ', 'RKLB', 'AFRM', 'UPST', 'HIMS', 'ASTS', 'LUNR', 'SMR', 'OKLO', 'SERV',
     'JOBY', 'ACHR', 'CELH', 'CVNA', 'AI', 'SOUN'
 ]
+MEAN_REV_TICKERS = CORE_TICKERS + MOMENTUM_TICKERS[:10]
 TAIL_HEDGE_TICKERS = ['SH', 'PSQ', 'GLD']
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_PAIRS}
 ALL_ASSETS = CORE_TICKERS + MOMENTUM_TICKERS + SMALL_CAP_TICKERS + TAIL_HEDGE_TICKERS + CRYPTO_PAIRS
@@ -666,7 +667,6 @@ def compute_trade_post_mortems(recent_orders, positions):
         unrealized_net = sum(p["unrealized_pl"] for p in eng_pos)
         avg_hold = float(eng_pm["Hold (Hrs)"].mean()) if not eng_pm.empty else 0.0
 
-        # v7.5 RL Meta-Allocator Multiplier
         reward_sig = np.clip(((profit_factor - 1.0) * 0.25) + ((win_rate - 50.0) / 200.0), -0.35, 0.35) if n_closed > 0 else 0.0
         rl_mult = float(np.exp(reward_sig))
 
@@ -815,6 +815,18 @@ def fetch_all_sheet_logs():
     except Exception:
         df_closed = pd.DataFrame()
     return df_core, df_mom, df_crypto, df_disc, df_closed
+
+def filter_sub_engine_log(df_disc, tranche_key):
+    """Isolates rows belonging to DISCOVERY, MEAN_REV, SMALL_CAP, or TAIL_HEDGE."""
+    if df_disc.empty or "Decision" not in df_disc.columns:
+        return pd.DataFrame()
+    mask = df_disc["Decision"].astype(str).str.contains(f"\\[{tranche_key}\\]", regex=True, na=False)
+    filtered = df_disc[mask].copy()
+    if filtered.empty and tranche_key == "DISCOVERY":
+        other_tags = ["\\[MEAN_REV\\]", "\\[SMALL_CAP\\]", "\\[TAIL_HEDGE\\]"]
+        mask_other = df_disc["Decision"].astype(str).str.contains("|".join(other_tags), regex=True, na=False)
+        return df_disc[~mask_other].copy()
+    return filtered
 
 def trigger_github_workflow(token, mode="auto"):
     if not token:
@@ -1203,11 +1215,6 @@ def run_arbiter_backtest(tickers, period_str, sl_atr, tp_atr, risk_bps, w_news_o
     return equity, df_trades, df_eq, regime_counts
 
 def run_monte_carlo_10k(trade_pnls, n_paths=10000, horizon_trades=60, start_equity=100000.0):
-    """
-    v8.5 Walk-Forward 10,000-Path Monte Carlo Resampling Engine:
-    Bootstraps 10,000 synthetic equity trajectories from historical trade P/L distributions
-    to quantify 5th, 25th, 50th, 75th, and 95th percentile confidence cones and Probability of Profit.
-    """
     if len(trade_pnls) < 3:
         return None
     pnl_arr = np.array(trade_pnls, dtype=float)
@@ -1236,7 +1243,7 @@ def run_monte_carlo_10k(trade_pnls, n_paths=10000, horizon_trades=60, start_equi
     }
 
 # =====================================================================
-# 7. REUSABLE STRATEGY ENGINE WORKSTATION
+# 7. REUSABLE STRATEGY ENGINE WORKSTATION (ENGINES 1 THROUGH 7)
 # =====================================================================
 def render_strategy_engine_view(
     engine_title,
@@ -1257,6 +1264,14 @@ def render_strategy_engine_view(
     tranche_invested = sum(p['market_value'] for p in tranche_pos)
     tranche_pl = sum(p['unrealized_pl'] for p in tranche_pos)
     tranche_exposure = (tranche_invested / equity) * 100 if equity > 0 else 0.0
+
+    # Dynamically merge any newly discovered tickers from the log into the Technical Inspector dropdown
+    dynamic_tickers = list(universe_tickers)
+    if not df_log.empty and "Ticker" in df_log.columns:
+        logged_syms = [str(x).strip() for x in df_log["Ticker"].unique() if str(x).strip()]
+        for s in reversed(logged_syms):
+            if s not in dynamic_tickers:
+                dynamic_tickers.insert(0, s)
 
     bull_count, bear_count = 0, 0
     if not df_log.empty and "FinBERT Score" in df_log.columns:
@@ -1370,6 +1385,8 @@ def render_strategy_engine_view(
                     "SL ➔ TP Gauge": st.column_config.ProgressColumn("SL ➔ TP Trajectory", format="%.0f%%", min_value=0, max_value=100)
                 }
             )
+        else:
+            st.info(f"No open positions currently held in the **{tranche_key}** tranche.")
 
         st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>Latest Screened {tranche_key} Candidates & Arbiter Regime Matrix</div>', unsafe_allow_html=True)
         if not df_log.empty:
@@ -1379,7 +1396,7 @@ def render_strategy_engine_view(
                 latest_matrix["FinBERT Score"] = pd.to_numeric(latest_matrix["FinBERT Score"], errors="coerce").fillna(0.0)
             st.dataframe(latest_matrix, use_container_width=True, hide_index=True)
         else:
-            st.info(f"No scan records in `{tranche_key}` yet. Use the sidebar dispatch buttons to run an immediate scan.")
+            st.info(f"No scan records in `{tranche_key}` yet. Select `{tranche_key.lower()}` in the sidebar dispatch box to fire an immediate scan.")
 
     with t2:
         st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>{tranche_key} Neural Sentiment Spectrum (ProsusAI/FinBERT)</div>', unsafe_allow_html=True)
@@ -1411,7 +1428,7 @@ def render_strategy_engine_view(
 
     with t3:
         st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>Multi-Timeframe Technical & VWAP Inspector</div>', unsafe_allow_html=True)
-        sel_ticker = st.selectbox(f"Select {tranche_key} Instrument:", universe_tickers, index=0, key=f"sel_{tranche_key}")
+        sel_ticker = st.selectbox(f"Select {tranche_key} Instrument:", dynamic_tickers, index=0, key=f"sel_{tranche_key}")
         df_yf = fetch_ticker_history(sel_ticker)
         if not df_yf.empty:
             fig_tech = build_pro_technical_chart(sel_ticker, df_yf)
@@ -1563,15 +1580,19 @@ def render_live_terminal():
     </div>
     """, unsafe_allow_html=True)
 
-    # 5. Sleek Top 7-View Horizontal Strategy & Switchboard Bar
+    # 5. Full 11-Tab Top Horizontal Navigation Bar (All 7 Engines Unlocked)
     nav_options = [
         "🏛️ Master Overview & Attribution",
-        "🎛️ 7-Engine Mode Switchboard & Discovery",
+        "🎛️ 7-Engine Pod Switchboard",
         "🛡️ Engine 1: Core Long-Term",
         "⚡ Engine 2: Momentum (14x/Day)",
         "🪙 Engine 3: Crypto AI (48x/Day)",
+        "🛰️ Engine 4: AI Discovery Agent",
+        "🧲 Engine 5: Mean-Reversion",
+        "🚀 Engine 6: Small-Cap Alpha",
+        "🛡️ Engine 7: Tail-Hedge (GEX)",
         "🧪 Backtest & 10k Monte Carlo Lab",
-        "🛡️ Risk, VaR, GEX & Correlation Lab"
+        "📊 Risk, VaR, GEX & Correlation Lab"
     ]
     if hasattr(st, "segmented_control"):
         selected_page = st.segmented_control(
@@ -1691,7 +1712,7 @@ def render_live_terminal():
                 st.info("Heatmap activates when positions are open.")
 
         with col_radar:
-            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Top Bullish Arbiter Signals Across All Engines</div>', unsafe_allow_html=True)
+            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Top Bullish Arbiter Signals Across All 7 Engines</div>', unsafe_allow_html=True)
             combined_logs = []
             for tag, d_f in [("CORE", df_core), ("MOMENTUM", df_mom), ("CRYPTO", df_crypto), ("DISC/SPEC", df_disc)]:
                 if not d_f.empty and "Ticker" in d_f.columns and "FinBERT Score" in d_f.columns:
@@ -1711,7 +1732,7 @@ def render_live_terminal():
                 st.info("No AI scan signals logged yet.")
 
     # =================================================================
-    # VIEW 2: 7-ENGINE MODE SWITCHBOARD & MARKET-WIDE DISCOVERY AGENT
+    # VIEW 2: 7-ENGINE MODE SWITCHBOARD
     # =================================================================
     elif selected_page == nav_options[1]:
         st.markdown('<div class="sec-title"><span class="sec-dot"></span>7-Engine Strategy Palette & Live Pod Switchboard</div>', unsafe_allow_html=True)
@@ -1741,12 +1762,6 @@ def render_live_terminal():
                 if save_engine_config_to_sheet(new_cfg):
                     st.success("✅ 7-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
                     st.rerun()
-
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>Engine 4 (`DISCOVERY`), Engine 5 (`MEAN_REV`) & Engine 6 (`SMALL_CAP`) Live Telemetry</div>', unsafe_allow_html=True)
-        if not df_disc.empty:
-            st.dataframe(df_disc.iloc[::-1].head(60), use_container_width=True, hide_index=True)
-        else:
-            st.info("No Discovery / Mean-Rev / Small-Cap scans logged yet. Select `discovery`, `mean_rev`, or `small_cap` in the sidebar dispatch box to fire immediately!")
 
     # =================================================================
     # VIEW 3: ENGINE 1 — CORE LONG-TERM EQUITIES
@@ -1806,9 +1821,89 @@ def render_live_terminal():
         )
 
     # =================================================================
-    # VIEW 6: BACKTEST & v8.5 10,000-PATH MONTE CARLO SIMULATOR
+    # VIEW 6: ENGINE 4 — MARKET-WIDE AI DISCOVERY AGENT
     # =================================================================
     elif selected_page == nav_options[5]:
+        df_sub_disc = filter_sub_engine_log(df_disc, "DISCOVERY")
+        render_strategy_engine_view(
+            engine_title="Engine 4: Market-Wide AI Discovery Agent (Unconstrained Global Breaking News Hunter)",
+            engine_subtitle="Mandate: Scans Alpaca Global Breaking News Firehose (8,000+ Stocks) • Filters Tradable Catalysts via FinBERT + L2 OBI + Arbiter",
+            tranche_key="DISCOVERY",
+            universe_tickers=MOMENTUM_TICKERS[:10] + SMALL_CAP_TICKERS[:10],
+            positions=positions,
+            active_orders=active_orders,
+            recent_orders=recent_orders,
+            df_log=df_sub_disc,
+            equity=equity,
+            buy_thresh=0.15,
+            exit_thresh=-0.15,
+            is_crypto=False
+        )
+
+    # =================================================================
+    # VIEW 7: ENGINE 5 — STATISTICAL MEAN-REVERSION
+    # =================================================================
+    elif selected_page == nav_options[6]:
+        df_sub_mr = filter_sub_engine_log(df_disc, "MEAN_REV")
+        render_strategy_engine_view(
+            engine_title="Engine 5: Statistical Mean-Reversion (Extreme Oversold Bollinger & Wilder RSI <= 32 Snapback)",
+            engine_subtitle="Mandate: Institutional Pullback Arbitrage • Buys 2-Sigma Lower Bollinger & RSI <= 32 Dips Above 200-SMA • Exits on RSI >= 58 Snapback",
+            tranche_key="MEAN_REV",
+            universe_tickers=MEAN_REV_TICKERS,
+            positions=positions,
+            active_orders=active_orders,
+            recent_orders=recent_orders,
+            df_log=df_sub_mr,
+            equity=equity,
+            buy_thresh=-0.10,
+            exit_thresh=-0.30,
+            is_crypto=False
+        )
+
+    # =================================================================
+    # VIEW 8: ENGINE 6 — SMALL-CAP ALPHA BREAKOUTS
+    # =================================================================
+    elif selected_page == nav_options[7]:
+        df_sub_sc = filter_sub_engine_log(df_disc, "SMALL_CAP")
+        render_strategy_engine_view(
+            engine_title="Engine 6: Small-Cap & High-Beta Speculative Breakouts (Russell 2000 / AI / Space / Quantum)",
+            engine_subtitle="Mandate: High-Velocity Volume Surges (IONQ, RKLB, ASTS, SMR, OKLO, HIMS, SOFI) • Tight ATR Risk-Parity Sizing (0.30% Risk/Trade)",
+            tranche_key="SMALL_CAP",
+            universe_tickers=SMALL_CAP_TICKERS,
+            positions=positions,
+            active_orders=active_orders,
+            recent_orders=recent_orders,
+            df_log=df_sub_sc,
+            equity=equity,
+            buy_thresh=0.10,
+            exit_thresh=-0.12,
+            is_crypto=False
+        )
+
+    # =================================================================
+    # VIEW 9: ENGINE 7 — OPTIONS GEX & TAIL-HEDGE OVERLAY
+    # =================================================================
+    elif selected_page == nav_options[8]:
+        df_sub_th = filter_sub_engine_log(df_disc, "TAIL_HEDGE")
+        render_strategy_engine_view(
+            engine_title="Engine 7: v8.0 Options Gamma Exposure (GEX) & Inverse ETF Tail-Hedge Shield (SH / PSQ / GLD)",
+            engine_subtitle="Mandate: Automated Crash Protection • Deploys ProShares Short S&P 500 (SH) When Macro Shield Trips or SPY Options GEX <= -0.18",
+            tranche_key="TAIL_HEDGE",
+            universe_tickers=TAIL_HEDGE_TICKERS,
+            positions=positions,
+            active_orders=active_orders,
+            recent_orders=recent_orders,
+            df_log=df_sub_th,
+            equity=equity,
+            buy_thresh=0.00,
+            exit_thresh=-0.20,
+            is_crypto=False
+        )
+
+    # =================================================================
+    # VIEW 10: BACKTEST & v8.5 10,000-PATH MONTE CARLO SIMULATOR
+    # =================================================================
+    elif selected_page == nav_options[9]:
         st.markdown('<div class="sec-title"><span class="sec-dot"></span>In-Terminal Strategy Backtest & v8.5 10,000-Path Walk-Forward Monte Carlo Engine</div>', unsafe_allow_html=True)
         st.caption("Simulate historical Arbiter + Chandelier performance and stress-test parameter stability across 10,000 bootstrap-resampled Monte Carlo trajectories.")
 
@@ -1920,9 +2015,9 @@ def render_live_terminal():
             st.dataframe(df_bt_trades.iloc[::-1], use_container_width=True, hide_index=True)
 
     # =================================================================
-    # VIEW 7: INSTITUTIONAL RISK, VaR, OPTIONS GEX & CORRELATION LAB
+    # VIEW 11: INSTITUTIONAL RISK, VaR, OPTIONS GEX & CORRELATION LAB
     # =================================================================
-    elif selected_page == nav_options[6]:
+    elif selected_page == nav_options[10]:
         st.markdown('<div class="sec-title"><span class="sec-dot"></span>Institutional Risk Management, VaR / CVaR, Options GEX & Correlation Lab</div>', unsafe_allow_html=True)
 
         st.markdown(f"""

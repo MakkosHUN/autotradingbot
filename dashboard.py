@@ -1719,7 +1719,7 @@ def render_live_terminal():
 
         with st.form("engine_switchboard_form"):
             new_cfg = {}
-            cols_ row1 = st.columns(4)
+            cols_row1 = st.columns(4)
             cols_row2 = st.columns(3)
             all_cols = cols_row1 + cols_row2
 

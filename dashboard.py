@@ -17,7 +17,7 @@ from google.oauth2.service_account import Credentials
 # 1. PAGE CONFIG & INSTITUTIONAL DARK GLASSMORPHISM CSS
 # =====================================================================
 st.set_page_config(
-    page_title="QUANT V3.0 // Multi-Strategy Command Center",
+    page_title="QUANT V3.5 // Multi-Strategy Command Center",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -107,9 +107,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-CORE_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG', 'CAT', 'DIS']
-MOMENTUM_TICKERS = ['AMD', 'PLTR', 'META', 'COIN', 'NFLX', 'AMZN', 'CRM', 'UBER']
-CRYPTO_PAIRS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD']
+# 68-Asset Master Pools
+CORE_TICKERS = [
+    'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG',
+    'CAT', 'DIS', 'V', 'MA', 'UNH', 'HD', 'COST', 'ABBV', 'KO', 'PEP',
+    'AVGO', 'ORCL', 'CVX', 'MRK', 'BAC', 'LLY', 'MCD', 'TMO', 'CSCO', 'ACN'
+]
+MOMENTUM_TICKERS = [
+    'AMD', 'PLTR', 'META', 'COIN', 'NFLX', 'AMZN', 'CRM', 'UBER', 'SHOP', 'XYZ',
+    'SNOW', 'CRWD', 'PANW', 'DKNG', 'ROKU', 'HOOD', 'MARA', 'RIOT', 'SOFI', 'ARM',
+    'SMCI', 'MU', 'INTC', 'MSTR'
+]
+CRYPTO_PAIRS = [
+    'BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'DOGE/USD', 'XRP/USD',
+    'LTC/USD', 'UNI/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD', 'SUI/USD'
+]
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_PAIRS}
 
 def classify_symbol(sym):
@@ -118,7 +130,7 @@ def classify_symbol(sym):
         return "CORE"
     if sym in MOMENTUM_TICKERS:
         return "MOMENTUM"
-    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM:
+    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM or sym.endswith("/USD") or sym.endswith("USD"):
         return "CRYPTO"
     return "CORE"
 
@@ -127,22 +139,21 @@ def classify_symbol(sym):
 # =====================================================================
 def get_secret(key, default=""):
     try:
-        return st.secrets.get(key, default)
+        val = st.secrets.get(key, default)
+        return val if val else default
     except Exception:
         return default
 
-API_KEY = get_secret("APCA_API_KEY_ID")
-API_SECRET = get_secret("APCA_API_SECRET_KEY")
-GOOGLE_CREDS_RAW = get_secret("GOOGLE_CREDENTIALS")
-GITHUB_PAT = get_secret("GITHUB_PAT")
+API_KEY = str(get_secret("APCA_API_KEY_ID", "")).strip()
+API_SECRET = str(get_secret("APCA_API_SECRET_KEY", "")).strip()
+GOOGLE_CREDS_RAW = get_secret("GOOGLE_CREDENTIALS", "")
+GITHUB_PAT_SECRET = str(get_secret("GITHUB_PAT", "")).strip().strip('"').strip("'")
 BASE_URL = "https://paper-api.alpaca.markets"
-
-if not API_KEY or not API_SECRET:
-    st.error("⚠️ Missing Alpaca API keys in Streamlit Secrets. Add `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` in App Settings -> Secrets.")
-    st.stop()
 
 @st.cache_resource
 def init_alpaca():
+    if not API_KEY or not API_SECRET:
+        return None
     return tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
 def repair_pem_key(pk_str):
@@ -163,15 +174,29 @@ def repair_pem_key(pk_str):
 
 def connect_gsheets():
     if not GOOGLE_CREDS_RAW:
-        return None, "GOOGLE_CREDENTIALS not found in Streamlit Secrets."
+        return None, "Missing GOOGLE_CREDENTIALS in Streamlit Secrets"
     try:
-        if isinstance(GOOGLE_CREDS_RAW, str):
-            creds_dict = json.loads(GOOGLE_CREDS_RAW, strict=False)
-        else:
+        if isinstance(GOOGLE_CREDS_RAW, str) and GOOGLE_CREDS_RAW.strip():
+            clean_str = GOOGLE_CREDS_RAW.replace("\xa0", " ").replace("\u00a0", " ").strip()
+            try:
+                creds_dict = json.loads(clean_str, strict=False)
+            except Exception:
+                try:
+                    import tomllib
+                    parsed = tomllib.loads(clean_str)
+                    creds_dict = parsed.get("GOOGLE_CREDENTIALS", parsed)
+                except Exception:
+                    creds_dict = {}
+        elif isinstance(GOOGLE_CREDS_RAW, dict) or hasattr(GOOGLE_CREDS_RAW, "get"):
             creds_dict = dict(GOOGLE_CREDS_RAW)
+        else:
+            creds_dict = {}
 
         if "private_key" in creds_dict:
             creds_dict["private_key"] = repair_pem_key(creds_dict["private_key"])
+
+        if not creds_dict:
+            return None, "Invalid Google Credentials format."
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -192,6 +217,8 @@ spreadsheet, sheet_status = connect_gsheets()
 # =====================================================================
 @st.cache_data(ttl=30)
 def fetch_alpaca_state():
+    if not api:
+        return False, {}, [], [], [], pd.DataFrame()
     clock_obj = api.get_clock()
     is_open = bool(clock_obj.is_open)
 
@@ -310,12 +337,15 @@ def parse_sheet_tab(ws):
             else:
                 cols = default_cols[:ncol] + [f"Extra_{i}" for i in range(max(0, ncol - len(default_cols)))]
                 data_rows = rows
-            return pd.DataFrame(data_rows, columns=cols)
+            df = pd.DataFrame(data_rows, columns=cols)
+            if "Ticker" in df.columns:
+                df = df[df["Ticker"].astype(str).str.strip() != ""]
+            return df
     except Exception:
         pass
     return pd.DataFrame()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=45)
 def fetch_all_sheet_logs():
     if not spreadsheet:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -340,7 +370,7 @@ def fetch_all_sheet_logs():
 # 4. SIDEBAR COMMAND DECK & PAGE ROUTER
 # =====================================================================
 with st.sidebar:
-    st.markdown("## ⚡ COMMAND DECK v3.0")
+    st.markdown("## ⚡ COMMAND DECK v3.5")
 
     @st.fragment(run_every="30s")
     def sidebar_live_clock():
@@ -367,31 +397,50 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🚀 Remote Bot Trigger")
-    st.caption("Dispatches all 3 engines on GitHub Actions immediately.")
+    st.caption("Dispatches the 68-Asset AI Screener & 3 Engines on GitHub Actions.")
+    custom_pat = st.text_input(
+        "GitHub Token Override (Optional if set in Secrets):",
+        value="",
+        type="password",
+        help="If GitHub revoked your old token (401 Error), paste a valid token here."
+    )
+    active_pat = custom_pat.strip() if custom_pat.strip() else GITHUB_PAT_SECRET
+
     if st.button("⚡ Trigger 3-Engine Scan Now", use_container_width=True):
-        if not GITHUB_PAT:
-            st.warning("Add `GITHUB_PAT` to Streamlit Secrets to enable 1-click remote triggers.")
+        if not active_pat:
+            st.error("⚠️ No GitHub Token found. Paste a valid GitHub PAT in the box above or save `GITHUB_PAT` in Streamlit Secrets.")
         else:
             resp = requests.post(
                 "https://api.github.com/repos/MakkosHUN/autotradingbot/actions/workflows/schedule.yml/dispatches",
-                headers={"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github+json"},
+                headers={
+                    "Authorization": f"Bearer {active_pat}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28"
+                },
                 json={"ref": "main"},
                 timeout=10
             )
             if resp.status_code == 204:
                 st.success("✅ 3-Engine Scan Dispatched! Completes in ~60s.")
+            elif resp.status_code == 401:
+                st.error("❌ GitHub 401 (Bad Credentials): Your old token was revoked by GitHub. Paste a valid token in the input box!")
             else:
                 st.error(f"GitHub API Error ({resp.status_code}): {resp.text}")
 
     st.markdown("---")
     st.markdown("### 🛡️ System Safeguards")
+    if not spreadsheet:
+        st.warning(f"Google Sheets Status: `{sheet_status}`")
+    else:
+        st.caption("🟢 **Google Sheets Logger:** `Connected`")
 
     @st.fragment(run_every="30s")
     def sidebar_live_safeguards():
-        _, acct_s, _, _, _, _ = fetch_alpaca_state()
+        if api:
+            _, acct_s, _, _, _, _ = fetch_alpaca_state()
+            dt_count = int(acct_s.get('daytrade_count', 0))
+            st.progress(min(dt_count / 3.0, 1.0), text=f"PDT Counter: {dt_count} / 3 Day Trades")
         _, spy_s, vix_s = fetch_macro_telemetry()
-        dt_count = int(acct_s.get('daytrade_count', 0))
-        st.progress(min(dt_count / 3.0, 1.0), text=f"PDT Counter: {dt_count} / 3 Day Trades")
         st.markdown(f"**SPY 24h:** `{spy_s:+.2f}%`  \n**CBOE VIX:** `{vix_s:.1f}`")
 
     sidebar_live_safeguards()
@@ -401,15 +450,17 @@ with st.sidebar:
         st.warning("Use only in extreme black-swan events.")
         confirm_override = st.checkbox("Unlock Emergency Buttons")
         if st.button("Cancel All Open Orders", disabled=not confirm_override, use_container_width=True):
-            api.cancel_all_orders()
-            st.cache_data.clear()
-            st.success("All open orders canceled.")
-            st.rerun()
+            if api:
+                api.cancel_all_orders()
+                st.cache_data.clear()
+                st.success("All open orders canceled.")
+                st.rerun()
         if st.button("🔥 Liquidate All Positions", disabled=not confirm_override, use_container_width=True):
-            api.close_all_positions(cancel_orders=True)
-            st.cache_data.clear()
-            st.error("All positions liquidated to cash.")
-            st.rerun()
+            if api:
+                api.close_all_positions(cancel_orders=True)
+                st.cache_data.clear()
+                st.error("All positions liquidated to cash.")
+                st.rerun()
 
 # =====================================================================
 # 5. REUSABLE ENGINE RENDERER FOR PAGES 2, 3, AND 4
@@ -441,22 +492,20 @@ def render_strategy_engine_view(
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Tranche Invested Capital", f"${tranche_invested:,.2f}", f"{tranche_exposure:.1f}% of Total Equity")
     k2.metric("Tranche Open P/L", f"${tranche_pl:+,.2f}", f"{len(tranche_pos)} Active Holdings")
-    k3.metric("Universe Size", f"{len(universe_tickers)} Assets", "24/7 Active" if is_crypto else "NYSE Market Hours")
+    k3.metric("Screener Pool Size", f"{len(universe_tickers)} Assets", "24/7 Active" if is_crypto else "24/7 Radar • NYSE Exec")
     k4.metric("FinBERT Trigger Thresholds", f"Buy ≥ {buy_thresh:+.2f}", f"Exit ≤ {exit_thresh:+.2f}")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     t1, t2, t3, t4 = st.tabs([
-        "💼 Tranche Positions & Risk Matrix",
+        "💼 Tranche Positions & Screener Matrix",
         "🧠 FinBERT Sentiment Radar & Sheet Logs",
         "🔬 Technical Trend Inspector",
         "📜 Tranche Order History"
     ])
 
     with t1:
-        if not tranche_pos:
-            st.info(f"No active positions currently open in the {tranche_key} tranche.")
-        else:
+        if tranche_pos:
             pos_rows = []
             for p in sorted(tranche_pos, key=lambda x: x['market_value'], reverse=True):
                 sym = p['symbol']
@@ -569,14 +618,25 @@ def render_strategy_engine_view(
                 yaxis=dict(title="Unrealized P/L ($)", gridcolor="rgba(255,255,255,0.06)")
             )
             st.plotly_chart(fig_bar, use_container_width=True)
+        else:
+            st.info(f"No open positions currently held in the **{tranche_key}** tranche. Capital is waiting for a confirmed breakout signal below.")
+
+        st.markdown(f"#### 📡 Latest Screened {tranche_key} Watchlist & AI Decision Matrix")
+        if not df_log.empty:
+            ticker_col = "Ticker" if "Ticker" in df_log.columns else df_log.columns[1]
+            latest_matrix = df_log.drop_duplicates(subset=[ticker_col], keep="last").iloc[::-1]
+            st.dataframe(latest_matrix, use_container_width=True, hide_index=True)
+        elif not spreadsheet:
+            st.error(f"⚠️ Cannot load `{tranche_key}` matrix because Google Sheets is disconnected (`{sheet_status}`). Update `GOOGLE_CREDENTIALS` in your Streamlit Cloud App Secrets!")
+        else:
+            st.caption(f"No scan rows recorded in `{tranche_key}` sheet tab yet. Click **⚡ Trigger 3-Engine Scan Now** in the sidebar to populate all 3 engines immediately!")
 
     with t2:
         st.subheader(f"🧠 Latest {tranche_key} FinBERT Sentiment Radar")
         if not df_log.empty:
-            n_latest = len(universe_tickers)
-            latest_df = df_log.tail(n_latest).copy()
-            score_col = "FinBERT Score" if "FinBERT Score" in latest_df.columns else latest_df.columns[2]
-            ticker_col = "Ticker" if "Ticker" in latest_df.columns else latest_df.columns[1]
+            score_col = "FinBERT Score" if "FinBERT Score" in df_log.columns else df_log.columns[2]
+            ticker_col = "Ticker" if "Ticker" in df_log.columns else df_log.columns[1]
+            latest_df = df_log.drop_duplicates(subset=[ticker_col], keep="last").tail(12).copy()
             latest_df["Score_Num"] = pd.to_numeric(latest_df[score_col], errors="coerce").fillna(0.0)
 
             bar_colors = ["#00FFAA" if s >= buy_thresh else ("#FF4B4B" if s <= exit_thresh else "#64748B") for s in latest_df["Score_Num"]]
@@ -587,19 +647,21 @@ def render_strategy_engine_view(
             fig_sent.add_hline(y=buy_thresh, line_dash="dash", line_color="#00FFAA", annotation_text=f"Buy ({buy_thresh:+.2f})")
             fig_sent.add_hline(y=exit_thresh, line_dash="dash", line_color="#FF4B4B", annotation_text=f"Exit ({exit_thresh:+.2f})")
             fig_sent.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,22,34,0.5)", height=310,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,22,34,0.5)", height=320,
                 margin=dict(t=20, b=10, l=10, r=10),
-                yaxis=dict(title="Net FinBERT Score (-1 to +1)", range=[-0.6, 0.9], gridcolor="rgba(255,255,255,0.06)")
+                yaxis=dict(title="Net FinBERT Score (-1 to +1)", range=[-0.65, 0.9], gridcolor="rgba(255,255,255,0.06)")
             )
             st.plotly_chart(fig_sent, use_container_width=True)
 
-            st.markdown(f"#### 📋 {tranche_key} Audit Log")
+            st.markdown(f"#### 📋 {tranche_key} Full Audit Log")
             st.dataframe(df_log.iloc[::-1].head(100), use_container_width=True, hide_index=True)
+        elif not spreadsheet:
+            st.error(f"⚠️ Google Sheets Disconnected: `{sheet_status}`. Paste your new Google Service Account JSON into Streamlit Secrets!")
         else:
-            st.info(f"✅ Ready! The `{tranche_key}` log worksheet will populate automatically on the next scan.")
+            st.info(f"The `{tranche_key}` worksheet currently has 0 rows. Trigger a scan from the sidebar to populate the AI Sentiment Radar!")
 
     with t3:
-        st.subheader(f"🔬 {tranche_key} Technical Trend Inspector")
+        st.subheader(f"🔬 {tranche_key} Technical Trend Inspector (Full {len(universe_tickers)}-Asset Pool)")
         sel_ticker = st.selectbox(f"Select {tranche_key} Asset:", universe_tickers, index=0, key=f"sel_{tranche_key}")
         df_yf = fetch_ticker_history(sel_ticker).copy()
         if not df_yf.empty:
@@ -630,19 +692,23 @@ def render_strategy_engine_view(
         if tranche_orders:
             st.dataframe(pd.DataFrame(tranche_orders), use_container_width=True, hide_index=True)
         else:
-            st.info(f"No recent orders for {tranche_key} assets.")
+            st.info(f"No orders submitted yet for {tranche_key} assets.")
 
 # =====================================================================
 # 6. AUTO-SYNCING MAIN TERMINAL
 # =====================================================================
 @st.fragment(run_every="30s")
 def render_live_terminal():
+    if not api:
+        st.error("Alpaca API keys are missing. Dashboard telemetry is offline.")
+        return
+
     is_open, account, positions, active_orders, recent_orders, port_hist = fetch_alpaca_state()
     macro_ok, spy_chg, vix_val = fetch_macro_telemetry()
     df_core, df_mom, df_crypto, df_closed = fetch_all_sheet_logs()
     daytrades = int(account.get('daytrade_count', 0))
 
-    mkt_badge = '<span class="status-pill pill-green">● NYSE OPEN</span>' if is_open else '<span class="status-pill pill-amber">● NYSE CLOSED</span>'
+    mkt_badge = '<span class="status-pill pill-green">● NYSE OPEN</span>' if is_open else '<span class="status-pill pill-amber">● NYSE CLOSED (24/7 RADAR)</span>'
     crypto_badge = '<span class="status-pill pill-blue">🪙 CRYPTO 24/7 ACTIVE</span>'
     macro_badge = '<span class="status-pill pill-green">🛡️ MACRO NORMAL</span>' if macro_ok else '<span class="status-pill pill-red">⚠️ MACRO CRASH SHIELD</span>'
     pdt_badge = f'<span class="status-pill pill-green">PDT: {daytrades}/3 SAFE</span>' if daytrades < 3 else '<span class="status-pill pill-red">PDT LOCKED (3/3)</span>'
@@ -650,8 +716,8 @@ def render_live_terminal():
     st.markdown(f"""
     <div class="terminal-header">
         <div>
-            <p class="terminal-title">⚡ QUANTITATIVE AI COMMAND CENTER // v3.0 MULTI-STRATEGY</p>
-            <p class="terminal-sub">3-Tier Architecture: Core Long-Term Equities • Short-Term Momentum • 24/7 Crypto AI Quant</p>
+            <p class="terminal-title">⚡ QUANTITATIVE AI COMMAND CENTER // v3.5 DYNAMIC SCREENER</p>
+            <p class="terminal-sub">68-Asset Funnel: 30 Core Blue-Chips • 24 High-Beta Momentum • 14 Crypto AI Quant Pairs</p>
         </div>
         <div>
             {mkt_badge}
@@ -682,17 +748,14 @@ def render_live_terminal():
 
     st.markdown("---")
 
-    # -----------------------------------------------------------------
-    # PAGE 1: MASTER HEDGE FUND OVERVIEW
-    # -----------------------------------------------------------------
     if selected_page == "🏛️ Master Hedge Fund Overview":
         st.subheader("🏛️ 3-Tranche Strategy Performance & Capital Allocation")
 
         tranche_summary = []
-        for t_key, t_label, t_risk in [
-            ("CORE", "🛡️ Engine 1: Core Long-Term Equities", "Low Risk • 1.5x/3.5x ATR • 200-SMA Filter"),
-            ("MOMENTUM", "⚡ Engine 2: Short-Term Momentum", "Mid Risk • 1.0x/2.0x ATR • Fast 20-EMA/50-SMA"),
-            ("CRYPTO", "🪙 Engine 3: 24/7 Crypto AI Quant", "High Risk • 24/7 Execution • Dynamic +6%/-3%")
+        for t_key, t_label, t_risk, df_t in [
+            ("CORE", "🛡️ Engine 1: Core Long-Term (30-Stock Screener)", "Low Risk • 1.5x/3.5x ATR • 200-SMA Filter", df_core),
+            ("MOMENTUM", "⚡ Engine 2: Short-Term Momentum (24-Stock Screener)", "Mid Risk • 1.0x/2.0x ATR • Fast 20-EMA/50-SMA", df_mom),
+            ("CRYPTO", "🪙 Engine 3: 24/7 Crypto AI Quant (14-Pair Screener)", "High Risk • 24/7 Execution • Dynamic +6%/-3%", df_crypto)
         ]:
             t_pos = [p for p in positions if p['tranche'] == t_key]
             t_val = sum(p['market_value'] for p in t_pos)
@@ -701,6 +764,7 @@ def render_live_terminal():
             tranche_summary.append({
                 "Strategy Engine": t_label,
                 "Risk Profile & Mandate": t_risk,
+                "Logged Scans": len(df_t),
                 "Active Positions": len(t_pos),
                 "Invested Capital": t_val,
                 "Portfolio Share (%)": t_exp,
@@ -785,13 +849,10 @@ def render_live_terminal():
             else:
                 st.info("No recent orders found.")
 
-    # -----------------------------------------------------------------
-    # PAGE 2: ENGINE 1 — CORE LONG-TERM EQUITIES
-    # -----------------------------------------------------------------
     elif selected_page == "🛡️ Engine 1: Core Long-Term":
         render_strategy_engine_view(
-            engine_title="🛡️ Engine 1: Core Blue-Chip Trend Equities (Low Risk / Steady Alpha)",
-            engine_subtitle="Universe: 12 S&P 500 Leaders • Filters: Price > 200-SMA & 20-EMA, Wilder's RSI < 72, FinBERT ≥ +0.10 • Brackets: 1.5x ATR Stop / 3.5x ATR Target (+2.5% Break-Even Ratchet)",
+            engine_title="🛡️ Engine 1: Core Blue-Chip Trend Equities (30-Stock Screener ➔ Top 10 Active)",
+            engine_subtitle="Pool: 30 S&P 500 Leaders • Filters: Price > 200-SMA & 20-EMA, Wilder's RSI < 72, FinBERT ≥ +0.10 • Brackets: 1.5x ATR Stop / 3.5x ATR Target (+2.5% Break-Even Ratchet)",
             tranche_key="CORE",
             universe_tickers=CORE_TICKERS,
             positions=positions,
@@ -805,13 +866,10 @@ def render_live_terminal():
             is_crypto=False
         )
 
-    # -----------------------------------------------------------------
-    # PAGE 3: ENGINE 2 — SHORT-TERM MOMENTUM
-    # -----------------------------------------------------------------
     elif selected_page == "⚡ Engine 2: Short-Term Momentum":
         render_strategy_engine_view(
-            engine_title="⚡ Engine 2: Tactical Short-Term Momentum (Mid Risk / Mid Reward)",
-            engine_subtitle="Universe: 8 High-Beta Tech & Growth Movers • Filters: 20-EMA > 50-SMA, Wilder's RSI < 72, FinBERT ≥ +0.05 • Brackets: Tight 1.0x ATR Stop / 2.0x ATR Target (+1.5% Fast Break-Even Ratchet)",
+            engine_title="⚡ Engine 2: Tactical Short-Term Momentum (24-Stock Screener ➔ Top 8 Movers)",
+            engine_subtitle="Pool: 24 High-Beta Tech & Growth Movers • Filters: 20-EMA > 50-SMA, Wilder's RSI < 72, FinBERT ≥ +0.05 (or 9-EMA > 20-EMA Breakout) • Brackets: 1.0x ATR Stop / 2.0x ATR Target",
             tranche_key="MOMENTUM",
             universe_tickers=MOMENTUM_TICKERS,
             positions=positions,
@@ -825,13 +883,10 @@ def render_live_terminal():
             is_crypto=False
         )
 
-    # -----------------------------------------------------------------
-    # PAGE 4: ENGINE 3 — 24/7 CRYPTO AI QUANT
-    # -----------------------------------------------------------------
     elif selected_page == "🪙 Engine 3: 24/7 Crypto AI":
         render_strategy_engine_view(
-            engine_title="🪙 Engine 3: 24/7 Crypto AI Quant (High Risk / High Reward)",
-            engine_subtitle="Universe: BTC/USD, ETH/USD, SOL/USD, AVAX/USD, LINK/USD • Runs 24/7/365 (Zero PDT Restrictions) • Dynamic +6.0% Take-Profit / -3.0% Stop-Loss / Oversold RSI Bounce & AI Breakout",
+            engine_title="🪙 Engine 3: 24/7 Crypto AI Quant (14-Pair Screener ➔ Top 6 Movers)",
+            engine_subtitle="Pool: 14 Major Crypto Pairs • Runs 24/7/365 (Zero PDT Restrictions) • Dynamic +6.0% Take-Profit / -3.0% Stop-Loss / Oversold RSI Bounce & AI Breakout",
             tranche_key="CRYPTO",
             universe_tickers=CRYPTO_PAIRS,
             positions=positions,
@@ -841,7 +896,7 @@ def render_live_terminal():
             df_closed=df_closed,
             equity=equity,
             buy_thresh=0.05,
-            exit_thresh=-0.15,
+            exit_thresh=-0.20,
             is_crypto=True
         )
 

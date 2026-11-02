@@ -1,23 +1,25 @@
-name: Multi-Frequency Quant Engine v3.5
+name: AETHER QUANT v8.5 Multi-Frequency 7-Engine Router
 
 on:
   schedule:
-    # 1. FULL 3-ENGINE SCAN: NYSE Open (14:35 UTC) & NYSE Close (20:35 UTC), Mon-Fri
+    # 1. FULL ENABLED SUITE SCAN: NYSE Open (14:35 UTC) & NYSE Close (20:35 UTC), Mon-Fri
     - cron: '35 14,20 * * 1-5'
 
-    # 2. SHORT-TERM MOMENTUM + CRYPTO: Every hour in between during NYSE hours, Mon-Fri
-    - cron: '35 15,16,17,18,19 * * 1-5'
+    # 2. 14x/DAY INTRADAY EQUITY + CRYPTO (Every 30 mins during NYSE hours: 15:05 to 20:05 UTC, Mon-Fri)
+    - cron: '5,35 15,16,17,18,19 * * 1-5'
+    - cron: '5 20 * * 1-5'
 
-    # 3. 24/7 CRYPTO AI QUANT: Every 2 hours overnight & all weekend (Sat-Sun)
-    - cron: '15 0,2,4,6,8,10,12,22 * * 1-5'
-    - cron: '15 */2 * * 0,6'
+    # 3. 48x/DAY 24/7 CRYPTO & RADAR (Every 30 mins overnight Mon-Fri & all weekend Sat-Sun)
+    - cron: '5,35 0-13,21-23 * * 1-5'
+    - cron: '5 14 * * 1-5'
+    - cron: '5,35 * * * 0,6'
 
   workflow_dispatch:
     inputs:
       bot_mode:
-        description: 'Select Engine to Run (all, core, momentum, crypto)'
+        description: 'Select Engine Mode (auto, all, core, momentum, crypto, discovery, mean_rev, small_cap, tail_hedge)'
         required: false
-        default: 'all'
+        default: 'auto'
 
 jobs:
   run-bot:
@@ -43,27 +45,27 @@ jobs:
           pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
           pip install "alpaca-trade-api==3.2.0" "yfinance==0.2.58" gspread google-auth pandas numpy requests
 
-      - name: Route & Execute Quant Engine by Schedule
+      - name: Route & Execute AETHER QUANT v8.5 Engine
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
           SCHEDULE_CRON: ${{ github.event.schedule }}
           MANUAL_MODE: ${{ github.event.inputs.bot_mode }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${MANUAL_MODE:-all}"
-            echo "🚀 Manual Trigger Detected -> Running Mode: $MODE"
+            MODE="${MANUAL_MODE:-auto}"
+            echo "🚀 Manual Dispatch -> Running Mode: $MODE"
             python bot.py --mode "$MODE"
           elif [ "$SCHEDULE_CRON" = "35 14,20 * * 1-5" ]; then
-            echo "🏛️ NYSE Open/Close Window -> Running ALL 3 Engines (Core + Momentum + Crypto)"
-            python bot.py --mode all
-          elif [ "$SCHEDULE_CRON" = "35 15,16,17,18,19 * * 1-5" ]; then
-            echo "⚡ NYSE Intraday Hourly Window -> Running Short-Term Momentum + 24/7 Crypto"
-            python bot.py --mode momentum
-            python bot.py --mode crypto
+            echo "🏛️ NYSE Open/Close Window -> Running All Dashboard-Enabled Engines (auto)"
+            python bot.py --mode auto
+          elif [ "$SCHEDULE_CRON" = "5,35 15,16,17,18,19 * * 1-5" ] || [ "$SCHEDULE_CRON" = "5 20 * * 1-5" ]; then
+            echo "⚡ 30-Min Intraday High-Frequency Window -> Running Enabled Active Intraday & Crypto Engines"
+            python bot.py --mode intraday
           else
-            echo "🪙 Off-Hours / Weekend Window -> Running 24/7 Crypto AI Engine Only"
+            echo "🪙 30-Min 24/7 Window -> Running Crypto AI Engine (if enabled)"
             python bot.py --mode crypto
           fi

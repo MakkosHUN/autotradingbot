@@ -21,7 +21,10 @@ API_KEY = os.environ.get("APCA_API_KEY_ID", "").strip()
 API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "").strip()
 BASE_URL = "https://paper-api.alpaca.markets"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://share.streamlit.io").strip().rstrip("/")
+
+# Fallback to https://share.streamlit.io if DASHBOARD_URL secret is empty
+raw_dash_url = os.environ.get("DASHBOARD_URL", "").strip().rstrip("/")
+DASHBOARD_URL = raw_dash_url if raw_dash_url.startswith("http") else "https://share.streamlit.io"
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
@@ -97,7 +100,7 @@ config_sheet = get_or_create_worksheet(
 )
 
 # =====================================================================
-# 2. 7-ENGINE MASTER POOLS & DYNAMIC GOOGLE SHEETS CONFIG LOADER
+# 2. STRICTLY DISJOINT 7-ENGINE MASTER POOLS (NO CANNIBALIZATION)
 # =====================================================================
 CORE_POOL = [
     'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG',
@@ -113,12 +116,23 @@ CRYPTO_POOL = [
     'BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'DOGE/USD', 'XRP/USD',
     'LTC/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD'
 ]
+# Disjoint Mean-Reversion Pool (Sector ETFs & Oversold Value Pullbacks - Zero overlap with CORE/MOMENTUM)
+MEAN_REV_POOL = [
+    'QQQ', 'IWM', 'DIA', 'SMH', 'XLF', 'XLE', 'XLK', 'XLV', 'XBI', 'ARKK',
+    'TLT', 'GDX', 'NKE', 'SBUX', 'PYPL', 'TGT', 'BA', 'LULU', 'DE', 'FDX'
+]
 SMALL_CAP_POOL = [
     'IONQ', 'RKLB', 'AFRM', 'UPST', 'HIMS', 'ASTS', 'LUNR', 'SMR', 'OKLO', 'SERV',
     'JOBY', 'ACHR', 'CELH', 'CVNA', 'AI', 'SOUN'
 ]
+# Broad Market Radar for Engine 4 Discovery Agent
+DISCOVERY_RADAR_POOL = [
+    'DELL', 'ANET', 'VRT', 'CEG', 'VST', 'AXON', 'APP', 'TTD', 'NET', 'DDOG',
+    'ZS', 'MDB', 'TEAM', 'NOW', 'WDAY', 'FTNT', 'GILD', 'AMGN', 'REGN', 'VRTX',
+    'ISRG', 'SYK', 'BSX', 'GE', 'RTX', 'LMT', 'NOC', 'GS', 'MS', 'BLK',
+    'SCHW', 'AXP', 'C', 'BX', 'KKR', 'APO', 'PGR', 'CB', 'MMC', 'CME'
+]
 TAIL_HEDGE_POOL = ['SH', 'PSQ', 'GLD']
-MEAN_REV_POOL = CORE_POOL + MOMENTUM_POOL[:10]
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_POOL}
 
 DEFAULT_ENGINE_CONFIG = {
@@ -173,6 +187,8 @@ def classify_symbol(sym):
         return "CORE"
     if sym in MOMENTUM_POOL:
         return "MOMENTUM"
+    if sym in MEAN_REV_POOL:
+        return "MEAN_REV"
     if sym in SMALL_CAP_POOL:
         return "SMALL_CAP"
     return "DISCOVERY"
@@ -181,11 +197,6 @@ def classify_symbol(sym):
 # 3. v7.5 REINFORCEMENT LEARNING (PPO POLICY GRADIENT) META-ALLOCATOR
 # =====================================================================
 def compute_rl_meta_allocation(engine_cfg):
-    """
-    v7.5 PPO-Style Softmax Policy Gradient Meta-Allocator:
-    Reads historical realized trade rewards from 'Closed Trades' and dynamically adjusts
-    each enabled engine's capital allocation cap based on rolling Sharpe & Profit Factor.
-    """
     base_caps = {k: v["cap"] for k, v in engine_cfg.items()}
     if not closed_sheet:
         return base_caps
@@ -217,7 +228,6 @@ def compute_rl_meta_allocation(engine_cfg):
         adjusted_caps = {}
         for eng, base_c in base_caps.items():
             r_score = rewards.get(eng, 0.0)
-            # Softmax policy gradient scaling (+/- 30% of base cap)
             mult = float(np.exp(r_score * 0.6))
             adjusted_caps[eng] = round(float(np.clip(base_c * mult, 0.05, 0.45)), 3)
         print(f"[v7.5 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
@@ -230,11 +240,6 @@ def compute_rl_meta_allocation(engine_cfg):
 # 4. v7.0 LEVEL-2 ORDER-BOOK IMBALANCE (OBI) & v8.0 OPTIONS GEX
 # =====================================================================
 def get_orderbook_imbalance(ticker):
-    """
-    v7.0 Microstructure Order-Book Imbalance (OBI):
-    Fetches real-time bid/ask quote sizes from Alpaca stream snapshot and computes:
-    OBI = (Bid_Size - Ask_Size) / (Bid_Size + Ask_Size) in [-1.0, +1.0].
-    """
     try:
         if "/" in ticker:
             quotes = api.get_latest_crypto_quotes([ticker], "us")
@@ -251,10 +256,6 @@ def get_orderbook_imbalance(ticker):
     return 0.0
 
 def check_macro_gex_and_circuit_breaker(equity, last_equity):
-    """
-    v8.0 Macro, Intraday Circuit Breaker & S&P 500 Options Gamma Exposure (GEX) Sensor:
-    Computes Net Call vs. Put Open Interest Gamma proxy on SPY nearest expiration.
-    """
     intraday_dd = ((equity - last_equity) / last_equity) if last_equity > 0 else 0.0
     if intraday_dd <= -0.020:
         return False, f"PORTFOLIO CIRCUIT BREAKER ({intraday_dd*100:+.2f}% Drawdown)", -1.0
@@ -269,7 +270,6 @@ def check_macro_gex_and_circuit_breaker(equity, last_equity):
         if len(spy) >= 2:
             spy_change = (spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]
 
-        # Calculate S&P 500 Options Gamma Exposure (GEX) Proxy from Call/Put Open Interest
         exps = spy_tk.options
         if exps:
             chain = spy_tk.option_chain(exps[0])
@@ -293,29 +293,44 @@ def check_macro_gex_and_circuit_breaker(equity, last_equity):
 # =====================================================================
 def discover_market_wide_catalysts(owned_symbols, top_n=6):
     """
-    Market-Wide AI Discovery Agent:
-    Scans Alpaca's global real-time breaking news firehose (across all 8,000+ stocks/cryptos),
-    extracts newly mentioned symbols outside our static pools, verifies Alpaca tradability,
-    and ranks them for immediate FinBERT + Arbiter execution.
+    Market-Wide AI Discovery Agent (Fixed for alpaca-trade-api==3.2.0):
+    1. Queries Yahoo Finance's live Day Gainers & Most Actives screeners + our 40-stock Mid/Large-Cap Discovery Radar.
+    2. Queries Alpaca's news firehose with explicit symbol batches to extract breaking news catalysts outside our static pools.
     """
-    known_static = set(CORE_POOL + MOMENTUM_POOL + SMALL_CAP_POOL + TAIL_HEDGE_POOL + [c.replace("/", "") for c in CRYPTO_POOL])
-    symbol_counts = {}
-    try:
-        global_news = api.get_news(limit=50)
-        for item in global_news:
-            syms = getattr(item, "symbols", []) or []
-            for s in syms:
-                s_clean = str(s).strip().upper()
-                if s_clean and s_clean not in known_static and len(s_clean) <= 5 and s_clean.isalpha():
-                    symbol_counts[s_clean] = symbol_counts.get(s_clean, 0) + 1
-    except Exception as e:
-        print(f"Global discovery news warning: {e}")
+    known_static = set(
+        CORE_POOL + MOMENTUM_POOL + MEAN_REV_POOL + SMALL_CAP_POOL + TAIL_HEDGE_POOL
+        + [c.replace("/", "") for c in CRYPTO_POOL]
+    )
+    discovered_pool = list(DISCOVERY_RADAR_POOL)
 
-    ranked_candidates = sorted(symbol_counts.keys(), key=lambda x: symbol_counts[x], reverse=True)
+    # Pull live market movers from Yahoo Finance Screener if available
+    try:
+        for scr_name in ["day_gainers", "most_actives"]:
+            scr = yf.screen(scr_name)
+            quotes = scr.get("quotes", []) if isinstance(scr, dict) else []
+            for q in quotes[:15]:
+                sym = str(q.get("symbol", "")).strip().upper()
+                if sym and sym.isalpha() and len(sym) <= 5 and sym not in known_static and sym not in discovered_pool:
+                    discovered_pool.insert(0, sym)
+    except Exception:
+        pass
+
+    # Also query Alpaca news using valid symbol string batch
+    try:
+        batch_query = ",".join(discovered_pool[:25])
+        alpaca_news = api.get_news(batch_query, limit=40)
+        for item in alpaca_news:
+            for s in (getattr(item, "symbols", []) or []):
+                s_clean = str(s).strip().upper()
+                if s_clean and s_clean.isalpha() and len(s_clean) <= 5 and s_clean not in known_static and s_clean not in discovered_pool:
+                    discovered_pool.insert(0, s_clean)
+    except Exception as e:
+        print(f"Discovery news batch note: {e}")
+
+    # Screen the discovered pool for top volume + momentum breakouts
+    screened = screen_top_candidates(discovered_pool[:45], top_n=top_n, owned_symbols=owned_symbols, mode="momentum")
     verified = []
-    for sym in ranked_candidates:
-        if len(verified) >= top_n:
-            break
+    for sym in screened:
         try:
             asset = api.get_asset(sym)
             if getattr(asset, "tradable", False) and getattr(asset, "status", "") == "active":
@@ -323,14 +338,16 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
         except Exception:
             continue
 
-    print(f"[AI DISCOVERY AGENT] Found {len(verified)} unconstrained market-wide catalysts: {verified}")
+    print(f"[AI DISCOVERY AGENT] Selected {len(verified)} unconstrained market-wide catalysts: {verified}")
     return verified
 
-def screen_top_candidates(pool, top_n, owned_symbols, mode="core"):
+def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=None):
+    # Strictly include owned symbols ONLY if they belong to this exact tranche
     always_include = []
     for t in pool:
         if t in owned_symbols or to_alpaca_pos_symbol(t) in owned_symbols:
-            always_include.append(t)
+            if tranche_name is None or classify_symbol(t) == tranche_name:
+                always_include.append(t)
 
     remaining_pool = [t for t in pool if t not in always_include]
     slots_left = max(0, top_n - len(always_include))
@@ -360,7 +377,6 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core"):
                 if mode in ["momentum", "small_cap"]:
                     rank_score = (abs(ret_1d) * 100.0) * (1.0 + min(rel_vol, 3.0))
                 elif mode == "mean_rev":
-                    # Prioritize sharpest pullbacks for oversold snapback
                     rank_score = (-ret_1d * 100.0) + rel_vol
                 elif mode == "crypto":
                     rank_score = (abs(ret_1d) * 100.0) + (rel_vol * 1.5)
@@ -387,7 +403,7 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core"):
     return final_list
 
 # =====================================================================
-# 6. MATHEMATICAL ARBITER MATRIX v8.5 (WITH L2 OBI + VWAP + MEAN-REV)
+# 6. MATHEMATICAL ARBITER MATRIX v8.5.1 (WITH L2 OBI + VWAP + MEAN-REV)
 # =====================================================================
 def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05, base_exit_max=-0.15, strategy_mode="core"):
     if tech is None:
@@ -425,7 +441,6 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
     else:
         tech_score -= 0.15
 
-    # v7.0 Order-Book Imbalance (OBI) + 5D-VWAP + Money Flow contribution
     if price >= vwap5 and (mfm > 0.05 or obi_score > 0.10):
         tech_score += 0.20
     elif price < vwap5 and (mfm < -0.15 or obi_score < -0.15):
@@ -712,7 +727,7 @@ def was_stopped_out_last_24h(ticker, closed_orders):
     return False
 
 def has_upcoming_earnings_48h(ticker):
-    if "/" in ticker or ticker in TAIL_HEDGE_POOL:
+    if "/" in ticker or ticker in TAIL_HEDGE_POOL or ticker in MEAN_REV_POOL[:12]:
         return False
     try:
         cal = yf.Ticker(ticker).calendar
@@ -809,7 +824,7 @@ def sync_recent_closed_sells(closed_orders):
     return new_fill_alerts
 
 # =====================================================================
-# 8. UNIVERSAL EQUITY TRANCHE EXECUTOR (CORE, MOM, DISC, MEAN_REV, SMALL_CAP)
+# 8. UNIVERSAL EQUITY TRANCHE EXECUTOR (STRICT TRANCHE OWNERSHIP GUARD)
 # =====================================================================
 def run_equity_tranche(
     tranche_name,
@@ -857,6 +872,10 @@ def run_equity_tranche(
         owned_qty = float(pos.qty) if pos else 0.0
         decision = f"HOLD [{regime_tag}]"
         action_taken = "None"
+
+        # Prevent cross-engine cannibalization: only manage positions belonging to this tranche
+        if owned_qty > 0 and classify_symbol(ticker) != tranche_name:
+            continue
 
         if owned_qty > 0:
             entry_price = float(pos.avg_entry_price)
@@ -1007,13 +1026,12 @@ def run_equity_tranche(
 def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, is_nyse_open, macro_ok, macro_reason, net_gex_score, risk_bps):
     hedge_alerts = []
     hedge_lines = []
-    hedge_sym = "SH"  # ProShares Short S&P500 Inverse ETF
+    hedge_sym = "SH"
     pos = positions_map.get(hedge_sym)
     owned_qty = float(pos.qty) if pos else 0.0
     tech = get_technicals_and_atr(hedge_sym)
     price = tech["price"] if tech else 12.0
 
-    # Trigger Tail Hedge when Macro Crash Shield trips OR Options GEX is deeply negative (< -0.18)
     needs_hedge = (not macro_ok) or (net_gex_score <= -0.18)
 
     if owned_qty > 0 and macro_ok and net_gex_score > -0.05 and is_nyse_open:
@@ -1214,10 +1232,9 @@ def run_bot(mode="auto"):
     all_alerts = list(automated_exit_alerts)
     section_reports = []
 
-    # 1. Engine 3: 24/7 Crypto AI Quant (48x/Day)
     if should_run("CRYPTO"):
         print("=== Running Engine 3: 24/7 Crypto AI Quant ===")
-        crypto_candidates = screen_top_candidates(CRYPTO_POOL, top_n=6, owned_symbols=owned_symbols, mode="crypto")
+        crypto_candidates = screen_top_candidates(CRYPTO_POOL, top_n=6, owned_symbols=owned_symbols, mode="crypto", tranche_name="CRYPTO")
         c_alerts, crypto_lines = run_crypto_tranche(
             crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps,
             active_orders, equity, macro_ok, macro_reason, engine_cfg["CRYPTO"]["risk_bps"]
@@ -1226,10 +1243,9 @@ def run_bot(mode="auto"):
         if crypto_lines:
             section_reports.append("🪙 **Engine 3 — 24/7 Crypto AI (48x/Day):**\n" + "\n".join(crypto_lines))
 
-    # 2. Engine 1: Core Long-Term Equities
     if should_run("CORE"):
         print("=== Running Engine 1: Core Long-Term Equities ===")
-        core_candidates = screen_top_candidates(CORE_POOL, top_n=8, owned_symbols=owned_symbols, mode="core")
+        core_candidates = screen_top_candidates(CORE_POOL, top_n=8, owned_symbols=owned_symbols, mode="core", tranche_name="CORE")
         core_alerts, core_lines = run_equity_tranche(
             tranche_name="CORE", tickers=core_candidates, sheet_ws=core_sheet,
             raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
@@ -1243,10 +1259,9 @@ def run_bot(mode="auto"):
         if core_lines:
             section_reports.append("🛡️ **Engine 1 — Core Blue-Chips:**\n" + "\n".join(core_lines))
 
-    # 3. Engine 2: Short-Term Momentum (14x/Day)
     if should_run("MOMENTUM"):
         print("=== Running Engine 2: Short-Term Momentum ===")
-        mom_candidates = screen_top_candidates(MOMENTUM_POOL, top_n=6, owned_symbols=owned_symbols, mode="momentum")
+        mom_candidates = screen_top_candidates(MOMENTUM_POOL, top_n=6, owned_symbols=owned_symbols, mode="momentum", tranche_name="MOMENTUM")
         mom_alerts, mom_lines = run_equity_tranche(
             tranche_name="MOMENTUM", tickers=mom_candidates, sheet_ws=momentum_sheet,
             raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
@@ -1260,7 +1275,6 @@ def run_bot(mode="auto"):
         if mom_lines:
             section_reports.append("⚡ **Engine 2 — Short-Term Momentum (14x/Day):**\n" + "\n".join(mom_lines))
 
-    # 4. Engine 4: Unconstrained Market-Wide AI Discovery Agent
     if should_run("DISCOVERY"):
         print("=== Running Engine 4: Market-Wide AI Discovery Agent ===")
         disc_candidates = discover_market_wide_catalysts(owned_symbols, top_n=5)
@@ -1278,10 +1292,9 @@ def run_bot(mode="auto"):
             if disc_lines:
                 section_reports.append("🛰️ **Engine 4 — Market-Wide AI Discovery Agent:**\n" + "\n".join(disc_lines))
 
-    # 5. Engine 5: Statistical Mean-Reversion (Oversold Bollinger/RSI Snapback)
     if should_run("MEAN_REV"):
         print("=== Running Engine 5: Statistical Mean-Reversion ===")
-        mr_candidates = screen_top_candidates(MEAN_REV_POOL, top_n=5, owned_symbols=owned_symbols, mode="mean_rev")
+        mr_candidates = screen_top_candidates(MEAN_REV_POOL, top_n=5, owned_symbols=owned_symbols, mode="mean_rev", tranche_name="MEAN_REV")
         mr_alerts, mr_lines = run_equity_tranche(
             tranche_name="MEAN_REV", tickers=mr_candidates, sheet_ws=discovery_sheet,
             raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
@@ -1295,10 +1308,9 @@ def run_bot(mode="auto"):
         if mr_lines:
             section_reports.append("🧲 **Engine 5 — Statistical Mean-Reversion:**\n" + "\n".join(mr_lines))
 
-    # 6. Engine 6: Small-Cap & High-Beta Speculative Breakouts
     if should_run("SMALL_CAP"):
         print("=== Running Engine 6: Small-Cap Speculative Breakouts ===")
-        sc_candidates = screen_top_candidates(SMALL_CAP_POOL, top_n=5, owned_symbols=owned_symbols, mode="small_cap")
+        sc_candidates = screen_top_candidates(SMALL_CAP_POOL, top_n=5, owned_symbols=owned_symbols, mode="small_cap", tranche_name="SMALL_CAP")
         sc_alerts, sc_lines = run_equity_tranche(
             tranche_name="SMALL_CAP", tickers=sc_candidates, sheet_ws=discovery_sheet,
             raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
@@ -1312,7 +1324,6 @@ def run_bot(mode="auto"):
         if sc_lines:
             section_reports.append("🚀 **Engine 6 — Small-Cap Alpha Breakouts:**\n" + "\n".join(sc_lines))
 
-    # 7. Engine 7: v8.0 Options GEX & Inverse Tail-Hedge Shield
     if should_run("TAIL_HEDGE"):
         print("=== Running Engine 7: v8.0 Options GEX & Tail-Hedge Overlay ===")
         th_alerts, th_lines = run_tail_hedge_engine(
@@ -1324,9 +1335,8 @@ def run_bot(mode="auto"):
             section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
 
     if all_alerts:
-        send_discord_alert("🚨 **AETHER QUANT v8.5 Execution Alert (7-Engine Suite • L2 OBI • RL Meta-Allocator):**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **AETHER QUANT v8.5.1 Execution Alert (7-Engine Suite • L2 OBI • RL Meta-Allocator):**\n" + "\n".join(all_alerts))
 
-    # Post-Scan Telemetry Report
     try:
         time.sleep(2)
         account = api.get_account()
@@ -1346,7 +1356,7 @@ def run_bot(mode="auto"):
         enabled_list = [k for k, v in engine_cfg.items() if v["enabled"]]
 
         detailed_report = (
-            f"💠 **AETHER QUANT v8.5 OMEGA Telemetry (7-Engine Suite • L2 OBI • GEX • RL Meta)**\n"
+            f"💠 **AETHER QUANT v8.5.1 OMEGA Telemetry (7-Engine Suite • L2 OBI • GEX • RL Meta)**\n"
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}`\n"
             f"🎛️ **Active Engines ({len(enabled_list)}/7):** `{', '.join(enabled_list)}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"

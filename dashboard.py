@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials
 # 1. PAGE CONFIG & MILLION-DOLLAR OBSIDIAN QUANT CSS
 # =====================================================================
 st.set_page_config(
-    page_title="AETHER QUANT v6.0 // Institutional Terminal",
+    page_title="AETHER QUANT v8.5 // Omega Institutional Terminal",
     page_icon="💠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -310,7 +310,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 68-Asset Master Pools
+# 7-Engine Asset Pools
 CORE_TICKERS = [
     'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG',
     'CAT', 'DIS', 'V', 'MA', 'UNH', 'HD', 'COST', 'ABBV', 'KO', 'PEP',
@@ -325,18 +325,37 @@ CRYPTO_PAIRS = [
     'BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'DOGE/USD', 'XRP/USD',
     'LTC/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD'
 ]
+SMALL_CAP_TICKERS = [
+    'IONQ', 'RKLB', 'AFRM', 'UPST', 'HIMS', 'ASTS', 'LUNR', 'SMR', 'OKLO', 'SERV',
+    'JOBY', 'ACHR', 'CELH', 'CVNA', 'AI', 'SOUN'
+]
+TAIL_HEDGE_TICKERS = ['SH', 'PSQ', 'GLD']
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_PAIRS}
-ALL_68_ASSETS = CORE_TICKERS + MOMENTUM_TICKERS + CRYPTO_PAIRS
+ALL_ASSETS = CORE_TICKERS + MOMENTUM_TICKERS + SMALL_CAP_TICKERS + TAIL_HEDGE_TICKERS + CRYPTO_PAIRS
+
+DEFAULT_ENGINE_CONFIG = {
+    "CORE":       {"enabled": True,  "cap": 0.35, "risk_bps": 0.0050, "freq": "2x/Day (Open/Close)", "desc": "S&P 500 Blue-Chip Trend Equities"},
+    "MOMENTUM":   {"enabled": True,  "cap": 0.25, "risk_bps": 0.0040, "freq": "14x/Day (Every 30m NYSE)", "desc": "High-Beta Tech & Growth Breakouts"},
+    "CRYPTO":     {"enabled": True,  "cap": 0.15, "risk_bps": 0.0045, "freq": "48x/Day (Every 30m 24/7)", "desc": "24/7 Digital Asset Quant"},
+    "DISCOVERY":  {"enabled": True,  "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Real-Time Firehose)", "desc": "Unconstrained Market-Wide News Catalyst Hunter"},
+    "MEAN_REV":   {"enabled": False, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Intraday Snapback)", "desc": "Statistical Arbitrage / Bollinger + RSI <= 32 Bounce"},
+    "SMALL_CAP":  {"enabled": False, "cap": 0.10, "risk_bps": 0.0030, "freq": "14x/Day (Intraday Breakouts)", "desc": "Russell 2000 & High-Velocity Speculative Movers"},
+    "TAIL_HEDGE": {"enabled": True,  "cap": 0.10, "risk_bps": 0.0050, "freq": "Continuous Macro/GEX Guard", "desc": "v8.0 Options GEX & Inverse ETF Crash Shield (SH)"}
+}
 
 def classify_symbol(sym):
     s_clean = sym.replace("/", "")
+    if sym in TAIL_HEDGE_TICKERS:
+        return "TAIL_HEDGE"
+    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM or sym.endswith("/USD") or sym.endswith("USD"):
+        return "CRYPTO"
     if sym in CORE_TICKERS:
         return "CORE"
     if sym in MOMENTUM_TICKERS:
         return "MOMENTUM"
-    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM or sym.endswith("/USD") or sym.endswith("USD"):
-        return "CRYPTO"
-    return "CORE"
+    if sym in SMALL_CAP_TICKERS:
+        return "SMALL_CAP"
+    return "DISCOVERY"
 
 # =====================================================================
 # 2. CREDENTIALS & CONNECTION INITIALIZATION
@@ -418,8 +437,56 @@ api = init_alpaca()
 spreadsheet, sheet_status = connect_gsheets()
 
 # =====================================================================
-# 3. LIVE TELEMETRY, VaR/CVaR, CORRELATION & POST-MORTEM ANALYTICS
+# 3. 7-ENGINE CONFIG SYNC, LIVE TELEMETRY, GEX, RL & MONTE CARLO
 # =====================================================================
+@st.cache_data(ttl=20)
+def fetch_engine_config():
+    cfg = {k: dict(v) for k, v in DEFAULT_ENGINE_CONFIG.items()}
+    if not spreadsheet:
+        return cfg
+    try:
+        try:
+            ws = spreadsheet.worksheet("Engine Config")
+        except Exception:
+            ws = spreadsheet.add_worksheet(title="Engine Config", rows="20", cols="6")
+            ws.append_row(["Engine", "Enabled", "Base_Cap_Pct", "Risk_Bps", "Description"])
+            init_rows = [
+                [k, "TRUE" if v["enabled"] else "FALSE", str(v["cap"]), str(v["risk_bps"]), v["desc"]]
+                for k, v in cfg.items()
+            ]
+            ws.append_rows(init_rows)
+            return cfg
+
+        rows = ws.get_all_values()
+        for r in rows[1:]:
+            if len(r) >= 4 and r[0] in cfg:
+                eng = r[0].strip()
+                cfg[eng]["enabled"] = str(r[1]).strip().upper() in ["TRUE", "1", "YES", "ON", "ACTIVE"]
+                try:
+                    cfg[eng]["cap"] = float(r[2])
+                    cfg[eng]["risk_bps"] = float(r[3])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return cfg
+
+def save_engine_config_to_sheet(updated_cfg):
+    if not spreadsheet:
+        return False
+    try:
+        ws = spreadsheet.worksheet("Engine Config")
+        ws.clear()
+        rows = [["Engine", "Enabled", "Base_Cap_Pct", "Risk_Bps", "Description"]]
+        for k, v in updated_cfg.items():
+            rows.append([k, "TRUE" if v["enabled"] else "FALSE", str(v["cap"]), str(v["risk_bps"]), v["desc"]])
+        ws.append_rows(rows)
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        st.error(f"Failed to save Engine Config: {e}")
+        return False
+
 def get_nyse_bell_countdown():
     ny_now = datetime.now(ZoneInfo("America/New_York"))
     wk = ny_now.weekday()
@@ -581,7 +648,7 @@ def compute_trade_post_mortems(recent_orders, positions):
 
     df_pm = pd.DataFrame(post_mortems)
     attr_rows = []
-    for eng in ["CORE", "MOMENTUM", "CRYPTO"]:
+    for eng in DEFAULT_ENGINE_CONFIG.keys():
         eng_pm = df_pm[df_pm["Engine"] == eng] if not df_pm.empty else pd.DataFrame()
         eng_pos = [p for p in positions if p["tranche"] == eng]
 
@@ -599,12 +666,17 @@ def compute_trade_post_mortems(recent_orders, positions):
         unrealized_net = sum(p["unrealized_pl"] for p in eng_pos)
         avg_hold = float(eng_pm["Hold (Hrs)"].mean()) if not eng_pm.empty else 0.0
 
+        # v7.5 RL Meta-Allocator Multiplier
+        reward_sig = np.clip(((profit_factor - 1.0) * 0.25) + ((win_rate - 50.0) / 200.0), -0.35, 0.35) if n_closed > 0 else 0.0
+        rl_mult = float(np.exp(reward_sig))
+
         attr_rows.append({
             "Strategy Engine": eng,
             "Closed Trades": n_closed,
             "Open Trades": len(eng_pos),
             "Win Rate (%)": round(win_rate, 1),
             "Profit Factor": round(profit_factor, 2),
+            "RL Policy Mult": f"{rl_mult:.2f}x",
             "Avg Win ($)": round(avg_win, 2),
             "Avg Loss ($)": round(avg_loss, 2),
             "Avg Hold (Hrs)": round(avg_hold, 1),
@@ -616,20 +688,28 @@ def compute_trade_post_mortems(recent_orders, positions):
     return pd.DataFrame(attr_rows), df_pm
 
 @st.cache_data(ttl=120)
-def fetch_macro_telemetry():
-    spy_chg, vix_val, spy_30d = 0.0, 0.0, 0.0
+def fetch_macro_and_gex_telemetry():
+    spy_chg, vix_val, spy_30d, net_gex = 0.0, 0.0, 0.0, 0.0
     try:
-        spy = yf.Ticker("SPY").history(period="1mo")
+        spy_tk = yf.Ticker("SPY")
+        spy = spy_tk.history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="5d")
         if len(spy) >= 2:
             spy_chg = ((spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]) * 100
             spy_30d = ((spy['Close'].iloc[-1] - spy['Close'].iloc[0]) / spy['Close'].iloc[0]) * 100
         if not vix.empty:
             vix_val = float(vix['Close'].iloc[-1])
+        exps = spy_tk.options
+        if exps:
+            ch = spy_tk.option_chain(exps[0])
+            c_oi = float(ch.calls["openInterest"].fillna(0).sum())
+            p_oi = float(ch.puts["openInterest"].fillna(0).sum())
+            if (c_oi + p_oi) > 0:
+                net_gex = round((c_oi - p_oi) / (c_oi + p_oi), 3)
     except Exception:
         pass
     macro_ok = (spy_chg > -1.5) and (vix_val < 28.0)
-    return macro_ok, spy_chg, vix_val, spy_30d
+    return macro_ok, spy_chg, vix_val, spy_30d, net_gex
 
 @st.cache_data(ttl=300)
 def fetch_ticker_history(ticker, period="1y"):
@@ -641,16 +721,11 @@ def fetch_ticker_history(ticker, period="1y"):
 
 @st.cache_data(ttl=300)
 def compute_portfolio_var_and_correlation(positions_tuple, equity):
-    """
-    Computes 95% and 99% Daily Parametric & Historical Value-at-Risk (VaR),
-    Conditional VaR (CVaR / Expected Shortfall), and 60-Day Cross-Asset Correlation Matrix.
-    """
     if not positions_tuple:
         return 0.0, 0.0, 0.0, pd.DataFrame()
     syms = [p[0] for p in positions_tuple]
     weights = np.array([p[1] for p in positions_tuple], dtype=float)
-    total_invested = float(weights.sum())
-    if total_invested <= 0:
+    if float(weights.sum()) <= 0:
         return 0.0, 0.0, 0.0, pd.DataFrame()
 
     ret_dict = {}
@@ -719,7 +794,7 @@ def parse_sheet_tab(ws):
 @st.cache_data(ttl=45)
 def fetch_all_sheet_logs():
     if not spreadsheet:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     df_core = parse_sheet_tab(spreadsheet.sheet1)
     try:
         df_mom = parse_sheet_tab(spreadsheet.worksheet("Momentum Log"))
@@ -730,14 +805,18 @@ def fetch_all_sheet_logs():
     except Exception:
         df_crypto = pd.DataFrame()
     try:
+        df_disc = parse_sheet_tab(spreadsheet.worksheet("Discovery Log"))
+    except Exception:
+        df_disc = pd.DataFrame()
+    try:
         closed_ws = spreadsheet.worksheet("Closed Trades")
         closed_rows = closed_ws.get_all_values()
         df_closed = pd.DataFrame(closed_rows[1:], columns=closed_rows[0]) if len(closed_rows) > 1 else pd.DataFrame()
     except Exception:
         df_closed = pd.DataFrame()
-    return df_core, df_mom, df_crypto, df_closed
+    return df_core, df_mom, df_crypto, df_disc, df_closed
 
-def trigger_github_workflow(token, mode="all"):
+def trigger_github_workflow(token, mode="auto"):
     if not token:
         st.sidebar.error("⚠️ Missing GitHub PAT. Paste token in sidebar or Streamlit Secrets.")
         return False
@@ -752,7 +831,7 @@ def trigger_github_workflow(token, mode="all"):
         timeout=10
     )
     if resp.status_code == 204:
-        st.sidebar.success(f"✅ Dispatched `{mode.upper()}` Engine!")
+        st.sidebar.success(f"✅ Dispatched `{mode.upper()}` Mode!")
         return True
     else:
         resp2 = requests.post(
@@ -775,14 +854,17 @@ if "discord_cmd" in st.query_params:
     cmd_val = str(st.query_params["discord_cmd"]).strip().lower()
     st.query_params.clear()
     if cmd_val == "scan_all":
-        trigger_github_workflow(GITHUB_PAT_SECRET, "all")
-        st.toast("🚀 Discord Mobile Command Executed: Dispatched ALL 3 Engines!", icon="✅")
+        trigger_github_workflow(GITHUB_PAT_SECRET, "auto")
+        st.toast("🚀 Discord Command Executed: Dispatched Enabled Engines!", icon="✅")
+    elif cmd_val == "scan_discovery":
+        trigger_github_workflow(GITHUB_PAT_SECRET, "discovery")
+        st.toast("🛰️ Discord Command Executed: Dispatched AI Discovery Agent!", icon="✅")
     elif cmd_val == "scan_momentum":
         trigger_github_workflow(GITHUB_PAT_SECRET, "momentum")
-        st.toast("⚡ Discord Mobile Command Executed: Dispatched Momentum Engine!", icon="✅")
+        st.toast("⚡ Discord Command Executed: Dispatched Momentum Engine!", icon="✅")
     elif cmd_val == "scan_crypto":
         trigger_github_workflow(GITHUB_PAT_SECRET, "crypto")
-        st.toast("🪙 Discord Mobile Command Executed: Dispatched 24/7 Crypto Engine!", icon="✅")
+        st.toast("🪙 Discord Command Executed: Dispatched 24/7 Crypto Engine!", icon="✅")
     elif cmd_val == "snapshot" and DISCORD_WEBHOOK_SECRET and api:
         _, acct_snap, pos_snap, _, _, _ = fetch_alpaca_state()
         eq_s = acct_snap.get("equity", 0.0)
@@ -802,11 +884,11 @@ if "discord_cmd" in st.query_params:
         st.toast("🛑 Discord Command Executed: All Crypto positions liquidated!", icon="⚠️")
 
 # =====================================================================
-# 5. SIDEBAR TELEMETRY, ENGINE DISPATCH & PRECISION ORDER TICKET
+# 5. SIDEBAR TELEMETRY, 7-ENGINE DISPATCH & PRECISION ORDER DESK
 # =====================================================================
 with st.sidebar:
-    st.markdown("### 💠 AETHER QUANT `v6.0`")
-    st.caption("Arbiter • Corr Guard • Chandelier • VaR Lab")
+    st.markdown("### 💠 AETHER QUANT `v8.5 OMEGA`")
+    st.caption("7-Engine Pod • L2 OBI • RL Meta • 10k Monte Carlo")
 
     @st.fragment(run_every="30s")
     def sidebar_clocks():
@@ -828,7 +910,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.markdown("#### 🚀 Engine Dispatch Controls")
+    st.markdown("#### 🚀 7-Engine Remote Dispatch")
     custom_pat = st.text_input(
         "GitHub PAT Override (Optional):",
         value="",
@@ -837,24 +919,18 @@ with st.sidebar:
     )
     active_pat = custom_pat.strip() if custom_pat.strip() else GITHUB_PAT_SECRET
 
-    if st.button("⚡ Dispatch All 3 Engines", use_container_width=True):
-        trigger_github_workflow(active_pat, "all")
+    dispatch_choice = st.selectbox(
+        "Select Engine Mode to Fire:",
+        ["auto (All Enabled Engines)", "all (Force All 7)", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge"],
+        index=0
+    )
+    if st.button("⚡ Dispatch Selected Mode Now", use_container_width=True):
+        clean_mode = dispatch_choice.split(" ")[0]
+        trigger_github_workflow(active_pat, clean_mode)
 
-    d_col1, d_col2, d_col3 = st.columns(3)
-    with d_col1:
-        if st.button("🛡️ Core", use_container_width=True):
-            trigger_github_workflow(active_pat, "core")
-    with d_col2:
-        if st.button("⚡ Mom", use_container_width=True):
-            trigger_github_workflow(active_pat, "momentum")
-    with d_col3:
-        if st.button("🪙 Cryp", use_container_width=True):
-            trigger_github_workflow(active_pat, "crypto")
-
-    # Manual ATR Risk-Parity Order & Scaling Desk
     with st.expander("🎯 Manual Precision Order Desk"):
-        st.caption("Execute an instant ATR Risk-Parity trade or scale out of an active position.")
-        man_sym = st.selectbox("Select Asset:", ALL_68_ASSETS, index=0)
+        st.caption("Execute an instant ATR Risk-Parity trade on any asset.")
+        man_sym = st.selectbox("Select Asset:", ALL_ASSETS, index=0)
         man_risk_bps = st.slider("Risk Budget (% Equity):", 0.20, 1.00, 0.45, 0.05)
         if st.button("🚀 Submit Risk-Parity Buy", use_container_width=True):
             if api:
@@ -886,7 +962,7 @@ with st.sidebar:
 
     st.markdown("#### 🛡️ System Safeguards")
     if spreadsheet:
-        st.caption("🟢 **Cloud Audit Ledger:** `Connected`")
+        st.caption("🟢 **Cloud Audit & Config Ledger:** `Connected`")
     else:
         st.warning(f"🔴 **Sheets Disconnected:** `{sheet_status}`")
 
@@ -896,18 +972,18 @@ with st.sidebar:
             _, acct_s, _, _, _, _ = fetch_alpaca_state()
             dt_count = int(acct_s.get('daytrade_count', 0))
             st.progress(min(dt_count / 3.0, 1.0), text=f"FINRA PDT Shield: {dt_count} / 3 Day Trades")
-        _, spy_s, vix_s, _ = fetch_macro_telemetry()
+        _, spy_s, vix_s, _, gex_s = fetch_macro_and_gex_telemetry()
         st.markdown(f"""
-        <div style="font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:#94A3B8; margin-top:4px;">
-            SPY 24H: <span style="color:{'#10B981' if spy_s>=0 else '#F43F5E'}; font-weight:600;">{spy_s:+.2f}%</span> &nbsp;|&nbsp;
-            VIX: <span style="color:{'#10B981' if vix_s<22 else '#F59E0B'}; font-weight:600;">{vix_s:.1f}</span>
+        <div style="font-family:'JetBrains Mono',monospace; font-size:0.74rem; color:#94A3B8; margin-top:4px;">
+            SPY: <span style="color:{'#10B981' if spy_s>=0 else '#F43F5E'}; font-weight:600;">{spy_s:+.2f}%</span> |
+            VIX: <span style="color:{'#10B981' if vix_s<22 else '#F59E0B'}; font-weight:600;">{vix_s:.1f}</span> |
+            GEX: <span style="color:{'#10B981' if gex_s>=0 else '#F43F5E'}; font-weight:600;">{gex_s:+.2f}</span>
         </div>
         """, unsafe_allow_html=True)
 
     sidebar_safeguards()
 
     with st.expander("🚨 Kill-Switch & Overrides"):
-        st.caption("Immediate market liquidation and order book purge.")
         unlock_kill = st.checkbox("Arm Emergency Controls")
         if st.button("Cancel Open Orders", disabled=not unlock_kill, use_container_width=True):
             if api:
@@ -923,7 +999,7 @@ with st.sidebar:
                 st.rerun()
 
 # =====================================================================
-# 6. PRO TECHNICAL CHART (CANDLES + BBANDS + VWAP + WILDER'S RSI)
+# 6. PRO TECHNICAL CHART, BACKTESTER & v8.5 10,000-PATH MONTE CARLO
 # =====================================================================
 def build_pro_technical_chart(ticker, df_yf):
     df = df_yf.copy()
@@ -931,7 +1007,6 @@ def build_pro_technical_chart(ticker, df_yf):
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
 
-    # 5-Day Rolling VWAP
     typ_p = (df["High"] + df["Low"] + df["Close"]) / 3.0
     if "Volume" in df.columns and df["Volume"].sum() > 0:
         df["VWAP5"] = (typ_p * df["Volume"]).rolling(5).sum() / df["Volume"].rolling(5).sum()
@@ -1102,7 +1177,6 @@ def run_arbiter_backtest(tickers, period_str, sl_atr, tp_atr, risk_bps, w_news_o
                     equity_curve.append({"Date": dt_idx, "Equity": round(equity, 2)})
                     in_pos = False
                 else:
-                    # 3-Stage Chandelier Ratchet in Backtest
                     gain_pct = (px_now - entry_px) / entry_px
                     if gain_pct >= 0.060:
                         stop_px = max(stop_px, px_now - (1.2 * atr_now))
@@ -1128,8 +1202,41 @@ def run_arbiter_backtest(tickers, period_str, sl_atr, tp_atr, risk_bps, w_news_o
     df_eq = pd.DataFrame(equity_curve).sort_values("Date") if equity_curve else pd.DataFrame()
     return equity, df_trades, df_eq, regime_counts
 
+def run_monte_carlo_10k(trade_pnls, n_paths=10000, horizon_trades=60, start_equity=100000.0):
+    """
+    v8.5 Walk-Forward 10,000-Path Monte Carlo Resampling Engine:
+    Bootstraps 10,000 synthetic equity trajectories from historical trade P/L distributions
+    to quantify 5th, 25th, 50th, 75th, and 95th percentile confidence cones and Probability of Profit.
+    """
+    if len(trade_pnls) < 3:
+        return None
+    pnl_arr = np.array(trade_pnls, dtype=float)
+    rng = np.random.default_rng(42)
+    sampled = rng.choice(pnl_arr, size=(n_paths, horizon_trades), replace=True)
+    cum_paths = start_equity + np.cumsum(sampled, axis=1)
+    cum_paths = np.hstack([np.full((n_paths, 1), start_equity), cum_paths])
+
+    p05 = np.percentile(cum_paths, 5, axis=0)
+    p25 = np.percentile(cum_paths, 25, axis=0)
+    p50 = np.percentile(cum_paths, 50, axis=0)
+    p75 = np.percentile(cum_paths, 75, axis=0)
+    p95 = np.percentile(cum_paths, 95, axis=0)
+
+    terminal_eqs = cum_paths[:, -1]
+    prob_profit = float((terminal_eqs > start_equity).mean() * 100.0)
+    median_end = float(np.median(terminal_eqs))
+    tail_5_end = float(np.percentile(terminal_eqs, 5))
+
+    return {
+        "steps": np.arange(horizon_trades + 1),
+        "p05": p05, "p25": p25, "p50": p50, "p75": p75, "p95": p95,
+        "prob_profit": prob_profit,
+        "median_end": median_end,
+        "tail_5_end": tail_5_end
+    }
+
 # =====================================================================
-# 7. REUSABLE STRATEGY ENGINE WORKSTATION (ENGINES 1, 2, AND 3)
+# 7. REUSABLE STRATEGY ENGINE WORKSTATION
 # =====================================================================
 def render_strategy_engine_view(
     engine_title,
@@ -1177,8 +1284,8 @@ def render_strategy_engine_view(
             <span class="kpi-delta {pl_cls}">{len(tranche_pos)} Active Positions</span>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label"><span>ARBITER & RATCHET ENGINE</span><span>⚖️</span></div>
-            <div class="kpi-value">3-Stage Trail</div>
+            <div class="kpi-label"><span>MICROSTRUCTURE & RATCHET</span><span>⚖️</span></div>
+            <div class="kpi-value">L2 OBI + Trail</div>
             <span class="kpi-delta delta-neu">VWAP • Corr Guard • Chandelier</span>
         </div>
         <div class="kpi-card">
@@ -1249,56 +1356,20 @@ def render_strategy_engine_view(
                 })
 
             df_pos = pd.DataFrame(pos_rows)
-            col_table, col_pie = st.columns([2.35, 1])
-            with col_table:
-                st.markdown('<div class="sec-title"><span class="sec-dot"></span>Active Tranche Holdings & 3-Stage Chandelier Telemetry</div>', unsafe_allow_html=True)
-                st.dataframe(
-                    df_pos,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Market Value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
-                        "Avg Entry": st.column_config.NumberColumn("Avg Entry", format="$%.2f"),
-                        "Current Price": st.column_config.NumberColumn("Live Price", format="$%.2f"),
-                        "Unrealized P/L ($)": st.column_config.NumberColumn("Open P/L ($)", format="$%+.2f"),
-                        "Return (%)": st.column_config.NumberColumn("Return (%)", format="%+.2f%%"),
-                        "SL ➔ TP Gauge": st.column_config.ProgressColumn(
-                            "SL ➔ TP Trajectory",
-                            format="%.0f%%",
-                            min_value=0,
-                            max_value=100
-                        )
-                    }
-                )
-
-            with col_pie:
-                st.markdown('<div class="sec-title"><span class="sec-dot"></span>Tranche Weighting</div>', unsafe_allow_html=True)
-                alloc_df = pd.DataFrame({
-                    "Asset": [r["Ticker"] for r in pos_rows],
-                    "Value": [r["Market Value"] for r in pos_rows]
-                })
-                fig_pie = px.pie(
-                    alloc_df, values="Value", names="Asset", hole=0.68,
-                    color_discrete_sequence=["#10B981", "#38BDF8", "#6366F1", "#8B5CF6", "#F59E0B", "#EC4899"]
-                )
-                fig_pie.update_traces(
-                    textinfo="label+percent",
-                    hovertemplate="<b>%{label}</b><br>Invested: $%{value:,.2f}<br>Share: %{percent}<extra></extra>"
-                )
-                fig_pie.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(t=8, b=8, l=8, r=8), height=290,
-                    showlegend=False,
-                    annotations=[dict(
-                        text=(
-                            f"<span style='color:#64748B; font-size:10px;'>{tranche_key}</span><br>"
-                            f"<b style='color:#F8FAFC; font-size:15px;'>${tranche_invested:,.2f}</b><br>"
-                            f"<span style='color:#10B981; font-size:10px;'>{tranche_exposure:.1f}% Equity</span>"
-                        ),
-                        x=0.5, y=0.5, showarrow=False
-                    )]
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
+            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Active Tranche Holdings & 3-Stage Chandelier Telemetry</div>', unsafe_allow_html=True)
+            st.dataframe(
+                df_pos,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Market Value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+                    "Avg Entry": st.column_config.NumberColumn("Avg Entry", format="$%.2f"),
+                    "Current Price": st.column_config.NumberColumn("Live Price", format="$%.2f"),
+                    "Unrealized P/L ($)": st.column_config.NumberColumn("Open P/L ($)", format="$%+.2f"),
+                    "Return (%)": st.column_config.NumberColumn("Return (%)", format="%+.2f%%"),
+                    "SL ➔ TP Gauge": st.column_config.ProgressColumn("SL ➔ TP Trajectory", format="%.0f%%", min_value=0, max_value=100)
+                }
+            )
 
         st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>Latest Screened {tranche_key} Candidates & Arbiter Regime Matrix</div>', unsafe_allow_html=True)
         if not df_log.empty:
@@ -1306,14 +1377,7 @@ def render_strategy_engine_view(
             latest_matrix = df_log.drop_duplicates(subset=[ticker_col], keep="last").iloc[::-1].copy()
             if "FinBERT Score" in latest_matrix.columns:
                 latest_matrix["FinBERT Score"] = pd.to_numeric(latest_matrix["FinBERT Score"], errors="coerce").fillna(0.0)
-            st.dataframe(
-                latest_matrix,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "FinBERT Score": st.column_config.NumberColumn("FinBERT Score (-1 to +1)", format="%+.3f")
-                }
-            )
+            st.dataframe(latest_matrix, use_container_width=True, hide_index=True)
         else:
             st.info(f"No scan records in `{tranche_key}` yet. Use the sidebar dispatch buttons to run an immediate scan.")
 
@@ -1341,14 +1405,12 @@ def render_strategy_engine_view(
                 yaxis=dict(title="Net Sentiment Score", range=[-1.05, 1.05], gridcolor="rgba(255,255,255,0.05)")
             )
             st.plotly_chart(fig_sent, use_container_width=True)
-
-            st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>Historical {tranche_key} Execution Ledger</div>', unsafe_allow_html=True)
             st.dataframe(df_log.iloc[::-1].head(100), use_container_width=True, hide_index=True)
         else:
             st.info("Audit ledger will populate automatically after the next scan.")
 
     with t3:
-        st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>Multi-Timeframe Technical & VWAP Inspector ({len(universe_tickers)}-Asset Pool)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sec-title"><span class="sec-dot"></span>Multi-Timeframe Technical & VWAP Inspector</div>', unsafe_allow_html=True)
         sel_ticker = st.selectbox(f"Select {tranche_key} Instrument:", universe_tickers, index=0, key=f"sel_{tranche_key}")
         df_yf = fetch_ticker_history(sel_ticker)
         if not df_yf.empty:
@@ -1363,7 +1425,7 @@ def render_strategy_engine_view(
             st.info(f"No recent Alpaca orders recorded for the {tranche_key} tranche.")
 
 # =====================================================================
-# 8. MAIN OBSIDIAN TERMINAL RENDERER (AUTO-SYNCS EVERY 30S)
+# 8. MAIN OMEGA TERMINAL RENDERER (AUTO-SYNCS EVERY 30S)
 # =====================================================================
 @st.fragment(run_every="30s")
 def render_live_terminal():
@@ -1372,8 +1434,9 @@ def render_live_terminal():
         return
 
     is_open, account, positions, active_orders, recent_orders, port_hist = fetch_alpaca_state()
-    macro_ok, spy_chg, vix_val, spy_30d = fetch_macro_telemetry()
-    df_core, df_mom, df_crypto, df_closed = fetch_all_sheet_logs()
+    macro_ok, spy_chg, vix_val, spy_30d, net_gex = fetch_macro_and_gex_telemetry()
+    df_core, df_mom, df_crypto, df_disc, df_closed = fetch_all_sheet_logs()
+    engine_cfg = fetch_engine_config()
     df_attr, df_post_mortems = compute_trade_post_mortems(recent_orders, positions)
     _, bell_countdown = get_nyse_bell_countdown()
 
@@ -1394,13 +1457,15 @@ def render_live_terminal():
     pos_tuple = tuple((p["symbol"], float(p["market_value"])) for p in positions)
     var_95, var_99, cvar_95, corr_matrix = compute_portfolio_var_and_correlation(pos_tuple, equity)
     breaker_ok = day_pl_pct > -2.0
+    enabled_engines = [k for k, v in engine_cfg.items() if v["enabled"]]
 
     # 1. Live Scrolling Institutional Ticker Tape
     tape_items = [
         f'<span class="ticker-item"><span class="ticker-sym">SPY</span><span class="{"up" if spy_chg>=0 else "down"}">{spy_chg:+.2f}%</span></span>',
         f'<span class="ticker-item"><span class="ticker-sym">VIX</span><span class="{"up" if vix_val<22 else "down"}">{vix_val:.2f}</span></span>',
+        f'<span class="ticker-item"><span class="ticker-sym">GEX</span><span class="{"up" if net_gex>=0 else "down"}">{net_gex:+.2f}</span></span>',
         f'<span class="ticker-item"><span class="ticker-sym">95% VaR</span><span class="flat">${var_95:,.2f}</span></span>',
-        f'<span class="ticker-item"><span class="ticker-sym">NET LIQ</span><span class="flat">${equity:,.2f}</span></span>'
+        f'<span class="ticker-item"><span class="ticker-sym">ACTIVE PODS</span><span class="flat">{len(enabled_engines)}/7</span></span>'
     ]
     for p in positions:
         ret_p = ((p['current_price'] - p['avg_entry_price']) / p['avg_entry_price']) * 100.0
@@ -1414,8 +1479,8 @@ def render_live_terminal():
 
     # 2. Top Institutional Header
     mkt_pill = f'<span class="hud-pill hud-emerald">● NYSE OPEN ({bell_countdown})</span>' if is_open else f'<span class="hud-pill hud-amber">● NYSE CLOSED ({bell_countdown})</span>'
-    cryp_pill = '<span class="hud-pill hud-cyan">◈ CHANDELIER & CORR GUARD</span>'
-    mac_pill = '<span class="hud-pill hud-emerald">🛡️ CIRCUIT BREAKER ARMED</span>' if (macro_ok and breaker_ok) else '<span class="hud-pill hud-rose">⚠️ BREAKER / MACRO HALT</span>'
+    cryp_pill = f'<span class="hud-pill hud-cyan">◈ {len(enabled_engines)}/7 ENGINES ACTIVE</span>'
+    gex_pill = f'<span class="hud-pill {"hud-emerald" if net_gex>=0 else "hud-rose"}">SPY GEX: {net_gex:+.2f}</span>'
     pdt_pill = f'<span class="hud-pill hud-slate">PDT: {daytrades}/3</span>'
 
     st.markdown(f"""
@@ -1423,14 +1488,14 @@ def render_live_terminal():
         <div class="brand-cluster">
             <div class="brand-orb"></div>
             <div>
-                <div class="brand-title">AETHER QUANTITATIVE COMMAND <span class="brand-version">v6.0 APEX INSTITUTIONAL</span></div>
-                <div class="brand-sub">Arbiter Matrix • 60D Correlation Guard • 3-Stage Chandelier Ratchet • 5D-VWAP Flow • VaR & Stress Lab</div>
+                <div class="brand-title">AETHER QUANTITATIVE COMMAND <span class="brand-version">v8.5 OMEGA INSTITUTIONAL</span></div>
+                <div class="brand-sub">7-Engine Pod Switchboard • Market-Wide AI Discovery Agent • v7.0 L2 OBI • v7.5 RL Meta-Allocator • v8.0 Options GEX • v8.5 10k Monte Carlo</div>
             </div>
         </div>
         <div class="badge-cluster">
             {mkt_pill}
             {cryp_pill}
-            {mac_pill}
+            {gex_pill}
             {pdt_pill}
         </div>
     </div>
@@ -1484,8 +1549,8 @@ def render_live_terminal():
             <span class="alpha-val" style="color:#FB7185;">{max_dd:.2f}%</span>
         </div>
         <div class="alpha-item">
-            <span class="alpha-lbl">ANNUALIZED VOLATILITY:</span>
-            <span class="alpha-val">{ann_vol:.2f}%</span>
+            <span class="alpha-lbl">OPTIONS GAMMA (SPY GEX):</span>
+            <span class="alpha-val" style="color:{'#10B981' if net_gex>=0 else '#F43F5E'};">{net_gex:+.3f}</span>
         </div>
         <div class="alpha-item">
             <span class="alpha-lbl">ALPHA VS. S&P 500 (30D):</span>
@@ -1498,14 +1563,15 @@ def render_live_terminal():
     </div>
     """, unsafe_allow_html=True)
 
-    # 5. Sleek Top 6-View Horizontal Strategy & Risk Switcher
+    # 5. Sleek Top 7-View Horizontal Strategy & Switchboard Bar
     nav_options = [
         "🏛️ Master Overview & Attribution",
+        "🎛️ 7-Engine Mode Switchboard & Discovery",
         "🛡️ Engine 1: Core Long-Term",
-        "⚡ Engine 2: Short-Term Momentum",
-        "🪙 Engine 3: 24/7 Crypto AI",
-        "🧪 Backtest & Arbiter Lab",
-        "🛡️ Risk, VaR & Correlation Lab"
+        "⚡ Engine 2: Momentum (14x/Day)",
+        "🪙 Engine 3: Crypto AI (48x/Day)",
+        "🧪 Backtest & 10k Monte Carlo Lab",
+        "🛡️ Risk, VaR, GEX & Correlation Lab"
     ]
     if hasattr(st, "segmented_control"):
         selected_page = st.segmented_control(
@@ -1523,10 +1589,10 @@ def render_live_terminal():
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
     # =================================================================
-    # VIEW 1: MASTER HEDGE FUND OVERVIEW & PERFORMANCE ATTRIBUTION
+    # VIEW 1: MASTER HEDGE FUND OVERVIEW & RL ATTRIBUTION
     # =================================================================
     if selected_page == nav_options[0]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>Automated Performance Attribution & Win-Rate Analytics by Engine</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>7-Engine Performance Attribution & v7.5 RL Policy Meta-Allocator</div>', unsafe_allow_html=True)
         st.dataframe(
             df_attr,
             use_container_width=True,
@@ -1625,9 +1691,9 @@ def render_live_terminal():
                 st.info("Heatmap activates when positions are open.")
 
         with col_radar:
-            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Top Bullish Arbiter Signals Across All 3 Engines</div>', unsafe_allow_html=True)
+            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Top Bullish Arbiter Signals Across All Engines</div>', unsafe_allow_html=True)
             combined_logs = []
-            for tag, d_f in [("CORE", df_core), ("MOMENTUM", df_mom), ("CRYPTO", df_crypto)]:
+            for tag, d_f in [("CORE", df_core), ("MOMENTUM", df_mom), ("CRYPTO", df_crypto), ("DISC/SPEC", df_disc)]:
                 if not d_f.empty and "Ticker" in d_f.columns and "FinBERT Score" in d_f.columns:
                     sub = d_f.drop_duplicates(subset=["Ticker"], keep="last").copy()
                     sub["Engine"] = tag
@@ -1644,29 +1710,51 @@ def render_live_terminal():
             else:
                 st.info("No AI scan signals logged yet.")
 
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Automated Trade Post-Mortem Journal (Realized Round-Trips)</div>', unsafe_allow_html=True)
-            if not df_post_mortems.empty:
-                st.dataframe(df_post_mortems.iloc[::-1], use_container_width=True, hide_index=True)
-            elif not df_closed.empty:
-                st.dataframe(df_closed.iloc[::-1].head(25), use_container_width=True, hide_index=True)
-            else:
-                st.info("Post-mortem trade journal will populate automatically as round-trip exits complete.")
-        with col_c2:
-            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Master Alpaca Order Book (All Engines)</div>', unsafe_allow_html=True)
-            if recent_orders:
-                st.dataframe(pd.DataFrame(recent_orders).head(25), use_container_width=True, hide_index=True)
-            else:
-                st.info("No recent orders found.")
-
     # =================================================================
-    # VIEW 2: ENGINE 1 — CORE LONG-TERM EQUITIES
+    # VIEW 2: 7-ENGINE MODE SWITCHBOARD & MARKET-WIDE DISCOVERY AGENT
     # =================================================================
     elif selected_page == nav_options[1]:
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>7-Engine Strategy Palette & Live Pod Switchboard</div>', unsafe_allow_html=True)
+        st.caption("Toggle any combination of the 7 trading engines ON or OFF (e.g., trade 1 specific mode, pick 3, or enable all 7). Changes sync directly to Google Sheets (`Engine Config`) and govern all automated GitHub Actions runs.")
+
+        with st.form("engine_switchboard_form"):
+            new_cfg = {}
+            cols_ row1 = st.columns(4)
+            cols_row2 = st.columns(3)
+            all_cols = cols_row1 + cols_row2
+
+            for idx, (eng_k, eng_v) in enumerate(engine_cfg.items()):
+                with all_cols[idx]:
+                    st.markdown(f"**`{eng_k}`**")
+                    st.caption(f"{eng_v['desc']}  \n*{DEFAULT_ENGINE_CONFIG[eng_k]['freq']}*")
+                    en_val = st.toggle("Enable Engine", value=eng_v["enabled"], key=f"tog_{eng_k}")
+                    cap_val = st.slider("Base Cap (% Equity)", 5, 50, int(round(eng_v["cap"] * 100)), 5, key=f"cap_{eng_k}")
+                    risk_val = st.slider("Risk/Trade (bps)", 20, 100, int(round(eng_v["risk_bps"] * 10000)), 5, key=f"rsk_{eng_k}")
+                    new_cfg[eng_k] = {
+                        "enabled": en_val,
+                        "cap": round(cap_val / 100.0, 2),
+                        "risk_bps": round(risk_val / 10000.0, 4),
+                        "desc": eng_v["desc"]
+                    }
+
+            if st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary"):
+                if save_engine_config_to_sheet(new_cfg):
+                    st.success("✅ 7-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
+                    st.rerun()
+
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>Engine 4 (`DISCOVERY`), Engine 5 (`MEAN_REV`) & Engine 6 (`SMALL_CAP`) Live Telemetry</div>', unsafe_allow_html=True)
+        if not df_disc.empty:
+            st.dataframe(df_disc.iloc[::-1].head(60), use_container_width=True, hide_index=True)
+        else:
+            st.info("No Discovery / Mean-Rev / Small-Cap scans logged yet. Select `discovery`, `mean_rev`, or `small_cap` in the sidebar dispatch box to fire immediately!")
+
+    # =================================================================
+    # VIEW 3: ENGINE 1 — CORE LONG-TERM EQUITIES
+    # =================================================================
+    elif selected_page == nav_options[2]:
         render_strategy_engine_view(
-            engine_title="Engine 1: Core Blue-Chip Trend Equities (Arbiter + Corr Guard + 3-Stage Ratchet)",
-            engine_subtitle="Mandate: S&P 500 Leaders • Price > 200-SMA & 5D-VWAP • Max 35% Tranche Cap • 1.5x / 3.5x ATR Brackets",
+            engine_title="Engine 1: Core Blue-Chip Trend Equities (Arbiter + L2 OBI + 3-Stage Ratchet)",
+            engine_subtitle="Mandate: S&P 500 Leaders • 2x/Day Execution • Price > 200-SMA & 5D-VWAP • 1.5x / 3.5x ATR Brackets",
             tranche_key="CORE",
             universe_tickers=CORE_TICKERS,
             positions=positions,
@@ -1680,12 +1768,12 @@ def render_live_terminal():
         )
 
     # =================================================================
-    # VIEW 3: ENGINE 2 — SHORT-TERM MOMENTUM
+    # VIEW 4: ENGINE 2 — SHORT-TERM MOMENTUM (14x/DAY)
     # =================================================================
-    elif selected_page == nav_options[2]:
+    elif selected_page == nav_options[3]:
         render_strategy_engine_view(
-            engine_title="Engine 2: Tactical Short-Term Momentum (Arbiter + Corr Guard + 3-Stage Ratchet)",
-            engine_subtitle="Mandate: High-Beta Tech & Growth • 90/10 News Catalyst Runner or 10/90 VWAP Scalp • Max 25% Tranche Cap",
+            engine_title="Engine 2: Tactical Short-Term Momentum (14x/Day High-Frequency • L2 OBI • 3-Stage Ratchet)",
+            engine_subtitle="Mandate: High-Beta Tech & Growth • Scans Every 30 Mins During NYSE Hours • 90/10 News Catalyst Runner or 10/90 VWAP Scalp",
             tranche_key="MOMENTUM",
             universe_tickers=MOMENTUM_TICKERS,
             positions=positions,
@@ -1699,12 +1787,12 @@ def render_live_terminal():
         )
 
     # =================================================================
-    # VIEW 4: ENGINE 3 — 24/7 CRYPTO AI QUANT
+    # VIEW 5: ENGINE 3 — 24/7 CRYPTO AI QUANT (48x/DAY)
     # =================================================================
-    elif selected_page == nav_options[3]:
+    elif selected_page == nav_options[4]:
         render_strategy_engine_view(
-            engine_title="Engine 3: 24/7 Crypto AI Quant (Arbiter + Corr Guard + Dynamic Trail)",
-            engine_subtitle="Mandate: Round-the-Clock Crypto Execution (Zero PDT) • Max 15% Tranche Cap • Dynamic +8.7% / +6.0% / +5.1% TP",
+            engine_title="Engine 3: 24/7 Crypto AI Quant (48x/Day Every 30 Mins • L2 OBI • Dynamic Trail)",
+            engine_subtitle="Mandate: Round-the-Clock Crypto Execution (Zero PDT) • Scans Every 30 Minutes 24/7/365 • Dynamic +8.7% / +6.0% / +5.1% TP",
             tranche_key="CRYPTO",
             universe_tickers=CRYPTO_PAIRS,
             positions=positions,
@@ -1718,15 +1806,15 @@ def render_live_terminal():
         )
 
     # =================================================================
-    # VIEW 5: IN-TERMINAL BACKTEST & MATHEMATICAL ARBITER LAB
+    # VIEW 6: BACKTEST & v8.5 10,000-PATH MONTE CARLO SIMULATOR
     # =================================================================
-    elif selected_page == nav_options[4]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>In-Terminal Strategy Backtest & Mathematical Arbiter Simulator</div>', unsafe_allow_html=True)
-        st.caption("Simulate how your Mathematical Arbiter Matrix (90/10 News Catalyst vs. 50/50 Hybrid vs. 10/90 Technicals), 3-Stage Chandelier Ratchet, and ATR Risk-Parity Sizing perform across historical regimes.")
+    elif selected_page == nav_options[5]:
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>In-Terminal Strategy Backtest & v8.5 10,000-Path Walk-Forward Monte Carlo Engine</div>', unsafe_allow_html=True)
+        st.caption("Simulate historical Arbiter + Chandelier performance and stress-test parameter stability across 10,000 bootstrap-resampled Monte Carlo trajectories.")
 
         b_col1, b_col2, b_col3, b_col4 = st.columns(4)
         with b_col1:
-            bt_universe_name = st.selectbox("Select Strategy Universe:", ["⚡ Momentum Top 8", "🛡️ Core Blue-Chips Top 8", "🪙 Crypto 24/7 Pairs"])
+            bt_universe_name = st.selectbox("Select Strategy Universe:", ["⚡ Momentum Top 8", "🛡️ Core Blue-Chips Top 8", "🪙 Crypto 24/7 Pairs", "🚀 Small-Cap Alpha Top 8"])
         with b_col2:
             bt_period = st.selectbox("Historical Lookback Window:", ["6mo", "1y", "3mo"], index=0)
         with b_col3:
@@ -1746,6 +1834,8 @@ def render_live_terminal():
             bt_tickers = MOMENTUM_TICKERS[:8]
         elif bt_universe_name.startswith("🛡️"):
             bt_tickers = CORE_TICKERS[:8]
+        elif bt_universe_name.startswith("🚀"):
+            bt_tickers = SMALL_CAP_TICKERS[:8]
         else:
             bt_tickers = CRYPTO_PAIRS[:6]
 
@@ -1762,62 +1852,78 @@ def render_live_terminal():
         bt_gl = abs(float(bt_losses["Realized P/L ($)"].sum())) if not bt_losses.empty else 0.0
         bt_pf = (bt_gw / bt_gl) if bt_gl > 0 else (bt_gw if bt_gw > 0 else 0.0)
 
+        mc_res = run_monte_carlo_10k(df_bt_trades["Realized P/L ($)"].tolist(), n_paths=10000, horizon_trades=60) if n_bt >= 3 else None
+
         sim_cls = "delta-pos" if sim_ret_pct >= 0 else "delta-neg"
         st.markdown(f"""
         <div class="kpi-grid" style="grid-template-columns: repeat(4, 1fr); margin-top: 10px;">
             <div class="kpi-card">
                 <div class="kpi-label"><span>SIMULATED ENDING EQUITY</span><span>🧪</span></div>
                 <div class="kpi-value">${final_eq:,.2f}</div>
-                <span class="kpi-delta {sim_cls}">{sim_ret_pct:+.2f}% Total Return ({bt_period})</span>
+                <span class="kpi-delta {sim_cls}">{sim_ret_pct:+.2f}% Historical Return ({bt_period})</span>
             </div>
             <div class="kpi-card">
-                <div class="kpi-label"><span>SIMULATED WIN RATE</span><span>🎯</span></div>
-                <div class="kpi-value">{bt_wr:.1f}%</div>
-                <span class="kpi-delta delta-neu">{n_bt} Total Simulated Trades</span>
+                <div class="kpi-label"><span>SIMULATED WIN RATE & PF</span><span>🎯</span></div>
+                <div class="kpi-value">{bt_wr:.1f}% ({bt_pf:.2f}x)</div>
+                <span class="kpi-delta delta-neu">{n_bt} Historical Trades</span>
             </div>
             <div class="kpi-card">
-                <div class="kpi-label"><span>PROFIT FACTOR</span><span>⚖️</span></div>
-                <div class="kpi-value">{bt_pf:.2f}x</div>
-                <span class="kpi-delta delta-pos">Gross Win ${bt_gw:,.0f} / Loss ${bt_gl:,.0f}</span>
+                <div class="kpi-label"><span>10K MONTE CARLO MEDIAN (60T)</span><span>🎲</span></div>
+                <div class="kpi-value">${mc_res['median_end']:,.0f}</div>
+                <span class="kpi-delta delta-pos">Prob. of Profit: {mc_res['prob_profit']:.1f}%</span>
             </div>
             <div class="kpi-card">
-                <div class="kpi-label"><span>ARBITER REGIME SPLIT</span><span>🧠</span></div>
-                <div class="kpi-value">{reg_counts.get('NEWS-90/10',0)}N / {reg_counts.get('HYBRID-50/50',0)}H / {reg_counts.get('TECH-10/90',0)}T</div>
-                <span class="kpi-delta delta-neu">90/10 News • 50/50 Hybrid • 10/90 Tech</span>
+                <div class="kpi-label"><span>MONTE CARLO 5% TAIL FLOOR</span><span>🛡️</span></div>
+                <div class="kpi-value">${mc_res['tail_5_end']:,.0f}</div>
+                <span class="kpi-delta delta-neu">95% Confidence Survival Floor</span>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """ if mc_res else "<p>Run with more trades to populate Monte Carlo metrics.</p>", unsafe_allow_html=True)
 
-        if not df_bt_eq.empty:
-            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Simulated Arbiter Strategy Cumulative Equity Curve</div>', unsafe_allow_html=True)
-            fig_bt = go.Figure()
-            fig_bt.add_trace(go.Scatter(
-                x=df_bt_eq["Date"], y=df_bt_eq["Equity"], mode="lines+markers",
-                line=dict(color="#38BDF8", width=2.5),
-                marker=dict(size=5, color="#10B981"),
-                fill="tozeroy", fillcolor="rgba(56, 189, 248, 0.08)",
-                name="Arbiter Strategy Equity"
-            ))
-            fig_bt.add_hline(y=100000.0, line_dash="dot", line_color="rgba(148,163,184,0.4)", annotation_text="Initial Capital ($100k)")
-            fig_bt.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(11,15,25,0.55)", height=340,
-                margin=dict(t=12, b=12, l=10, r=10),
-                yaxis=dict(title="Simulated Equity ($)", gridcolor="rgba(255,255,255,0.05)")
-            )
-            st.plotly_chart(fig_bt, use_container_width=True)
+        mc_col1, mc_col2 = st.columns(2)
+        with mc_col1:
+            if not df_bt_eq.empty:
+                st.markdown('<div class="sec-title"><span class="sec-dot"></span>Historical Walk-Forward Equity Curve</div>', unsafe_allow_html=True)
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Scatter(
+                    x=df_bt_eq["Date"], y=df_bt_eq["Equity"], mode="lines+markers",
+                    line=dict(color="#38BDF8", width=2.5), fill="tozeroy", fillcolor="rgba(56, 189, 248, 0.08)",
+                    name="Historical Equity"
+                ))
+                fig_bt.add_hline(y=100000.0, line_dash="dot", line_color="rgba(148,163,184,0.4)")
+                fig_bt.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(11,15,25,0.55)", height=330,
+                    margin=dict(t=12, b=12, l=10, r=10), yaxis=dict(title="Equity ($)", gridcolor="rgba(255,255,255,0.05)")
+                )
+                st.plotly_chart(fig_bt, use_container_width=True)
 
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>Simulated Trade-by-Trade Arbiter Ledger</div>', unsafe_allow_html=True)
+        with mc_col2:
+            if mc_res:
+                st.markdown('<div class="sec-title"><span class="sec-dot"></span>v8.5 10,000-Path Monte Carlo Fan Chart (5th–95th Percentiles)</div>', unsafe_allow_html=True)
+                fig_mc = go.Figure()
+                fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p95"], line=dict(color="rgba(16,185,129,0.3)", width=1), name="95th Pct (Bull)"))
+                fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p05"], line=dict(color="rgba(244,63,94,0.3)", width=1), fill="tonexty", fillcolor="rgba(56,189,248,0.08)", name="5th Pct (Tail Risk)"))
+                fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p75"], line=dict(color="rgba(56,189,248,0.4)", width=1, dash="dot"), name="75th Pct"))
+                fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p25"], line=dict(color="rgba(56,189,248,0.4)", width=1, dash="dot"), fill="tonexty", fillcolor="rgba(16,185,129,0.12)", name="25th Pct"))
+                fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p50"], line=dict(color="#10B981", width=2.6), name="Median Path (50th)"))
+                fig_mc.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(11,15,25,0.55)", height=330,
+                    margin=dict(t=12, b=12, l=10, r=10),
+                    xaxis=dict(title="Forward Trade Sequence (60 Trades)"),
+                    yaxis=dict(title="Projected Equity ($)", gridcolor="rgba(255,255,255,0.05)"),
+                    showlegend=False
+                )
+                st.plotly_chart(fig_mc, use_container_width=True)
+
         if not df_bt_trades.empty:
+            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Simulated Trade-by-Trade Arbiter Ledger</div>', unsafe_allow_html=True)
             st.dataframe(df_bt_trades.iloc[::-1], use_container_width=True, hide_index=True)
-        else:
-            st.info("No simulated trades triggered under the current parameter thresholds.")
 
     # =================================================================
-    # VIEW 6: INSTITUTIONAL RISK, VaR, CORRELATION & STRESS-TEST LAB
+    # VIEW 7: INSTITUTIONAL RISK, VaR, OPTIONS GEX & CORRELATION LAB
     # =================================================================
-    elif selected_page == nav_options[5]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>Institutional Risk Management, VaR / CVaR & Cross-Asset Correlation Lab</div>', unsafe_allow_html=True)
-        st.caption("Real-time Value-at-Risk (VaR), Expected Shortfall (CVaR), 60-Day Cross-Asset Correlation Matrix, and Black-Swan Stress-Test Simulator.")
+    elif selected_page == nav_options[6]:
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>Institutional Risk Management, VaR / CVaR, Options GEX & Correlation Lab</div>', unsafe_allow_html=True)
 
         st.markdown(f"""
         <div class="kpi-grid" style="grid-template-columns: repeat(4, 1fr);">
@@ -1827,14 +1933,14 @@ def render_live_terminal():
                 <span class="kpi-delta delta-neu">{(var_95/equity)*100 if equity>0 else 0:.2f}% of Account Equity</span>
             </div>
             <div class="kpi-card">
-                <div class="kpi-label"><span>DAILY 99% VaR (EXTREME)</span><span>⚠️</span></div>
-                <div class="kpi-value">${var_99:,.2f}</div>
-                <span class="kpi-delta delta-neg">{(var_99/equity)*100 if equity>0 else 0:.2f}% Tail Threshold</span>
-            </div>
-            <div class="kpi-card">
                 <div class="kpi-label"><span>EXPECTED SHORTFALL (CVaR)</span><span>📉</span></div>
                 <div class="kpi-value">${cvar_95:,.2f}</div>
                 <span class="kpi-delta delta-neg">Mean Tail Loss Beyond 95% VaR</span>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label"><span>S&P 500 OPTIONS GEX PROXY</span><span>🧬</span></div>
+                <div class="kpi-value">{net_gex:+.3f}</div>
+                <span class="kpi-delta {'delta-pos' if net_gex>=0 else 'delta-neg'}">{'Positive Gamma Cushion' if net_gex>=0 else 'Negative Gamma Volatility Regime'}</span>
             </div>
             <div class="kpi-card">
                 <div class="kpi-label"><span>INTRADAY CIRCUIT BREAKER</span><span>🔌</span></div>
@@ -1849,10 +1955,8 @@ def render_live_terminal():
             st.markdown('<div class="sec-title"><span class="sec-dot"></span>60-Day Cross-Asset Pearson Correlation Matrix (Guard Threshold = 0.82)</div>', unsafe_allow_html=True)
             if not corr_matrix.empty and len(corr_matrix.columns) >= 2:
                 fig_corr = px.imshow(
-                    corr_matrix.round(2),
-                    text_auto=True,
-                    color_continuous_scale=["#10B981", "#0F172A", "#F43F5E"],
-                    zmin=-1.0, zmax=1.0
+                    corr_matrix.round(2), text_auto=True,
+                    color_continuous_scale=["#10B981", "#0F172A", "#F43F5E"], zmin=-1.0, zmax=1.0
                 )
                 fig_corr.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -1868,20 +1972,20 @@ def render_live_terminal():
             if positions:
                 stress_rows = []
                 for p in positions:
-                    beta_mult = 1.65 if p["tranche"] == "CRYPTO" else (1.35 if p["tranche"] == "MOMENTUM" else 0.85)
+                    beta_mult = -1.0 if p["tranche"] == "TAIL_HEDGE" else (1.65 if p["tranche"] == "CRYPTO" else (1.35 if p["tranche"] in ["MOMENTUM", "SMALL_CAP"] else 0.85))
                     est_move_pct = shock_pct * beta_mult
                     est_dlr_impact = p["market_value"] * (est_move_pct / 100.0)
                     stress_rows.append({
                         "Ticker": p["symbol"],
                         "Tranche": p["tranche"],
-                        "Beta Mult": f"{beta_mult:.2f}x",
+                        "Beta Mult": f"{beta_mult:+.2f}x",
                         "Current Value": f"${p['market_value']:,.2f}",
                         "Est. Shock Move": f"{est_move_pct:+.1f}%",
                         "Projected P/L Impact ($)": round(est_dlr_impact, 2)
                     })
                 df_stress = pd.DataFrame(stress_rows)
                 tot_shock_dlr = float(df_stress["Projected P/L Impact ($)"].sum())
-                st.caption(f"Projected Portfolio Impact under **{shock_pct:+.1f}%** Market Shock: **`${tot_shock_dlr:+,.2f}`** (`{(tot_shock_dlr/equity)*100:+.2f}%` of Total Equity — Protected by active ATR Stop-Losses)")
+                st.caption(f"Projected Portfolio Impact under **{shock_pct:+.1f}%** Market Shock: **`${tot_shock_dlr:+,.2f}`** (`{(tot_shock_dlr/equity)*100:+.2f}%` of Total Equity)")
                 st.dataframe(df_stress, use_container_width=True, hide_index=True)
             else:
                 st.info("No active positions exposed to market shock.")

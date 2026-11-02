@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
-          pip install alpaca-trade-api gspread google-auth "yfinance>=0.2.50,<0.3.0" pandas numpy requests
+          pip install "alpaca-trade-api==3.2.0" "yfinance==0.2.58" gspread google-auth pandas numpy requests
 
       - name: Route & Execute Quant Engine by Schedule
         env:

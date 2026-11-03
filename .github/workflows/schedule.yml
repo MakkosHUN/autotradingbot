@@ -4,20 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       bot_mode:
-        description: 'Execution Mode (smart_cron, auto, intraday, crypto, all, core, momentum, discovery)'
+        description: 'Execution Mode (smart_cron, auto, intraday, crypto, all, core, momentum, discovery, mean_rev, small_cap, tail_hedge)'
         required: false
         default: 'smart_cron'
 
 concurrency:
   group: aether-quant-execution
   cancel-in-progress: false
-
-  workflow_dispatch:
-    inputs:
-      bot_mode:
-        description: 'Select Engine Mode (auto, all, core, momentum, crypto, discovery, mean_rev, small_cap, tail_hedge)'
-        required: false
-        default: 'auto'
 
 jobs:
   run-bot:
@@ -43,27 +36,15 @@ jobs:
           pip install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers
           pip install "alpaca-trade-api==3.2.0" "yfinance==0.2.58" gspread google-auth pandas numpy requests
 
-      - name: Route & Execute AETHER QUANT v8.5 Engine
+      - name: Route & Execute AETHER QUANT v8.5.3 Engine
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
-          SCHEDULE_CRON: ${{ github.event.schedule }}
           MANUAL_MODE: ${{ github.event.inputs.bot_mode }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${MANUAL_MODE:-auto}"
-            echo "🚀 Manual Dispatch -> Running Mode: $MODE"
-            python bot.py --mode "$MODE"
-          elif [ "$SCHEDULE_CRON" = "35 14,20 * * 1-5" ]; then
-            echo "🏛️ NYSE Open/Close Window -> Running All Dashboard-Enabled Engines (auto)"
-            python bot.py --mode auto
-          elif [ "$SCHEDULE_CRON" = "5,35 15,16,17,18,19 * * 1-5" ] || [ "$SCHEDULE_CRON" = "5 20 * * 1-5" ]; then
-            echo "⚡ 30-Min Intraday High-Frequency Window -> Running Enabled Active Intraday & Crypto Engines"
-            python bot.py --mode intraday
-          else
-            echo "🪙 30-Min 24/7 Window -> Running Crypto AI Engine (if enabled)"
-            python bot.py --mode crypto
-          fi
+          MODE="${MANUAL_MODE:-smart_cron}"
+          echo "🚀 Dispatching AETHER QUANT -> Mode: $MODE"
+          python bot.py --mode "$MODE"

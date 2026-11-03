@@ -112,11 +112,11 @@ MOMENTUM_POOL = [
     'SNOW', 'CRWD', 'PANW', 'DKNG', 'ROKU', 'HOOD', 'MARA', 'RIOT', 'SOFI', 'ARM',
     'SMCI', 'MU', 'INTC', 'MSTR'
 ]
-# --- UPGRADED v8.5.2 CRYPTO UNIVERSE (PINNED MAJORS + ROTATING ALTS) ---
+# --- UPGRADED v8.5.3 CRYPTO UNIVERSE (CLEAN YF/ALPACA PAIRS) ---
 CRYPTO_MAJORS = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
 CRYPTO_ALTS = [
     "XRP/USD", "AVAX/USD", "LINK/USD", "SHIB/USD",
-    "DOT/USD", "LTC/USD", "UNI/USD", "AAVE/USD", "BCH/USD", "PEPE/USD"
+    "DOT/USD", "LTC/USD", "AAVE/USD", "BCH/USD"
 ]
 CRYPTO_POOL = CRYPTO_MAJORS + CRYPTO_ALTS
 
@@ -267,12 +267,15 @@ def check_macro_gex_and_circuit_breaker(equity, last_equity):
     spy_change, vix_level, net_gex_score = 0.0, 0.0, 0.0
     try:
         spy_tk = yf.Ticker("SPY")
-        spy = spy_tk.history(period="2d")
-        vix = yf.Ticker("^VIX").history(period="2d")
+        spy = spy_tk.history(period="5d").dropna(subset=["Close"])
+        vix = yf.Ticker("^VIX").history(period="5d").dropna(subset=["Close"])
         if not vix.empty:
             vix_level = float(vix['Close'].iloc[-1])
         if len(spy) >= 2:
-            spy_change = (spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]
+            c_now = float(spy['Close'].iloc[-1])
+            c_prev = float(spy['Close'].iloc[-2])
+            if c_prev > 0 and not pd.isna(c_now) and not pd.isna(c_prev):
+                spy_change = (c_now - c_prev) / c_prev
 
         exps = spy_tk.options
         if exps:
@@ -296,18 +299,12 @@ def check_macro_gex_and_circuit_breaker(equity, last_equity):
 # 5. MARKET-WIDE AI DISCOVERY AGENT (UNCONSTRAINED TICKER HUNTER)
 # =====================================================================
 def discover_market_wide_catalysts(owned_symbols, top_n=6):
-    """
-    Market-Wide AI Discovery Agent (Fixed for alpaca-trade-api==3.2.0):
-    1. Queries Yahoo Finance's live Day Gainers & Most Actives screeners + our 40-stock Mid/Large-Cap Discovery Radar.
-    2. Queries Alpaca's news firehose with explicit symbol batches to extract breaking news catalysts outside our static pools.
-    """
     known_static = set(
         CORE_POOL + MOMENTUM_POOL + MEAN_REV_POOL + SMALL_CAP_POOL + TAIL_HEDGE_POOL
         + [c.replace("/", "") for c in CRYPTO_POOL]
     )
     discovered_pool = list(DISCOVERY_RADAR_POOL)
 
-    # Pull live market movers from Yahoo Finance Screener if available
     try:
         for scr_name in ["day_gainers", "most_actives"]:
             scr = yf.screen(scr_name)
@@ -319,7 +316,6 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
     except Exception:
         pass
 
-    # Also query Alpaca news using valid symbol string batch
     try:
         batch_query = ",".join(discovered_pool[:25])
         alpaca_news = api.get_news(batch_query, limit=40)
@@ -331,7 +327,6 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
     except Exception as e:
         print(f"Discovery news batch note: {e}")
 
-    # Screen the discovered pool for top volume + momentum breakouts
     screened = screen_top_candidates(discovered_pool[:45], top_n=top_n, owned_symbols=owned_symbols, mode="momentum")
     verified = []
     for sym in screened:
@@ -346,7 +341,6 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
     return verified
 
 def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=None):
-    # Strictly include owned symbols ONLY if they belong to this exact tranche
     always_include = []
     for t in pool:
         if t in owned_symbols or to_alpaca_pos_symbol(t) in owned_symbols:
@@ -407,7 +401,7 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
     return final_list
 
 # =====================================================================
-# 6. MATHEMATICAL ARBITER MATRIX v8.5.2 (DUAL-MODE CRYPTO + L2 OBI)
+# 6. MATHEMATICAL ARBITER MATRIX v8.5.3 (ANTI-CHURN DEADBAND + L2 OBI)
 # =====================================================================
 def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05, base_exit_max=-0.15, strategy_mode="core"):
     if tech is None:
@@ -501,22 +495,22 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
         buy_signal = True
     elif regime == "TECH-10/90" and (
         (composite >= 0.22 and price > ema9 > ema20 and price >= vwap5 and obi_score >= -0.10)
-        or (rsi <= 32.0 and finbert_score > -0.25)
+        or (rsi <= 32.0 and finbert_score > -0.15)
     ):
         buy_signal = True
 
-    # --- v8.5.2 DUAL-MODE CRYPTO ARBITER (BREAKOUT + OVERSOLD LIQUIDITY SNIPE) ---
+    # --- v8.5.3 ANTI-CHURN CRYPTO ARBITER (STRICT > -0.15 ENTRY FLOOR) ---
     if strategy_mode == "crypto":
         is_crypto_oversold_snipe = (
             (rsi <= 32.0 or price <= bb_low * 1.005)
-            and obi_score >= -0.05
-            and finbert_score > -0.65
+            and obi_score >= -0.02
+            and finbert_score > -0.15  # Never snipe into active negative news (prevents buy/sell ping-pong)
         )
         is_crypto_quiet_breakout = (
             price > ema20
-            and 42.0 <= rsi <= 74.0
-            and obi_score >= -0.05
-            and finbert_score >= -0.05
+            and 42.0 <= rsi <= 72.0
+            and obi_score >= 0.00
+            and finbert_score >= 0.00
         )
         if is_crypto_oversold_snipe:
             regime = "CRYPTO-SNIPE"
@@ -696,13 +690,15 @@ def get_technicals_and_atr(ticker):
     df = yf.Ticker(yf_sym).history(period="1y")
     if df.empty or len(df) < 25:
         return None
-    close = df['Close']
+    close = df['Close'].dropna()
+    if len(close) < 25:
+        return None
     current_price = float(close.iloc[-1])
-    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(df) >= 200 else float(close.mean())
-    sma50 = float(close.rolling(50).mean().iloc[-1]) if len(df) >= 50 else float(close.mean())
+    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float(close.mean())
+    sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float(close.mean())
     ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
     ema9 = float(close.ewm(span=9, adjust=False).mean().iloc[-1])
-    std20 = float(close.rolling(20).std().iloc[-1]) if len(df) >= 20 else (current_price * 0.02)
+    std20 = float(close.rolling(20).std().iloc[-1]) if len(close) >= 20 else (current_price * 0.02)
     bb_low = ema20 - (2.0 * std20)
 
     delta = close.diff()
@@ -713,8 +709,8 @@ def get_technicals_and_atr(ticker):
     rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
 
     high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - close.shift())
-    low_close = np.abs(df['Low'] - close.shift())
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     true_range = ranges.max(axis=1)
     atr_series = true_range.rolling(14).mean()
@@ -754,6 +750,20 @@ def was_stopped_out_last_24h(ticker, closed_orders):
     for o in closed_orders:
         if to_alpaca_pos_symbol(o.symbol) == norm and o.side == 'sell' and o.type in ['stop', 'stop_limit'] and o.status == 'filled':
             return True
+    return False
+
+def was_crypto_sold_recently(pair, closed_orders, hours=4):
+    """Prevents ping-pong churn by blocking re-entry into any crypto sold within the last N hours."""
+    norm = to_alpaca_pos_symbol(pair)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    for o in closed_orders:
+        if to_alpaca_pos_symbol(o.symbol) == norm and o.side == 'sell' and o.status == 'filled':
+            filled_at = getattr(o, 'filled_at', None)
+            if filled_at and hasattr(filled_at, 'tzinfo') and filled_at.tzinfo is not None:
+                if filled_at >= cutoff:
+                    return True
+            else:
+                return True
     return False
 
 def has_upcoming_earnings_48h(ticker):
@@ -903,7 +913,6 @@ def run_equity_tranche(
         decision = f"HOLD [{regime_tag}]"
         action_taken = "None"
 
-        # Prevent cross-engine cannibalization: only manage positions belonging to this tranche
         if owned_qty > 0 and classify_symbol(ticker) != tranche_name:
             continue
 
@@ -1088,9 +1097,9 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
     return hedge_alerts, hedge_lines
 
 # =====================================================================
-# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (48x/DAY + L2 OBI + SNIPE)
+# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (ANTI-CHURN + 4H COOLDOWN)
 # =====================================================================
-def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, equity, macro_ok, macro_reason, risk_bps):
+def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, closed_orders_24h, equity, macro_ok, macro_reason, risk_bps):
     crypto_alerts = []
     scan_lines = []
     rows_to_append = []
@@ -1102,7 +1111,7 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
         tech = get_technicals_and_atr(pair)
         obi = get_orderbook_imbalance(pair)
         rsi_val = f"{tech['rsi14']:.1f}" if tech else "N/A"
-        arb = compute_arbiter_matrix(score, tech, obi_score=obi, base_buy_min=0.05, base_exit_max=-0.20, strategy_mode="crypto")
+        arb = compute_arbiter_matrix(score, tech, obi_score=obi, base_buy_min=0.05, base_exit_max=-0.35, strategy_mode="crypto")
         regime_tag = arb["regime"]
 
         norm_sym = to_alpaca_pos_symbol(pair)
@@ -1123,9 +1132,9 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                 exit_reason = f"Arbiter Take-Profit Hit (+{unrealized_pct*100:.2f}% in {regime_tag})"
             elif unrealized_pct <= -0.030:
                 exit_reason = f"Crypto Stop-Loss Hit ({unrealized_pct*100:.2f}%)"
-            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.005:
+            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.008:
                 exit_reason = arb["arbiter_exit_reason"]
-            elif score <= -0.25:
+            elif score <= -0.35:
                 exit_reason = f"Bearish Crypto Catalyst ({score:+.3f})"
 
             if exit_reason:
@@ -1163,6 +1172,8 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                 )
                 if not macro_ok and "CIRCUIT BREAKER" in macro_reason:
                     decision = f"BULLISH (Blocked: {macro_reason})"
+                elif was_crypto_sold_recently(pair, closed_orders_24h, hours=4):
+                    decision = "BULLISH (Blocked: 4h Exit Cooldown)"
                 elif not corr_ok:
                     decision = f"BULLISH (Blocked: {corr_reason})"
                 elif regime_tag != "CRYPTO-SNIPE" and tech["price"] < tech["ema20"]:
@@ -1218,6 +1229,10 @@ def run_bot(mode="auto"):
     clock = api.get_clock()
     is_nyse_open = bool(clock.is_open)
 
+    # If triggered by fallback schedule while NYSE is closed, only run Crypto
+    if mode in ["auto", "intraday"] and not is_nyse_open:
+        mode = "crypto"
+
     account = api.get_account()
     equity = float(account.equity)
     last_equity = float(getattr(account, 'last_equity', equity) or equity)
@@ -1268,12 +1283,11 @@ def run_bot(mode="auto"):
 
     if should_run("CRYPTO"):
         print("=== Running Engine 3: 24/7 Crypto AI Quant ===")
-        # Pin all 4 Crypto Majors (BTC, ETH, SOL, DOGE) + top 4 active altcoins + any owned crypto
         alt_candidates = screen_top_candidates(CRYPTO_ALTS, top_n=4, owned_symbols=owned_symbols, mode="crypto", tranche_name="CRYPTO")
         crypto_candidates = list(dict.fromkeys(CRYPTO_MAJORS + alt_candidates))
         c_alerts, crypto_lines = run_crypto_tranche(
             crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps,
-            active_orders, equity, macro_ok, macro_reason, engine_cfg["CRYPTO"]["risk_bps"]
+            active_orders, closed_orders_24h, equity, macro_ok, macro_reason, engine_cfg["CRYPTO"]["risk_bps"]
         )
         all_alerts.extend(c_alerts)
         if crypto_lines:
@@ -1371,7 +1385,7 @@ def run_bot(mode="auto"):
             section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
 
     if all_alerts:
-        send_discord_alert("🚨 **AETHER QUANT v8.5.2 Execution Alert (7-Engine Suite • L2 OBI • RL Meta-Allocator):**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **AETHER QUANT v8.5.3 Execution Alert (7-Engine Suite • L2 OBI • RL Meta-Allocator):**\n" + "\n".join(all_alerts))
 
     try:
         time.sleep(2)
@@ -1392,7 +1406,7 @@ def run_bot(mode="auto"):
         enabled_list = [k for k, v in engine_cfg.items() if v["enabled"]]
 
         detailed_report = (
-            f"💠 **AETHER QUANT v8.5.2 OMEGA Telemetry (7-Engine Suite • L2 OBI • GEX • RL Meta)**\n"
+            f"💠 **AETHER QUANT v8.5.3 OMEGA Telemetry (7-Engine Suite • L2 OBI • GEX • RL Meta)**\n"
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}`\n"
             f"🎛️ **Active Engines ({len(enabled_list)}/7):** `{', '.join(enabled_list)}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
@@ -1453,7 +1467,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        default=os.environ.get("BOT_MODE", "auto"),
+        default=os.environ.get("BOT_MODE", "smart_cron"),
         choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "smart_cron"]
     )
     args = parser.parse_args()

@@ -1,18 +1,16 @@
 name: AETHER QUANT v8.5 Multi-Frequency 7-Engine Router
 
 on:
-  schedule:
-    # 1. FULL ENABLED SUITE SCAN: NYSE Open (14:35 UTC) & NYSE Close (20:35 UTC), Mon-Fri
-    - cron: '35 14,20 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      bot_mode:
+        description: 'Execution Mode (smart_cron, auto, intraday, crypto, all, core, momentum, discovery)'
+        required: false
+        default: 'smart_cron'
 
-    # 2. 14x/DAY INTRADAY EQUITY + CRYPTO (Every 30 mins during NYSE hours: 15:05 to 20:05 UTC, Mon-Fri)
-    - cron: '5,35 15,16,17,18,19 * * 1-5'
-    - cron: '5 20 * * 1-5'
-
-    # 3. 48x/DAY 24/7 CRYPTO & RADAR (Every 30 mins overnight Mon-Fri & all weekend Sat-Sun)
-    - cron: '5,35 0-13,21-23 * * 1-5'
-    - cron: '5 14 * * 1-5'
-    - cron: '5,35 * * * 0,6'
+concurrency:
+  group: aether-quant-execution
+  cancel-in-progress: false
 
   workflow_dispatch:
     inputs:

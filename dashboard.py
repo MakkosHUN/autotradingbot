@@ -185,11 +185,14 @@ st.markdown("""
 
     .kpi-grid {
         display: grid;
-        grid-template-columns: repeat(5, 1fr);
+        grid-template-columns: repeat(6, 1fr);
         gap: 14px;
         margin-bottom: 16px;
     }
-    @media (max-width: 1100px) {
+    @media (max-width: 1400px) {
+        .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 900px) {
         .kpi-grid { grid-template-columns: repeat(2, 1fr); }
     }
     .kpi-card {
@@ -1265,7 +1268,6 @@ def render_strategy_engine_view(
     tranche_pl = sum(p['unrealized_pl'] for p in tranche_pos)
     tranche_exposure = (tranche_invested / equity) * 100 if equity > 0 else 0.0
 
-    # Dynamically merge any newly discovered tickers from the log into the Technical Inspector dropdown
     dynamic_tickers = list(universe_tickers)
     if not df_log.empty and "Ticker" in df_log.columns:
         logged_syms = [str(x).strip() for x in df_log["Ticker"].unique() if str(x).strip()]
@@ -1476,6 +1478,26 @@ def render_live_terminal():
     breaker_ok = day_pl_pct > -2.0
     enabled_engines = [k for k, v in engine_cfg.items() if v["enabled"]]
 
+    # Calculate Realized Fee & Estimated Spread Drag over recent FILLED orders
+    total_fee_drag = 0.0
+    for o in recent_orders:
+        if o['status'] == 'FILLED' and float(o.get('qty', 0) or 0) > 0 and o['filled_avg_price'] is not None:
+            qty = float(o['filled_qty'] or o['qty'])
+            fill_px = float(o['filled_avg_price'])
+            lim_px = float(o['limit_price']) if o['limit_price'] is not None else None
+            
+            base_fee = (fill_px * qty * 0.0015) if o['tranche'] == 'CRYPTO' else (qty * 0.003) # Alpaca Crypto vs Reg fees
+            slippage = 0.0
+            if lim_px:
+                if o['side'] == 'BUY':
+                    slippage = max(0.0, (fill_px - lim_px) * qty)
+                elif o['side'] == 'SELL':
+                    slippage = max(0.0, (lim_px - fill_px) * qty)
+            else:
+                slippage = fill_px * qty * 0.0005 # Base spread estimate for market fills
+                
+            total_fee_drag += (base_fee + slippage)
+
     # 1. Live Scrolling Institutional Ticker Tape
     tape_items = [
         f'<span class="ticker-item"><span class="ticker-sym">SPY</span><span class="{"up" if spy_chg>=0 else "down"}">{spy_chg:+.2f}%</span></span>',
@@ -1549,6 +1571,11 @@ def render_live_terminal():
             <div class="kpi-label"><span>DAILY 95% VALUE-AT-RISK</span><span>🛡️</span></div>
             <div class="kpi-value">${var_95:,.2f}</div>
             <span class="kpi-delta delta-neu">99% CVaR Tail: ${cvar_95:,.2f}</span>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label"><span>FEE & SPREAD DRAG</span><span>💸</span></div>
+            <div class="kpi-value">$-{total_fee_drag:,.2f}</div>
+            <span class="kpi-delta delta-neg">Est. Cum. Broker Friction</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1626,7 +1653,7 @@ def render_live_terminal():
             }
         )
 
-        col_eq, col_pie = st.columns([1.45, 1])
+        col_eq, col_pie, col_asset = st.columns([1.6, 1, 1])
         with col_eq:
             st.markdown('<div class="sec-title"><span class="sec-dot"></span>30-Day Portfolio Net Liquidation Curve</div>', unsafe_allow_html=True)
             if not port_hist.empty and "equity" in port_hist.columns:
@@ -1681,6 +1708,53 @@ def render_live_terminal():
                 st.plotly_chart(fig_pie, use_container_width=True)
             else:
                 st.info("Portfolio is currently 100% in cash.")
+
+        with col_asset:
+            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Asset Class Exposure Breakdown</div>', unsafe_allow_html=True)
+            if positions:
+                asset_exposures = {"Equities": 0.0, "Crypto": 0.0, "Commodities": 0.0}
+                for p in positions:
+                    sym = p['symbol']
+                    val = p['market_value']
+                    if p['tranche'] == 'CRYPTO' or sym in CRYPTO_PAIRS:
+                        asset_exposures["Crypto"] += val
+                    elif sym in ["GLD", "SLV", "USO", "UNG", "DBA"]:
+                        asset_exposures["Commodities"] += val
+                    else:
+                        asset_exposures["Equities"] += val
+                
+                asset_df = pd.DataFrame({
+                    "Class": list(asset_exposures.keys()),
+                    "Value": list(asset_exposures.values())
+                })
+                asset_df = asset_df[asset_df["Value"] > 0]
+                
+                fig_asset = px.pie(
+                    asset_df, values="Value", names="Class", hole=0.68,
+                    color="Class",
+                    color_discrete_map={"Equities": "#38BDF8", "Crypto": "#A855F7", "Commodities": "#F59E0B"}
+                )
+                fig_asset.update_traces(
+                    textinfo="label+percent",
+                    hovertemplate="<b>%{label}</b><br>Exposure: $%{value:,.2f}<br>Share: %{percent}<extra></extra>"
+                )
+                max_conc = asset_df['Value'].max() / invested * 100 if invested > 0 else 0.0
+                fig_asset.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(t=10, b=10, l=10, r=10), height=330,
+                    showlegend=False,
+                    annotations=[dict(
+                        text=(
+                            f"<span style='color:#64748B; font-size:10px;'>MAX CONC.</span><br>"
+                            f"<b style='color:#F8FAFC; font-size:16px;'>{max_conc:.1f}%</b><br>"
+                            f"<span style='color:#{'10B981' if max_conc<=50 else 'F43F5E'}; font-size:11px;'>{'Safe' if max_conc<=50 else 'Warning >50%'}</span>"
+                        ),
+                        x=0.5, y=0.5, showarrow=False
+                    )]
+                )
+                st.plotly_chart(fig_asset, use_container_width=True)
+            else:
+                st.info("No active exposure.")
 
         col_tree, col_radar = st.columns([1.15, 1])
         with col_tree:

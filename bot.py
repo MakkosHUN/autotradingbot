@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import math
 import argparse
 import requests
 from datetime import datetime, timedelta, timezone
@@ -153,7 +154,8 @@ DEFAULT_ENGINE_CONFIG = {
     "SMALL_CAP":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
     "TAIL_HEDGE": {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"},
     "COMMODITIES":{"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Precious Metals & Energy Hard Assets"},
-    "DEFENSE":    {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Aerospace & Defense Safe Haven"}
+    "DEFENSE":    {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Aerospace & Defense Safe Haven"},
+    "PREDATOR":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0050, "desc": "Engine 8: Retail Stop-Loss & Liquidity Flush Trapper"}
 }
 
 def load_or_init_engine_config():
@@ -1254,6 +1256,138 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
     return crypto_alerts, scan_lines
 
 # =====================================================================
+# 10.5. ENGINE 8: THE LIQUIDITY PREDATOR (FLUSH HUNTER)
+# =====================================================================
+def map_liquidity_clusters_and_bid(ticker, df_yf, equity, risk_bps):
+    """
+    Identifies retail stop-loss clusters (MAs, swing lows, psychological boundaries)
+    and formulates predatory limit bids to catch the slippage flush natively on the broker.
+    """
+    if df_yf.empty or len(df_yf) < 200:
+        return None
+        
+    close = float(df_yf["Close"].iloc[-1])
+    sma200 = float(df_yf["Close"].rolling(200).mean().iloc[-1])
+    sma50 = float(df_yf["Close"].rolling(50).mean().iloc[-1])
+    swing_low_20 = float(df_yf["Low"].rolling(20).min().iloc[-1])
+    atr = float((df_yf["High"] - df_yf["Low"]).rolling(14).mean().iloc[-1])
+    
+    clusters = []
+    
+    # 1. Psychological Round Numbers (e.g., $100.00, $50.00)
+    order_of_mag = 10 if close < 200 else 50
+    nearest_round_floor = math.floor(close / order_of_mag) * order_of_mag
+    if (close - nearest_round_floor) / close < 0.04 and nearest_round_floor < close:
+        clusters.append({"type": "Psy-Round", "level": nearest_round_floor})
+        
+    # 2. Moving Average Floors
+    if close > sma200 and (close - sma200) / close < 0.05:
+        clusters.append({"type": "200-SMA", "level": sma200})
+    if close > sma50 and (close - sma50) / close < 0.04:
+        clusters.append({"type": "50-SMA", "level": sma50})
+        
+    # 3. Swing Lows
+    if close > swing_low_20 and (close - swing_low_20) / close < 0.03:
+        clusters.append({"type": "20D-Low", "level": swing_low_20})
+        
+    if not clusters:
+        return None
+        
+    # Find the most relevant cluster (closest below current price)
+    clusters = sorted(clusters, key=lambda x: close - x["level"])
+    target_cluster = clusters[0]
+    cluster_px = target_cluster["level"]
+    
+    # The Predator Bid: Set limit order 0.65% to 1.2% BELOW the cluster to catch stop-loss slippage
+    flush_discount = max(0.0065, (atr / close) * 0.5) 
+    predator_bid = cluster_px * (1.0 - flush_discount)
+    
+    # Risk-Parity Sizing based on a catastrophic hard stop 
+    catastrophic_stop = predator_bid - (atr * 1.5)
+    stop_dist = predator_bid - catastrophic_stop
+    raw_qty = (equity * (risk_bps / 100.0)) / stop_dist
+    max_qty = (equity * 0.05) / predator_bid
+    qty = max(1, int(min(raw_qty, max_qty)))
+    
+    # Instant Mean-Reversion Target (Snapback to the broken cluster level)
+    snapback_tp = cluster_px * 1.015 
+    
+    return {
+        "Ticker": ticker,
+        "Cluster Level": round(cluster_px, 2),
+        "Cluster Type": target_cluster["type"],
+        "Live Price": round(close, 2),
+        "Predator Bid": round(predator_bid, 2),
+        "Snapback TP": round(snapback_tp, 2),
+        "Hard Stop": round(catastrophic_stop, 2),
+        "Qty": qty,
+        "Capital Req": round(qty * predator_bid, 2)
+    }
+
+def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bps):
+    alerts = []
+    lines = []
+    rows_to_append = []
+    
+    pool = CORE_POOL + MOMENTUM_POOL
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    # Batch download for speed and efficiency
+    yf_list = [to_yf_symbol(t) for t in pool]
+    try:
+        data = yf.download(yf_list, period="1y", interval="1d", group_by="ticker", threads=True, progress=False)
+    except Exception as e:
+        print(f"Predator data fetch error: {e}")
+        return alerts, lines
+
+    for ticker in pool:
+        if ticker in positions_map or to_alpaca_pos_symbol(ticker) in positions_map:
+            continue
+            
+        # Check if we already have a resting buy limit order for this trap
+        existing_orders = [o for o in active_orders if to_alpaca_pos_symbol(o.symbol) == to_alpaca_pos_symbol(ticker) and o.side == 'buy' and o.type == 'limit']
+        if existing_orders:
+            continue
+            
+        yf_sym = to_yf_symbol(ticker)
+        try:
+            df_t = data[yf_sym] if len(yf_list) > 1 else data
+            df_t = df_t.dropna(subset=["Close"])
+        except Exception:
+            continue
+            
+        trap = map_liquidity_clusters_and_bid(ticker, df_t, equity, risk_bps)
+        if trap:
+            try:
+                api.submit_order(
+                    symbol=trap["Ticker"],
+                    qty=trap["Qty"],
+                    side="buy",
+                    type="limit",
+                    limit_price=trap["Predator Bid"],
+                    time_in_force="gtc",
+                    order_class="bracket",
+                    take_profit={"limit_price": trap["Snapback TP"]},
+                    stop_loss={"stop_price": trap["Hard Stop"]}
+                )
+                action_taken = f"Armed {trap['Cluster Type']} Trap: Limit Buy {trap['Qty']} @ ${trap['Predator Bid']} | TP ${trap['Snapback TP']}"
+                decision = "BULLISH [PREDATOR-FLUSH]"
+                alerts.append(f"🩸 **[PREDATOR TRAP ARMED] {ticker}**: {action_taken} (Cluster: `${trap['Cluster Level']}`)")
+                lines.append(f"• **{ticker}** `[PREDATOR]`: {action_taken}")
+                rows_to_append.append([now_str, ticker, "N/A (Predator)", decision, action_taken, f"Capital Req: ${trap['Capital Req']}"])
+                time.sleep(0.35)
+            except Exception as e:
+                print(f"Predator order failed for {ticker}: {e}")
+                
+    if rows_to_append and sheet_ws:
+        try:
+            sheet_ws.append_rows(rows_to_append)
+        except Exception as e:
+            print(f"Predator sheet write warning: {e}")
+            
+    return alerts, lines
+
+# =====================================================================
 # 11. MASTER ORCHESTRATOR
 # =====================================================================
 def run_bot(mode="auto"):
@@ -1281,7 +1415,7 @@ def run_bot(mode="auto"):
         if mode == eng_key.lower():
             return True
         if mode == "intraday":
-            return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE"] and engine_cfg.get(eng_key, {}).get("enabled", False)
+            return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"] and engine_cfg.get(eng_key, {}).get("enabled", False)
         if mode == "auto":
             return engine_cfg.get(eng_key, {}).get("enabled", False)
         return False
@@ -1447,6 +1581,16 @@ def run_bot(mode="auto"):
         if th_lines:
             section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
 
+    if should_run("PREDATOR") and is_nyse_open:
+        print("=== Running Engine 8: Liquidity Predator ===")
+        pred_alerts, pred_lines = run_predator_tranche(
+            equity=equity, active_orders=active_orders, positions_map=positions_map,
+            sheet_ws=discovery_sheet, risk_bps=engine_cfg.get("PREDATOR", {}).get("risk_bps", 0.0050)
+        )
+        all_alerts.extend(pred_alerts)
+        if pred_lines:
+            section_reports.append("🩸 **Engine 8 — Liquidity Predator (Flush Hunter):**\n" + "\n".join(pred_lines))
+
     if all_alerts:
         send_discord_alert("🚨 **AETHER QUANT v8.6 Execution Alert (Multi-Asset Suites • RL Defensive Meta • Fee-Aware Arbiter):**\n" + "\n".join(all_alerts))
 
@@ -1471,7 +1615,7 @@ def run_bot(mode="auto"):
         detailed_report = (
             f"💠 **AETHER QUANT v8.6 OMEGA Telemetry (Multi-Asset Suites • GEX Defensive Meta)**\n"
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}`\n"
-            f"🎛️ **Active Engines ({len(enabled_list)}/9):** `{', '.join(enabled_list)}`\n"
+            f"🎛️ **Active Engines ({len(enabled_list)}/10):** `{', '.join(enabled_list)}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
             f"📅 **Today's Change:** `${day_pl:+,.2f}` (`{day_pl_pct:+.2f}%`) | 📊 **Open P/L:** `${total_unrealized_pl:+,.2f}`\n"
             f"💵 **Cash:** `${cash:,.2f}` | 💼 **Invested:** `${invested_val:,.2f}` ({len(positions_list)} total positions)\n\n"
@@ -1531,7 +1675,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         default=os.environ.get("BOT_MODE", "smart_cron"),
-        choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "commodities", "defense", "smart_cron"]
+        choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "commodities", "defense", "predator", "smart_cron"]
     )
     args = parser.parse_args()
 
@@ -1550,7 +1694,7 @@ if __name__ == "__main__":
 
         # 2. Intraday Market Hours (10:00 AM to 3:00 PM NY Time) -> Runs HIGH-FREQ EQUITIES + CRYPTO
         elif is_weekday and ((hr == 9 and mn > 45) or (10 <= hr <= 14) or (hr == 15 and mn < 30) or (hr == 16 and mn == 0)):
-            print("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery, excluding Core)")
+            print("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery + Predator, excluding Core)")
             run_bot(mode="intraday")
 
         # 3. Overnight & Weekends -> Runs CRYPTO ONLY

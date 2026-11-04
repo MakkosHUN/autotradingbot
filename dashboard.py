@@ -608,50 +608,39 @@ def fetch_alpaca_state():
 
     return is_open, account_data, positions_data, orders_data, recent_data, hist
 
-def compute_trade_post_mortems(recent_orders, positions):
-    filled = [
-        o for o in recent_orders
-        if o["status"] == "FILLED" and o["filled_avg_price"] is not None and float(o["filled_qty"] or 0) > 0
-    ]
-    filled_sorted = sorted(filled, key=lambda x: x["filled_at"] or x["submitted_at"])
-
-    open_lots = {}
+def compute_trade_post_mortems(df_closed, positions):
     post_mortems = []
-
-    for o in filled_sorted:
-        sym = o["symbol"]
-        side = o["side"]
-        price = float(o["filled_avg_price"])
-        qty = float(o["filled_qty"])
-        ts_str = o["filled_at"] or o["submitted_at"]
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", ""))
-        except Exception:
-            ts = datetime.now()
-
-        if side == "BUY":
-            open_lots[sym] = {"price": price, "qty": qty, "ts": ts, "tranche": o["tranche"]}
-        elif side == "SELL" and sym in open_lots:
-            lot = open_lots.pop(sym)
-            matched_qty = min(qty, lot["qty"])
-            pnl_dlr = (price - lot["price"]) * matched_qty
-            pnl_pct = ((price - lot["price"]) / lot["price"]) * 100.0 if lot["price"] > 0 else 0.0
-            hold_hrs = max(0.1, (ts - lot["ts"]).total_seconds() / 3600.0)
-            post_mortems.append({
-                "Closed At": ts_str,
-                "Engine": lot["tranche"],
-                "Ticker": sym,
-                "Qty": matched_qty,
-                "Entry ($)": round(lot["price"], 2),
-                "Exit ($)": round(price, 2),
-                "Realized P/L ($)": round(pnl_dlr, 2),
-                "Return (%)": round(pnl_pct, 2),
-                "Hold (Hrs)": round(hold_hrs, 1),
-                "Outcome": "WIN" if pnl_dlr > 0 else "LOSS"
-            })
-
+    
+    # 1. Map data directly from the Google Sheet ledger
+    if not df_closed.empty and "Engine" in df_closed.columns and "Realized P/L ($)" in df_closed.columns:
+        for _, row in df_closed.iterrows():
+            try:
+                # Clean currency strings to floats
+                pnl_str = str(row.get("Realized P/L ($)", "0")).replace("$", "").replace("+", "").replace(",", "")
+                pnl = float(pnl_str)
+                
+                ret_str = str(row.get("Return (%)", "0")).replace("%", "").replace("+", "")
+                ret = float(ret_str)
+                
+                post_mortems.append({
+                    "Closed At": row.get("Closed At (UTC)", ""),
+                    "Engine": row.get("Engine", ""),
+                    "Ticker": row.get("Ticker", ""),
+                    "Qty": row.get("Qty", 0),
+                    "Entry ($)": row.get("Entry Price", "0"),
+                    "Exit ($)": row.get("Fill Price", "0"),
+                    "Realized P/L ($)": pnl,
+                    "Return (%)": ret,
+                    "Hold (Hrs)": 24.0, 
+                    "Outcome": "WIN" if pnl > 0 else "LOSS"
+                })
+            except Exception:
+                continue
+                
     df_pm = pd.DataFrame(post_mortems)
     attr_rows = []
+    
+    # 2. Calculate Win Rates & RL Multipliers per Engine
     for eng in DEFAULT_ENGINE_CONFIG.keys():
         eng_pm = df_pm[df_pm["Engine"] == eng] if not df_pm.empty else pd.DataFrame()
         eng_pos = [p for p in positions if p["tranche"] == eng]
@@ -1456,7 +1445,7 @@ def render_live_terminal():
     macro_ok, spy_chg, vix_val, spy_30d, net_gex = fetch_macro_and_gex_telemetry()
     df_core, df_mom, df_crypto, df_disc, df_closed = fetch_all_sheet_logs()
     engine_cfg = fetch_engine_config()
-    df_attr, df_post_mortems = compute_trade_post_mortems(recent_orders, positions)
+    df_attr, df_post_mortems = compute_trade_post_mortems(df_closed, positions)
     _, bell_countdown = get_nyse_bell_countdown()
 
     equity = float(account.get('equity', 0.0))

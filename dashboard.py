@@ -611,22 +611,40 @@ def fetch_alpaca_state():
 def compute_trade_post_mortems(df_closed, positions, recent_orders):
     post_mortems = []
     
-    # ATTEMPT A: Cloud Ledger (Strips whitespace for bulletproof matching)
+    # ---------------------------------------------------------
+    # ATTEMPT A: Cloud Ledger (Google Sheet 'Closed Trades')
+    # ---------------------------------------------------------
     if not df_closed.empty:
         df_closed.columns = [str(c).strip() for c in df_closed.columns]
-        engine_col = next((c for c in df_closed.columns if "engine" in c.lower() or "tranche" in c.lower()), None)
         pnl_col = next((c for c in df_closed.columns if "p/l" in c.lower() or "pnl" in c.lower() or "realized" in c.lower()), None)
+        ticker_col = next((c for c in df_closed.columns if "ticker" in c.lower() or "symbol" in c.lower() or "asset" in c.lower()), None)
+        engine_col = next((c for c in df_closed.columns if "engine" in c.lower() or "tranche" in c.lower()), None)
         
-        if engine_col and pnl_col:
+        if pnl_col:
             for _, row in df_closed.iterrows():
                 try:
                     pnl_str = str(row.get(pnl_col, "0")).replace("$", "").replace("+", "").replace(",", "")
                     pnl = float(pnl_str if pnl_str.strip() else 0)
                     
-                    engine_val = str(row.get(engine_col, "")).strip().upper()
+                    sym = str(row.get(ticker_col, "")).strip().upper() if ticker_col else "UNKNOWN"
+                    
+                    # Robust Engine Detection (Matches substrings)
+                    engine_val = ""
+                    if engine_col:
+                        raw_eng = str(row.get(engine_col, "")).strip().upper()
+                        for k in DEFAULT_ENGINE_CONFIG.keys():
+                            if k in raw_eng:
+                                engine_val = k
+                                break
+                    
+                    # If Engine is missing in the sheet, auto-classify via ticker dictionary
+                    if not engine_val and sym != "UNKNOWN":
+                        engine_val = classify_symbol(sym)
+                        
                     if engine_val:
                         post_mortems.append({
                             "Engine": engine_val,
+                            "Ticker": sym,
                             "Realized P/L ($)": pnl,
                             "Hold (Hrs)": 24.0, 
                             "Outcome": "WIN" if pnl > 0 else "LOSS"
@@ -634,28 +652,54 @@ def compute_trade_post_mortems(df_closed, positions, recent_orders):
                 except Exception:
                     continue
 
-    # ATTEMPT B: Fallback to Alpaca API if Google Sheet is empty/mismatched
-    if len(post_mortems) == 0 and recent_orders:
-        sells = [o for o in recent_orders if o['side'] == 'SELL' and o['status'] == 'FILLED']
-        buys = [o for o in recent_orders if o['side'] == 'BUY' and o['status'] == 'FILLED']
-        
-        for s in sells:
-            sym = s['symbol']
-            matching_buy = next((b for b in buys if b['symbol'] == sym and b['filled_at'] < s['filled_at']), None)
-            if matching_buy and s['filled_avg_price'] and matching_buy['filled_avg_price']:
-                qty = float(s['filled_qty'] or s['qty'])
-                pnl = (float(s['filled_avg_price']) - float(matching_buy['filled_avg_price'])) * qty
-                post_mortems.append({
-                    "Engine": s.get('tranche', 'UNKNOWN'),
-                    "Realized P/L ($)": pnl,
-                    "Hold (Hrs)": 12.0,
-                    "Outcome": "WIN" if pnl > 0 else "LOSS"
-                })
+    # ---------------------------------------------------------
+    # ATTEMPT B: Direct Alpaca Deep Fetch (Merges Missing Trades)
+    # ---------------------------------------------------------
+    try:
+        if api:
+            # Fetch 400 closed orders to bypass the short 150 limit
+            deep_orders = api.list_orders(status='closed', limit=400)
+            
+            sells = [o for o in deep_orders if o.side == 'sell' and o.status == 'filled']
+            buys = [o for o in deep_orders if o.side == 'buy' and o.status == 'filled']
+            
+            for s in sells:
+                sym = str(s.symbol)
+                display_sym = CRYPTO_NORM.get(sym, sym)
                 
+                # Match sell to preceding buy
+                matching_buy = next((b for b in buys if str(b.symbol) == sym and b.filled_at < s.filled_at), None)
+                
+                if matching_buy and s.filled_avg_price and matching_buy.filled_avg_price:
+                    qty = float(s.filled_qty or s.qty or 0.0)
+                    pnl = (float(s.filled_avg_price) - float(matching_buy.filled_avg_price)) * qty
+                    
+                    eng = classify_symbol(display_sym)
+                    
+                    # Deduplicate: Only add if this trade isn't already listed from the Google Sheet
+                    is_dup = False
+                    for pm in post_mortems:
+                        if pm['Engine'] == eng and pm.get('Ticker') == display_sym and abs(pm['Realized P/L ($)'] - pnl) < 2.0:
+                            is_dup = True
+                            break
+                            
+                    if not is_dup:
+                        post_mortems.append({
+                            "Engine": eng,
+                            "Ticker": display_sym,
+                            "Realized P/L ($)": pnl,
+                            "Hold (Hrs)": 12.0,
+                            "Outcome": "WIN" if pnl > 0 else "LOSS"
+                        })
+    except Exception as e:
+        pass
+
     df_pm = pd.DataFrame(post_mortems)
     attr_rows = []
     
+    # ---------------------------------------------------------
     # Calculate Win Rates & RL Multipliers per Engine
+    # ---------------------------------------------------------
     for eng in DEFAULT_ENGINE_CONFIG.keys():
         eng_pm = df_pm[df_pm["Engine"] == eng] if not df_pm.empty else pd.DataFrame()
         eng_pos = [p for p in positions if p["tranche"] == eng]

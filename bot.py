@@ -1023,30 +1023,40 @@ def sync_recent_closed_sells(closed_orders):
 
         # Alpaca bracket exits can arrive as child legs of a nested parent order.
         # Flatten both parent orders and their legs so automated TP/SL fills reconcile too.
-        orders_to_sync = []
-        seen_order_ids = set()
+        orders_by_id = {}
         for parent_order in closed_orders:
             candidates = [parent_order] + list(getattr(parent_order, "legs", None) or [])
             for candidate in candidates:
                 candidate_id = str(getattr(candidate, "id", "") or "").strip()
-                if candidate_id and candidate_id not in seen_order_ids:
-                    seen_order_ids.add(candidate_id)
-                    orders_to_sync.append(candidate)
+                if candidate_id:
+                    orders_by_id[candidate_id] = candidate
 
-        for order in orders_to_sync:
+        # Backfill old ledger rows too. Earlier bot versions wrote an estimated
+        # exit row at submit time but did not store a Status. Those orders may be
+        # older than the recent 24h/150-order window, so verify them by exact ID.
+        terminal_ledger_statuses = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+        for ledger_row in all_rows[1:]:
+            if len(ledger_row) <= id_idx:
+                continue
+            legacy_order_id = str(ledger_row[id_idx]).strip()
+            if not legacy_order_id or legacy_order_id in orders_by_id:
+                continue
+            ledger_status = (
+                str(ledger_row[status_idx]).strip().upper()
+                if len(ledger_row) > status_idx else ""
+            )
+            if ledger_status in terminal_ledger_statuses:
+                continue
+            try:
+                orders_by_id[legacy_order_id] = api.get_order(legacy_order_id)
+            except Exception as lookup_error:
+                print(f"Legacy closed-trade lookup warning ({legacy_order_id}): {lookup_error}")
+
+        for order_id, order in orders_by_id.items():
             if str(getattr(order, "side", "")).lower() != "sell":
                 continue
             order_status = str(getattr(order, "status", "")).lower()
-            if order_status not in {"filled", "canceled", "expired"}:
-                continue
-
-            order_id = str(getattr(order, "id", "") or "").strip()
-            if not order_id:
-                continue
-
-            fill_price = float(getattr(order, "filled_avg_price", 0.0) or 0.0)
-            qty_val = float(getattr(order, "filled_qty", 0.0) or 0.0)
-            if fill_price <= 0 or qty_val <= 0:
+            if order_status not in {"filled", "partially_filled", "canceled", "expired", "rejected"}:
                 continue
 
             existing = row_by_order_id.get(order_id)
@@ -1055,9 +1065,24 @@ def sync_recent_closed_sells(closed_orders):
                 str(existing_row[status_idx]).strip().upper()
                 if len(existing_row) > status_idx else ""
             )
-            # Reconciled terminal fills are immutable; avoid duplicate Discord alerts
-            # and needless writes on each scheduled bot run.
-            if existing_status in {"FILLED", "PARTIAL_FILL"}:
+            # A FILLED row is final. PARTIAL_FILL rows are rechecked because the
+            # remainder may fill on a later bot cycle.
+            if existing_status == "FILLED":
+                continue
+
+            fill_price = float(getattr(order, "filled_avg_price", 0.0) or 0.0)
+            qty_val = float(getattr(order, "filled_qty", 0.0) or 0.0)
+            if fill_price <= 0 or qty_val <= 0:
+                if existing and order_status in {"canceled", "expired", "rejected"}:
+                    status_label = order_status.upper()
+                    status_row = list(existing_row)
+                    while len(status_row) <= status_idx:
+                        status_row.append("")
+                    status_row[status_idx] = status_label
+                    closed_sheet.update(
+                        range_name=f"A{existing[0]}:K{existing[0]}", values=[status_row[:status_idx + 1]]
+                    )
+                    row_by_order_id[order_id] = (existing[0], status_row)
                 continue
             symbol_key = to_alpaca_pos_symbol(str(order.symbol))
             basis_record = basis_by_symbol.get(symbol_key, {})
@@ -1114,6 +1139,14 @@ def sync_recent_closed_sells(closed_orders):
                 all_rows.append(row_values)
 
             order_type = str(getattr(order, "type", "")).lower()
+            prior_qty = _parse_money_value(existing_row[2]) if len(existing_row) > 2 else 0.0
+            emit_fill_alert = (
+                not existing
+                or existing_status == "PENDING"
+                or (existing_status == "PARTIAL_FILL" and qty_val > prior_qty + 1e-9)
+            )
+            if not emit_fill_alert:
+                continue
             if order_type in ["stop", "stop_limit"]:
                 new_fill_alerts.append(
                     f"🛑 **STOP-LOSS FILLED ({display_symbol} | {engine_tag})**: Sold {qty_val:g} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)"
@@ -1206,7 +1239,8 @@ def run_equity_tranche(
                             symbol=ticker, qty=owned_qty, side='sell', type='market', time_in_force='gtc'
                         )
                         decision = f"EXIT SUBMITTED [{regime_tag}]"
-                        action_taken = f"Sell order submitted for {int(owned_qty)} @ ~${current_price:.2f} ({exit_label}); awaiting fill confirmation"
+                        exit_atr_note = f" | ATR(14): ${float(tech['atr14']):.2f}" if tech else ""
+                        action_taken = f"Sell order submitted for {int(owned_qty)} @ ~${current_price:.2f} ({exit_label}){exit_atr_note}; awaiting fill confirmation"
                         record_pending_exit(
                             sell_ord, ticker, owned_qty, exit_label, tranche_name, entry_price
                         )
@@ -1298,7 +1332,12 @@ def run_equity_tranche(
                             stop_loss={'stop_price': stop_price}
                         )
                         decision = f"BULLISH [{regime_tag}]"
-                        action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}"
+                        action_taken = (
+                            f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | "
+                            f"ATR(14): ${float(tech['atr14']):.2f} | Risk ATR used: ${atr:.2f} | "
+                            f"TP: ${target_price:.2f} ({adj_tp_mult}x risk ATR) | "
+                            f"SL: ${stop_price:.2f} ({sl_atr_mult}x ATR)"
+                        )
                         owned_qty = qty_to_buy
                         if tech and "returns_60d" in tech:
                             held_returns_map[ticker] = tech["returns_60d"]
@@ -1414,7 +1453,8 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                         symbol=pair, qty=owned_qty, side='sell', type='market', time_in_force='gtc'
                     )
                     decision = f"EXIT SUBMITTED [{regime_tag}]"
-                    action_taken = f"Sell order submitted for {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason}); awaiting fill confirmation"
+                    exit_atr_note = f" | ATR(14): ${float(tech['atr14']):.4f}" if tech else ""
+                    action_taken = f"Sell order submitted for {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason}){exit_atr_note}; awaiting fill confirmation"
                     record_pending_exit(
                         sell_order, pair, owned_qty, exit_reason, "CRYPTO", entry_price
                     )
@@ -1465,7 +1505,12 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                                 symbol=pair, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc'
                             )
                             decision = f"BULLISH [{regime_tag}]"
-                            action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | OBI {obi:+.2f} | TP +{dyn_tp}%)"
+                            action_taken = (
+                                f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} "
+                                f"({regime_tag} | OBI {obi:+.2f} | ATR(14): ${float(tech['atr14']):.4f} | "
+                                f"Risk ATR sizing: ${atr:.4f} | "
+                                f"TP +{dyn_tp}% | managed stop -3.0%)"
+                            )
                             owned_qty = qty_to_buy
                             held_returns_map[pair] = tech["returns_60d"]
                             crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")

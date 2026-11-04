@@ -1460,7 +1460,7 @@ def render_live_terminal():
     macro_ok, spy_chg, vix_val, spy_30d, net_gex = fetch_macro_and_gex_telemetry()
     df_core, df_mom, df_crypto, df_disc, df_closed = fetch_all_sheet_logs()
     engine_cfg = fetch_engine_config()
-    df_attr, df_post_mortems = compute_trade_post_mortems(df_closed, positions)
+    df_attr, df_post_mortems = compute_trade_post_mortems(df_closed, positions,recent_orders)
     _, bell_countdown = get_nyse_bell_countdown()
 
     equity = float(account.get('equity', 0.0))

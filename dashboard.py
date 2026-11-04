@@ -13,21 +13,6 @@ import alpaca_trade_api as tradeapi
 import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
-import json
-import re
-import requests
-from datetime import datetime, time as dtime, timedelta, timezone
-from zoneinfo import ZoneInfo
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
-import alpaca_trade_api as tradeapi
-import yfinance as yf
-import gspread
-from google.oauth2.service_account import Credentials
 
 # =====================================================================
 # 1. PAGE CONFIG & MILLION-DOLLAR OBSIDIAN QUANT CSS
@@ -1819,6 +1804,50 @@ def render_live_terminal():
                 "Total Engine Alpha ($)": st.column_config.NumberColumn("Net Engine Alpha ($)", format="$%+.2f")
             }
         )
+        if spreadsheet:
+            if not df_closed.empty and "Status" in df_closed.columns:
+                _ledger_status = df_closed["Status"].astype(str).str.strip().str.upper()
+                _confirmed = int(_ledger_status.isin(["FILLED", "PARTIAL_FILL"]).sum())
+                _pending = int(_ledger_status.isin(["PENDING", ""]).sum())
+                _other = int(len(df_closed) - _confirmed - _pending)
+                st.caption(
+                    f"Closed-trade ledger: {_confirmed} confirmed fills • "
+                    f"{_pending} pending/unreconciled rows • {_other} canceled/other rows."
+                )
+                if _pending:
+                    st.warning(
+                        "Some ledger rows still need broker confirmation. Make sure the updated bot.py is deployed and run the bot once; "
+                        "it now checks saved Alpaca order IDs to reconcile older exits."
+                    )
+            elif df_closed.empty:
+                st.warning(
+                    "The Closed Trades worksheet has no trade rows yet. The dashboard cannot derive historical closed-trade win rates "
+                    "from open positions alone. Deploy the updated bot.py and run it so confirmed SELL fills are written to this ledger."
+                )
+
+        st.markdown(
+            '<div class="sec-title"><span class="sec-dot"></span>Confirmed Closed Trade History</div>',
+            unsafe_allow_html=True,
+        )
+        if not df_post_mortems.empty:
+            closed_view = df_post_mortems.sort_values("Closed At", ascending=False, na_position="last").copy()
+            st.dataframe(
+                closed_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Qty": st.column_config.NumberColumn("Qty", format="%.4f"),
+                    "Entry ($)": st.column_config.NumberColumn("Entry ($)", format="$%.4f"),
+                    "Exit ($)": st.column_config.NumberColumn("Exit ($)", format="$%.4f"),
+                    "Realized P/L ($)": st.column_config.NumberColumn("Realized P/L ($)", format="$%+.2f"),
+                    "Return (%)": st.column_config.NumberColumn("Return (%)", format="%+.2f%%"),
+                    "Hold (Hrs)": st.column_config.NumberColumn("Hold (Hrs)", format="%.1f"),
+                },
+            )
+        else:
+            st.info(
+                "No broker-confirmed closed trades are available yet. Pending/unreconciled orders are intentionally not counted as wins or losses."
+            )
 
         col_eq, col_pie, col_asset = st.columns([1.6, 1, 1])
         with col_eq:

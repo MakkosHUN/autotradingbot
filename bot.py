@@ -89,11 +89,24 @@ core_sheet = spreadsheet.sheet1 if spreadsheet else None
 momentum_sheet = get_or_create_worksheet(spreadsheet, "Momentum Log", LOG_HEADERS)
 crypto_sheet = get_or_create_worksheet(spreadsheet, "Crypto Log", LOG_HEADERS)
 discovery_sheet = get_or_create_worksheet(spreadsheet, "Discovery Log", LOG_HEADERS)
-closed_sheet = get_or_create_worksheet(
-    spreadsheet,
-    "Closed Trades",
-    ["Closed At (UTC)", "Ticker", "Qty", "Exit Type", "Fill Price", "Order ID", "Engine", "Entry Price", "Realized P/L ($)", "Return (%)"]
-)
+CLOSED_TRADE_HEADERS = [
+    "Closed At (UTC)", "Ticker", "Qty", "Exit Type", "Fill Price", "Order ID",
+    "Engine", "Entry Price", "Realized P/L ($)", "Return (%)", "Status"
+]
+closed_sheet = get_or_create_worksheet(spreadsheet, "Closed Trades", CLOSED_TRADE_HEADERS)
+POSITION_BASIS_HEADERS = ["Ticker", "Engine", "Open Qty", "Avg Entry Price", "Updated At (UTC)"]
+position_basis_sheet = get_or_create_worksheet(spreadsheet, "Position Basis", POSITION_BASIS_HEADERS)
+
+# Migrate an existing 10-column ledger without disturbing its historical rows.
+if closed_sheet:
+    try:
+        _closed_headers = [str(x).strip() for x in closed_sheet.row_values(1)]
+        if not _closed_headers:
+            closed_sheet.append_row(CLOSED_TRADE_HEADERS)
+        elif "Status" not in _closed_headers:
+            closed_sheet.update_cell(1, len(_closed_headers) + 1, "Status")
+    except Exception as e:
+        print(f"Closed Trades schema migration warning: {e}")
 config_sheet = get_or_create_worksheet(
     spreadsheet,
     "Engine Config",
@@ -223,6 +236,9 @@ def compute_rl_meta_allocation(engine_cfg, net_gex_score=0.0):
             if len(rows) > 3:
                 df_c = pd.DataFrame(rows[1:], columns=rows[0])
                 if "Engine" in df_c.columns and "Realized P/L ($)" in df_c.columns:
+                    # A pending sell is not a realized reward: keep it out of RL feedback.
+                    if "Status" in df_c.columns:
+                        df_c = df_c[df_c["Status"].astype(str).str.strip().str.upper().isin(["FILLED", "PARTIAL_FILL"])]
                     df_c["PNL"] = df_c["Realized P/L ($)"].astype(str).str.replace("$", "").str.replace("+", "").str.replace(",", "")
                     df_c["PNL"] = pd.to_numeric(df_c["PNL"], errors="coerce").fillna(0.0)
 
@@ -848,44 +864,268 @@ def cancel_existing_orders_for_ticker(ticker, active_orders):
     if canceled:
         time.sleep(1.5)
 
-def find_last_buy_fill_price(symbol, closed_orders):
+def sync_position_basis_snapshot(positions):
+    """Persist current Alpaca average entry prices for later bracket-order exits."""
+    if not position_basis_sheet:
+        return
+    try:
+        rows = position_basis_sheet.get_all_values()
+        if not rows:
+            position_basis_sheet.append_row(POSITION_BASIS_HEADERS)
+            rows = [POSITION_BASIS_HEADERS]
+        headers = [str(x).strip() for x in rows[0]]
+        symbol_idx = headers.index("Ticker") if "Ticker" in headers else 0
+        row_by_symbol = {}
+        for row_number, row in enumerate(rows[1:], start=2):
+            if len(row) > symbol_idx and row[symbol_idx].strip():
+                row_by_symbol[to_alpaca_pos_symbol(row[symbol_idx].strip())] = row_number
+
+        updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        for position in positions:
+            raw_symbol = str(position.symbol)
+            display_symbol = CRYPTO_NORM.get(to_alpaca_pos_symbol(raw_symbol), raw_symbol)
+            row_values = [
+                display_symbol,
+                classify_symbol(display_symbol),
+                str(float(position.qty)),
+                f"${float(position.avg_entry_price):.4f}",
+                updated_at,
+            ]
+            existing_row = row_by_symbol.get(to_alpaca_pos_symbol(display_symbol))
+            if existing_row:
+                position_basis_sheet.update(
+                    values=[row_values], range_name=f"A{existing_row}:E{existing_row}"
+                )
+            else:
+                position_basis_sheet.append_row(row_values, value_input_option="USER_ENTERED")
+                row_by_symbol[to_alpaca_pos_symbol(display_symbol)] = len(rows) + 1
+                rows.append(row_values)
+    except Exception as e:
+        print(f"Position basis snapshot warning: {e}")
+
+
+def _parse_money_value(value):
+    """Parse sheet values such as '$+123.45' or 'N/A' into a float."""
+    try:
+        text_value = str(value or "").strip().replace("$", "").replace(",", "").replace("+", "").replace("%", "")
+        if not text_value or text_value.upper() in {"N/A", "PENDING", "NONE", "NAN"}:
+            return 0.0
+        return float(text_value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def find_last_buy_fill_price(symbol, closed_orders, before_time=None):
+    """Best-effort fallback: use the most recent filled BUY before the SELL."""
     norm = to_alpaca_pos_symbol(symbol)
-    for o in closed_orders:
-        if to_alpaca_pos_symbol(o.symbol) == norm and o.side == 'buy' and o.status == 'filled' and getattr(o, 'filled_avg_price', None):
-            return float(o.filled_avg_price)
-    return 0.0
+    candidates = []
+    for order in closed_orders:
+        if (
+            to_alpaca_pos_symbol(str(order.symbol)) == norm
+            and str(order.side).lower() == "buy"
+            and str(order.status).lower() == "filled"
+            and getattr(order, "filled_avg_price", None)
+        ):
+            filled_at = getattr(order, "filled_at", None)
+            if hasattr(filled_at, "isoformat"):
+                filled_at_key = filled_at.isoformat()
+            else:
+                filled_at_key = str(filled_at or "")
+            if hasattr(before_time, "isoformat"):
+                before_key = before_time.isoformat()
+            else:
+                before_key = str(before_time or "")
+            if before_key and filled_at_key and filled_at_key > before_key:
+                continue
+            candidates.append(order)
+    if not candidates:
+        return 0.0
+    candidates.sort(key=lambda item: str(getattr(item, "filled_at", "") or getattr(item, "submitted_at", "")))
+    return float(candidates[-1].filled_avg_price)
+
+
+def record_pending_exit(order, symbol, qty, exit_reason, engine, entry_price):
+    """Persist exit metadata immediately, but do not count it as closed until filled."""
+    if not closed_sheet or order is None:
+        return
+    order_id = str(getattr(order, "id", "") or "").strip()
+    if not order_id:
+        print(f"Pending exit ledger skipped for {symbol}: missing Alpaca order ID")
+        return
+    try:
+        order_ids = set(str(x).strip() for x in closed_sheet.col_values(6))
+        if order_id in order_ids:
+            return
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        display_symbol = CRYPTO_NORM.get(to_alpaca_pos_symbol(str(symbol)), str(symbol))
+        entry_value = float(entry_price or 0.0)
+        row = [
+            now_utc,
+            display_symbol,
+            str(qty),
+            str(exit_reason or "SELL")[:80],
+            "PENDING",
+            order_id,
+            str(engine or classify_symbol(str(symbol))).upper(),
+            f"${entry_value:.8f}" if entry_value > 0 else "N/A",
+            "",
+            "",
+            "PENDING",
+        ]
+        closed_sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"Pending exit ledger write warning ({symbol}): {e}")
+
 
 def sync_recent_closed_sells(closed_orders):
+    """Upsert confirmed SELL fills into Closed Trades, replacing PENDING estimates."""
     if not closed_sheet:
         return []
+
     new_fill_alerts = []
     try:
-        existing_ids = set(closed_sheet.col_values(6))
-        for o in closed_orders:
-            if o.side == 'sell' and o.status == 'filled' and o.id not in existing_ids:
-                filled_time = str(o.filled_at)[:19] if o.filled_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                fill_price = float(o.filled_avg_price) if o.filled_avg_price else 0.0
-                qty_val = float(o.filled_qty) if o.filled_qty else 0.0
-                order_type = o.type.upper()
-                engine_tag = classify_symbol(o.symbol)
-                entry_est = find_last_buy_fill_price(o.symbol, closed_orders)
-                if entry_est > 0 and fill_price > 0:
-                    realized_pl = (fill_price - entry_est) * qty_val
-                    realized_pct = ((fill_price - entry_est) / entry_est) * 100.0
-                else:
-                    realized_pl, realized_pct = 0.0, 0.0
+        all_rows = closed_sheet.get_all_values()
+        if not all_rows:
+            closed_sheet.append_row(CLOSED_TRADE_HEADERS)
+            all_rows = [CLOSED_TRADE_HEADERS]
 
-                closed_sheet.append_row([
-                    filled_time, o.symbol, str(o.filled_qty), order_type,
-                    f"${fill_price:.2f}", o.id, engine_tag,
-                    f"${entry_est:.2f}" if entry_est > 0 else "N/A",
-                    f"${realized_pl:+.2f}", f"{realized_pct:+.2f}%"
-                ])
-                existing_ids.add(o.id)
-                if o.type in ['stop', 'stop_limit']:
-                    new_fill_alerts.append(f"🛑 **STOP-LOSS TRIGGERED ({o.symbol} | {engine_tag})**: Sold {o.filled_qty} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)")
-                elif o.type == 'limit':
-                    new_fill_alerts.append(f"🎯 **TAKE-PROFIT HIT ({o.symbol} | {engine_tag})**: Sold {o.filled_qty} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)")
+        headers = [str(value).strip() for value in all_rows[0]]
+        # Keep compatibility with older ledgers while ensuring Status is available.
+        if "Status" not in headers:
+            closed_sheet.update_cell(1, len(headers) + 1, "Status")
+            headers.append("Status")
+            all_rows[0].append("Status")
+
+        def col_index(name, fallback):
+            return headers.index(name) if name in headers else fallback
+
+        id_idx = col_index("Order ID", 5)
+        engine_idx = col_index("Engine", 6)
+        entry_idx = col_index("Entry Price", 7)
+        status_idx = col_index("Status", 10)
+        basis_by_symbol = {}
+        if position_basis_sheet:
+            try:
+                basis_rows = position_basis_sheet.get_all_values()
+                for basis_row in basis_rows[1:]:
+                    if len(basis_row) >= 4 and str(basis_row[0]).strip():
+                        basis_by_symbol[to_alpaca_pos_symbol(str(basis_row[0]).strip())] = {
+                            "engine": str(basis_row[1]).strip().upper(),
+                            "entry_price": _parse_money_value(basis_row[3]),
+                        }
+            except Exception as e:
+                print(f"Position basis lookup warning: {e}")
+
+        row_by_order_id = {}
+        for row_number, row in enumerate(all_rows[1:], start=2):
+            if len(row) > id_idx and str(row[id_idx]).strip():
+                row_by_order_id[str(row[id_idx]).strip()] = (row_number, row)
+
+        # Alpaca bracket exits can arrive as child legs of a nested parent order.
+        # Flatten both parent orders and their legs so automated TP/SL fills reconcile too.
+        orders_to_sync = []
+        seen_order_ids = set()
+        for parent_order in closed_orders:
+            candidates = [parent_order] + list(getattr(parent_order, "legs", None) or [])
+            for candidate in candidates:
+                candidate_id = str(getattr(candidate, "id", "") or "").strip()
+                if candidate_id and candidate_id not in seen_order_ids:
+                    seen_order_ids.add(candidate_id)
+                    orders_to_sync.append(candidate)
+
+        for order in orders_to_sync:
+            if str(getattr(order, "side", "")).lower() != "sell":
+                continue
+            order_status = str(getattr(order, "status", "")).lower()
+            if order_status not in {"filled", "canceled", "expired"}:
+                continue
+
+            order_id = str(getattr(order, "id", "") or "").strip()
+            if not order_id:
+                continue
+
+            fill_price = float(getattr(order, "filled_avg_price", 0.0) or 0.0)
+            qty_val = float(getattr(order, "filled_qty", 0.0) or 0.0)
+            if fill_price <= 0 or qty_val <= 0:
+                continue
+
+            existing = row_by_order_id.get(order_id)
+            existing_row = existing[1] if existing else []
+            existing_status = (
+                str(existing_row[status_idx]).strip().upper()
+                if len(existing_row) > status_idx else ""
+            )
+            # Reconciled terminal fills are immutable; avoid duplicate Discord alerts
+            # and needless writes on each scheduled bot run.
+            if existing_status in {"FILLED", "PARTIAL_FILL"}:
+                continue
+            symbol_key = to_alpaca_pos_symbol(str(order.symbol))
+            basis_record = basis_by_symbol.get(symbol_key, {})
+            entry_est = _parse_money_value(existing_row[entry_idx]) if len(existing_row) > entry_idx else 0.0
+            if entry_est <= 0:
+                entry_est = float(basis_record.get("entry_price", 0.0) or 0.0)
+            if entry_est <= 0:
+                entry_est = find_last_buy_fill_price(
+                    str(order.symbol), closed_orders, before_time=getattr(order, "filled_at", None)
+                )
+            if entry_est <= 0:
+                # Do not fabricate realized P/L when the entry basis is unknown.
+                print(f"Closed trade {order_id} ({order.symbol}) needs an entry price; leaving it unconfirmed")
+                continue
+
+            realized_pl = (fill_price - entry_est) * qty_val
+            realized_pct = ((fill_price - entry_est) / entry_est) * 100.0
+            filled_at = getattr(order, "filled_at", None)
+            filled_time = str(filled_at)[:19] if filled_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            display_symbol = CRYPTO_NORM.get(to_alpaca_pos_symbol(str(order.symbol)), str(order.symbol))
+            engine_tag = (
+                str(existing_row[engine_idx]).strip().upper()
+                if len(existing_row) > engine_idx and str(existing_row[engine_idx]).strip()
+                else (str(basis_record.get("engine", "")).strip().upper() or classify_symbol(display_symbol))
+            )
+            exit_reason = (
+                str(existing_row[3]).strip()
+                if len(existing_row) > 3 and str(existing_row[3]).strip() and str(existing_row[3]).strip().upper() != "PENDING"
+                else str(getattr(order, "type", "SELL")).upper()
+            )
+
+            row_values = [
+                filled_time,
+                display_symbol,
+                str(qty_val),
+                exit_reason[:80],
+                f"${fill_price:.8f}",
+                order_id,
+                engine_tag,
+                f"${entry_est:.8f}",
+                f"${realized_pl:+.2f}",
+                f"{realized_pct:+.2f}%",
+                "FILLED" if order_status == "filled" else "PARTIAL_FILL",
+            ]
+
+            if existing:
+                row_number = existing[0]
+                closed_sheet.update(range_name=f"A{row_number}:K{row_number}", values=[row_values])
+                row_by_order_id[order_id] = (row_number, row_values)
+            else:
+                closed_sheet.append_row(row_values, value_input_option="USER_ENTERED")
+                row_by_order_id[order_id] = (len(all_rows) + 1, row_values)
+                all_rows.append(row_values)
+
+            order_type = str(getattr(order, "type", "")).lower()
+            if order_type in ["stop", "stop_limit"]:
+                new_fill_alerts.append(
+                    f"🛑 **STOP-LOSS FILLED ({display_symbol} | {engine_tag})**: Sold {qty_val:g} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)"
+                )
+            elif order_type == "limit":
+                new_fill_alerts.append(
+                    f"🎯 **TAKE-PROFIT FILLED ({display_symbol} | {engine_tag})**: Sold {qty_val:g} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)"
+                )
+            else:
+                new_fill_alerts.append(
+                    f"✅ **SELL FILLED ({display_symbol} | {engine_tag})**: Sold {qty_val:g} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)"
+                )
     except Exception as e:
         print(f"Closed trades sheet sync warning: {e}")
     return new_fill_alerts
@@ -965,16 +1205,13 @@ def run_equity_tranche(
                         sell_ord = api.submit_order(
                             symbol=ticker, qty=owned_qty, side='sell', type='market', time_in_force='gtc'
                         )
-                        decision = f"ARBITER EXIT [{regime_tag}]"
-                        action_taken = f"Sold {int(owned_qty)} @ ~${current_price:.2f} ({exit_label})"
-                        if closed_sheet:
-                            closed_sheet.append_row([
-                                now_str[:19], ticker, str(int(owned_qty)), exit_label[:28],
-                                f"${current_price:.2f}", str(getattr(sell_ord, 'id', 'EQ_MKT')),
-                                tranche_name, f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
-                            ])
+                        decision = f"EXIT SUBMITTED [{regime_tag}]"
+                        action_taken = f"Sell order submitted for {int(owned_qty)} @ ~${current_price:.2f} ({exit_label}); awaiting fill confirmation"
+                        record_pending_exit(
+                            sell_ord, ticker, owned_qty, exit_label, tranche_name, entry_price
+                        )
                         owned_qty = 0
-                        tranche_alerts.append(f"🔴 **[{tranche_name} | {regime_tag}] EXIT {ticker}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
+                        tranche_alerts.append(f"🟠 **[{tranche_name} | {regime_tag}] SELL ORDER SUBMITTED {ticker}**: {action_taken} (Estimated open P/L: `${unrealized_dlr:+.2f}`; not yet confirmed realized P/L)")
                     except Exception as e:
                         decision = "BEARISH"
                         action_taken = f"Sell Failed: {e}"
@@ -1105,8 +1342,12 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
     if owned_qty > 0 and macro_ok and net_gex_score > -0.05 and is_nyse_open:
         try:
             cancel_existing_orders_for_ticker(hedge_sym, active_orders)
-            api.submit_order(symbol=hedge_sym, qty=owned_qty, side="sell", type="market", time_in_force="gtc")
-            hedge_alerts.append(f"🛡️ **[TAIL_HEDGE UNWOUND] Sold {int(owned_qty)} {hedge_sym}**: Macro & GEX normalized (`{macro_reason}`).")
+            hedge_sell_order = api.submit_order(symbol=hedge_sym, qty=owned_qty, side="sell", type="market", time_in_force="gtc")
+            record_pending_exit(
+                hedge_sell_order, hedge_sym, owned_qty, "TAIL_HEDGE UNWOUND", "TAIL_HEDGE",
+                float(getattr(pos, "avg_entry_price", 0.0) or 0.0)
+            )
+            hedge_alerts.append(f"🟠 **[TAIL_HEDGE UNWIND ORDER SUBMITTED] {hedge_sym}**: Sell order for {int(owned_qty)} shares submitted; awaiting fill confirmation (`{macro_reason}`).")
             hedge_lines.append(f"• **{hedge_sym}** `[TAIL_HEDGE]`: Unwound hedge as Macro/GEX normalized.")
         except Exception as e:
             print(f"Tail hedge unwind note: {e}")
@@ -1172,16 +1413,13 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                     sell_order = api.submit_order(
                         symbol=pair, qty=owned_qty, side='sell', type='market', time_in_force='gtc'
                     )
-                    decision = f"EXIT [{regime_tag}]"
-                    action_taken = f"Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
-                    if closed_sheet:
-                        closed_sheet.append_row([
-                            now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28],
-                            f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_MKT')),
-                            "CRYPTO", f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
-                        ])
+                    decision = f"EXIT SUBMITTED [{regime_tag}]"
+                    action_taken = f"Sell order submitted for {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason}); awaiting fill confirmation"
+                    record_pending_exit(
+                        sell_order, pair, owned_qty, exit_reason, "CRYPTO", entry_price
+                    )
                     owned_qty = 0.0
-                    crypto_alerts.append(f"🪙 **[CRYPTO EXIT | {regime_tag}] {pair}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
+                    crypto_alerts.append(f"🟠 **[CRYPTO SELL ORDER SUBMITTED | {regime_tag}] {pair}**: {action_taken} (Estimated open P/L: `${unrealized_dlr:+.2f}`; not yet confirmed realized P/L)")
                 except Exception as e:
                     decision = "EXIT"
                     action_taken = f"Crypto Sell Failed: {e}"
@@ -1438,9 +1676,10 @@ def run_bot(mode="auto"):
         except Exception:
             pass
 
+    sync_position_basis_snapshot(raw_positions)
     active_orders = fetch_active_and_held_orders()
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    closed_orders_24h = api.list_orders(status='closed', after=since_24h, limit=100)
+    closed_orders_24h = api.list_orders(status='closed', after=since_24h, limit=500, nested=True)
 
     automated_exit_alerts = sync_recent_closed_sells(closed_orders_24h)
     all_alerts = list(automated_exit_alerts)

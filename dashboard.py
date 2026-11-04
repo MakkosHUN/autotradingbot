@@ -13,12 +13,27 @@ import alpaca_trade_api as tradeapi
 import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
+import json
+import re
+import requests
+from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+import alpaca_trade_api as tradeapi
+import yfinance as yf
+import gspread
+from google.oauth2.service_account import Credentials
 
 # =====================================================================
 # 1. PAGE CONFIG & MILLION-DOLLAR OBSIDIAN QUANT CSS
 # =====================================================================
 st.set_page_config(
-    page_title="AETHER QUANT v8.5 // Omega Institutional Terminal",
+    page_title="AETHER QUANT v8.6 // Omega Institutional Terminal",
     page_icon="💠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -313,7 +328,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 7-Engine Asset Pools
+# 10-Engine Asset Pools (kept in sync with bot.py v8.6)
 CORE_TICKERS = [
     'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG',
     'CAT', 'DIS', 'V', 'MA', 'UNH', 'HD', 'COST', 'ABBV', 'KO', 'PEP',
@@ -325,38 +340,57 @@ MOMENTUM_TICKERS = [
     'SMCI', 'MU', 'INTC', 'MSTR'
 ]
 CRYPTO_PAIRS = [
-    'BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'DOGE/USD', 'XRP/USD',
-    'LTC/USD', 'AAVE/USD', 'DOT/USD', 'BCH/USD', 'SHIB/USD'
+    'BTC/USD', 'ETH/USD', 'SOL/USD', 'DOGE/USD', 'XRP/USD', 'AVAX/USD',
+    'LINK/USD', 'SHIB/USD', 'DOT/USD', 'LTC/USD', 'AAVE/USD', 'BCH/USD'
+]
+MEAN_REV_TICKERS = [
+    'QQQ', 'IWM', 'DIA', 'SMH', 'XLF', 'XLE', 'XLK', 'XLV', 'XBI', 'ARKK',
+    'TLT', 'GDX', 'NKE', 'SBUX', 'PYPL', 'TGT', 'BA', 'LULU', 'DE', 'FDX'
 ]
 SMALL_CAP_TICKERS = [
     'IONQ', 'RKLB', 'AFRM', 'UPST', 'HIMS', 'ASTS', 'LUNR', 'SMR', 'OKLO', 'SERV',
     'JOBY', 'ACHR', 'CELH', 'CVNA', 'AI', 'SOUN'
 ]
-MEAN_REV_TICKERS = CORE_TICKERS + MOMENTUM_TICKERS[:10]
-TAIL_HEDGE_TICKERS = ['SH', 'PSQ', 'GLD']
-CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_PAIRS}
-ALL_ASSETS = CORE_TICKERS + MOMENTUM_TICKERS + SMALL_CAP_TICKERS + TAIL_HEDGE_TICKERS + CRYPTO_PAIRS
+TAIL_HEDGE_TICKERS = ['SH', 'PSQ']
+COMMODITY_TICKERS = ['GLD', 'SLV', 'USO']
+DEFENSE_TICKERS = ['LMT', 'RTX', 'NOC', 'GD']
+CRYPTO_NORM = {c.replace('/', ''): c for c in CRYPTO_PAIRS}
+ALL_ASSETS = (
+    CORE_TICKERS + MOMENTUM_TICKERS + MEAN_REV_TICKERS + SMALL_CAP_TICKERS
+    + TAIL_HEDGE_TICKERS + COMMODITY_TICKERS + DEFENSE_TICKERS + CRYPTO_PAIRS
+)
 
 DEFAULT_ENGINE_CONFIG = {
-    "CORE":       {"enabled": True,  "cap": 0.35, "risk_bps": 0.0050, "freq": "2x/Day (Open/Close)", "desc": "S&P 500 Blue-Chip Trend Equities"},
-    "MOMENTUM":   {"enabled": True,  "cap": 0.25, "risk_bps": 0.0040, "freq": "14x/Day (Every 30m NYSE)", "desc": "High-Beta Tech & Growth Breakouts"},
-    "CRYPTO":     {"enabled": True,  "cap": 0.15, "risk_bps": 0.0045, "freq": "48x/Day (Every 30m 24/7)", "desc": "24/7 Digital Asset Quant"},
-    "DISCOVERY":  {"enabled": True,  "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Real-Time Firehose)", "desc": "Unconstrained Market-Wide News Catalyst Hunter"},
-    "MEAN_REV":   {"enabled": False, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Intraday Snapback)", "desc": "Statistical Arbitrage / Bollinger + RSI <= 32 Bounce"},
-    "SMALL_CAP":  {"enabled": False, "cap": 0.10, "risk_bps": 0.0030, "freq": "14x/Day (Intraday Breakouts)", "desc": "Russell 2000 & High-Velocity Speculative Movers"},
-    "TAIL_HEDGE": {"enabled": True,  "cap": 0.10, "risk_bps": 0.0050, "freq": "Continuous Macro/GEX Guard", "desc": "v8.0 Options GEX & Inverse ETF Crash Shield (SH)"}
+    "CORE":        {"enabled": True, "cap": 0.35, "risk_bps": 0.0050, "freq": "2x/Day (Open/Close)", "desc": "S&P 500 Blue-Chip Trend Equities"},
+    "MOMENTUM":    {"enabled": True, "cap": 0.25, "risk_bps": 0.0040, "freq": "14x/Day (Every 30m NYSE)", "desc": "High-Beta Tech & Growth Breakouts"},
+    "CRYPTO":      {"enabled": True, "cap": 0.15, "risk_bps": 0.0045, "freq": "48x/Day (Every 30m 24/7)", "desc": "24/7 Digital Asset Quant"},
+    "DISCOVERY":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Real-Time Firehose)", "desc": "Unconstrained Market-Wide News Catalyst Agent"},
+    "MEAN_REV":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Intraday Snapback)", "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
+    "SMALL_CAP":   {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "freq": "14x/Day (Intraday Breakouts)", "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
+    "TAIL_HEDGE":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "freq": "Continuous Macro/GEX Guard", "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"},
+    "COMMODITIES": {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "freq": "Multi-Asset Defensive Tranche", "desc": "Precious Metals & Energy Hard Assets"},
+    "DEFENSE":     {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "freq": "Multi-Asset Defensive Tranche", "desc": "Aerospace & Defense Safe Haven"},
+    "PREDATOR":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0050, "freq": "Continuous Flush/Limit Trap", "desc": "Retail Stop-Loss & Liquidity Flush Trapper"}
 }
 
+
 def classify_symbol(sym):
-    s_clean = sym.replace("/", "")
+    sym = str(sym).strip().upper()
+    s_clean = sym.replace('/', '')
     if sym in TAIL_HEDGE_TICKERS:
         return "TAIL_HEDGE"
-    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM or sym.endswith("/USD") or sym.endswith("USD"):
+    if sym in CRYPTO_PAIRS or s_clean in CRYPTO_NORM or sym.endswith('/USD') or sym.endswith('USD'):
         return "CRYPTO"
+    if sym in COMMODITY_TICKERS:
+        return "COMMODITIES"
+    if sym in DEFENSE_TICKERS:
+        return "DEFENSE"
     if sym in CORE_TICKERS:
         return "CORE"
     if sym in MOMENTUM_TICKERS:
         return "MOMENTUM"
+    if sym in MEAN_REV_TICKERS:
+        return "MEAN_REV"
     if sym in SMALL_CAP_TICKERS:
         return "SMALL_CAP"
     return "DISCOVERY"
@@ -441,7 +475,7 @@ api = init_alpaca()
 spreadsheet, sheet_status = connect_gsheets()
 
 # =====================================================================
-# 3. 7-ENGINE CONFIG SYNC, LIVE TELEMETRY, GEX, RL & MONTE CARLO
+# 3. 10-ENGINE CONFIG SYNC, LIVE TELEMETRY, GEX, RL & MONTE CARLO
 # =====================================================================
 @st.cache_data(ttl=20)
 def fetch_engine_config():
@@ -587,6 +621,7 @@ def fetch_alpaca_state():
         raw_sym = str(o.symbol)
         display_sym = CRYPTO_NORM.get(raw_sym, raw_sym)
         recent_data.append({
+            "id": str(o.id),
             "submitted_at": str(o.submitted_at)[:19],
             "filled_at": str(getattr(o, 'filled_at', ''))[:19],
             "symbol": display_sym,
@@ -608,47 +643,179 @@ def fetch_alpaca_state():
 
     return is_open, account_data, positions_data, orders_data, recent_data, hist
 
-def compute_trade_post_mortems(recent_orders, positions):
-    filled = [
-        o for o in recent_orders
-        if o["status"] == "FILLED" and o["filled_avg_price"] is not None and float(o["filled_qty"] or 0) > 0
-    ]
-    filled_sorted = sorted(filled, key=lambda x: x["filled_at"] or x["submitted_at"])
+def _parse_ledger_number(value):
+    """Parse ledger cells such as '$+177.46', '+5.10%' or 'N/A'."""
+    try:
+        raw = str(value or "").strip().replace("$", "").replace(",", "").replace("+", "").replace("%", "")
+        if not raw or raw.upper() in {"N/A", "PENDING", "NONE", "NAN"}:
+            return np.nan
+        return float(raw)
+    except (TypeError, ValueError):
+        return np.nan
 
-    open_lots = {}
+
+def compute_trade_post_mortems(recent_orders, positions, closed_trades=None):
+    """Build performance attribution from confirmed Closed Trades rows.
+
+    The Alpaca-order reconstruction is retained only as a fallback when the
+    dashboard has no connected Closed Trades ledger.
+    """
     post_mortems = []
 
-    for o in filled_sorted:
-        sym = o["symbol"]
-        side = o["side"]
-        price = float(o["filled_avg_price"])
-        qty = float(o["filled_qty"])
-        ts_str = o["filled_at"] or o["submitted_at"]
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", ""))
-        except Exception:
-            ts = datetime.now()
+    if closed_trades is not None:
+        filled_order_by_id = {
+            str(o.get("id", "")): o
+            for o in recent_orders
+            if str(o.get("id", "")) and o.get("status") == "FILLED"
+        }
 
-        if side == "BUY":
-            open_lots[sym] = {"price": price, "qty": qty, "ts": ts, "tranche": o["tranche"]}
-        elif side == "SELL" and sym in open_lots:
-            lot = open_lots.pop(sym)
-            matched_qty = min(qty, lot["qty"])
-            pnl_dlr = (price - lot["price"]) * matched_qty
-            pnl_pct = ((price - lot["price"]) / lot["price"]) * 100.0 if lot["price"] > 0 else 0.0
-            hold_hrs = max(0.1, (ts - lot["ts"]).total_seconds() / 3600.0)
-            post_mortems.append({
-                "Closed At": ts_str,
-                "Engine": lot["tranche"],
-                "Ticker": sym,
-                "Qty": matched_qty,
-                "Entry ($)": round(lot["price"], 2),
-                "Exit ($)": round(price, 2),
-                "Realized P/L ($)": round(pnl_dlr, 2),
-                "Return (%)": round(pnl_pct, 2),
-                "Hold (Hrs)": round(hold_hrs, 1),
-                "Outcome": "WIN" if pnl_dlr > 0 else "LOSS"
-            })
+        # Recover hold time where both sides are present in the recent Alpaca
+        # feed. Closed-trade counts and P/L still come from the persistent ledger.
+        hold_hours_by_order_id = {}
+        recent_fills = [
+            o for o in recent_orders
+            if o.get("status") == "FILLED" and o.get("filled_avg_price") is not None
+            and float(o.get("filled_qty") or 0) > 0
+        ]
+        open_lots_for_hold = {}
+        for fill in sorted(recent_fills, key=lambda x: x.get("filled_at") or x.get("submitted_at", "")):
+            symbol = fill.get("symbol", "")
+            try:
+                fill_ts = datetime.fromisoformat(str(fill.get("filled_at") or fill.get("submitted_at", "")).replace("Z", ""))
+            except Exception:
+                fill_ts = datetime.now()
+            fill_qty = float(fill.get("filled_qty") or 0)
+            if fill.get("side") == "BUY":
+                open_lots_for_hold.setdefault(symbol, []).append({"qty": fill_qty, "ts": fill_ts})
+            elif fill.get("side") == "SELL":
+                remaining = fill_qty
+                weighted_hold = 0.0
+                matched_total = 0.0
+                lots = open_lots_for_hold.get(symbol, [])
+                while remaining > 1e-9 and lots:
+                    lot = lots[0]
+                    matched = min(remaining, lot["qty"])
+                    hold_hrs = max(0.0, (fill_ts - lot["ts"]).total_seconds() / 3600.0)
+                    weighted_hold += hold_hrs * matched
+                    matched_total += matched
+                    lot["qty"] -= matched
+                    remaining -= matched
+                    if lot["qty"] <= 1e-9:
+                        lots.pop(0)
+                if matched_total > 0 and fill.get("id"):
+                    hold_hours_by_order_id[str(fill["id"])] = weighted_hold / matched_total
+                if not lots:
+                    open_lots_for_hold.pop(symbol, None)
+
+        if not closed_trades.empty:
+            for _, row in closed_trades.iterrows():
+                order_id = str(row.get("Order ID", "")).strip()
+                status = str(row.get("Status", "")).strip().upper()
+                broker_order = filled_order_by_id.get(order_id)
+
+                # PENDING rows are deliberately excluded until Alpaca confirms a fill.
+                if status not in {"FILLED", "PARTIAL_FILL"}:
+                    # Backward compatibility: validate old 10-column ledger rows
+                    # against a currently visible, actually-filled Alpaca order.
+                    if status or broker_order is None:
+                        continue
+
+                qty = _parse_ledger_number(row.get("Qty"))
+                entry_px = _parse_ledger_number(row.get("Entry Price"))
+                exit_px = _parse_ledger_number(row.get("Fill Price"))
+                pnl = _parse_ledger_number(row.get("Realized P/L ($)"))
+                ret_pct = _parse_ledger_number(row.get("Return (%)"))
+
+                if broker_order is not None and status not in {"FILLED", "PARTIAL_FILL"}:
+                    qty = _parse_ledger_number(broker_order.get("filled_qty"))
+                    exit_px = _parse_ledger_number(broker_order.get("filled_avg_price"))
+
+                if pd.isna(qty) or qty <= 0:
+                    continue
+                if pd.isna(exit_px) or exit_px <= 0:
+                    continue
+                if not pd.isna(entry_px) and entry_px > 0:
+                    pnl = (exit_px - entry_px) * qty
+                    ret_pct = ((exit_px - entry_px) / entry_px) * 100.0
+                elif pd.isna(pnl):
+                    # We do not invent P/L when the entry basis is unavailable.
+                    continue
+                if pd.isna(pnl):
+                    continue
+
+                ticker = str(row.get("Ticker", "")).strip().upper()
+                engine = str(row.get("Engine", "")).strip().upper() or classify_symbol(ticker)
+                closed_at = str(row.get("Closed At (UTC)", "")).strip()
+                if broker_order is not None and not closed_at:
+                    closed_at = broker_order.get("filled_at") or broker_order.get("submitted_at", "")
+
+                post_mortems.append({
+                    "Closed At": closed_at,
+                    "Engine": engine,
+                    "Ticker": ticker,
+                    "Qty": float(qty),
+                    "Entry ($)": round(float(entry_px), 4) if not pd.isna(entry_px) else np.nan,
+                    "Exit ($)": round(float(exit_px), 4),
+                    "Realized P/L ($)": round(float(pnl), 2),
+                    "Return (%)": round(float(ret_pct), 2) if not pd.isna(ret_pct) else np.nan,
+                    "Hold (Hrs)": round(float(hold_hours_by_order_id.get(order_id, 0.0)), 1),
+                    "Outcome": "WIN" if pnl > 0 else "LOSS",
+                    "Order ID": order_id,
+                })
+
+    else:
+        # No Google Sheets ledger is connected: use a FIFO fallback over the
+        # available recent Alpaca fills. This is necessarily limited to that feed.
+        filled = [
+            o for o in recent_orders
+            if o["status"] == "FILLED" and o["filled_avg_price"] is not None
+            and float(o["filled_qty"] or 0) > 0
+        ]
+        filled_sorted = sorted(filled, key=lambda x: x["filled_at"] or x["submitted_at"])
+        open_lots = {}
+
+        for order in filled_sorted:
+            sym = order["symbol"]
+            side = order["side"]
+            price = float(order["filled_avg_price"])
+            qty = float(order["filled_qty"])
+            ts_str = order["filled_at"] or order["submitted_at"]
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", ""))
+            except Exception:
+                ts = datetime.now()
+
+            if side == "BUY":
+                open_lots.setdefault(sym, []).append({
+                    "price": price, "qty": qty, "ts": ts, "engine": order["tranche"]
+                })
+            elif side == "SELL":
+                remaining = qty
+                lots = open_lots.get(sym, [])
+                while remaining > 1e-9 and lots:
+                    lot = lots[0]
+                    matched_qty = min(remaining, lot["qty"])
+                    pnl = (price - lot["price"]) * matched_qty
+                    hold_hrs = max(0.0, (ts - lot["ts"]).total_seconds() / 3600.0)
+                    post_mortems.append({
+                        "Closed At": ts_str,
+                        "Engine": lot["engine"],
+                        "Ticker": sym,
+                        "Qty": matched_qty,
+                        "Entry ($)": round(lot["price"], 4),
+                        "Exit ($)": round(price, 4),
+                        "Realized P/L ($)": round(pnl, 2),
+                        "Return (%)": round(((price - lot["price"]) / lot["price"]) * 100.0, 2) if lot["price"] > 0 else 0.0,
+                        "Hold (Hrs)": round(hold_hrs, 1),
+                        "Outcome": "WIN" if pnl > 0 else "LOSS",
+                        "Order ID": order.get("id", ""),
+                    })
+                    lot["qty"] -= matched_qty
+                    remaining -= matched_qty
+                    if lot["qty"] <= 1e-9:
+                        lots.pop(0)
+                if not lots:
+                    open_lots.pop(sym, None)
 
     df_pm = pd.DataFrame(post_mortems)
     attr_rows = []
@@ -666,9 +833,9 @@ def compute_trade_post_mortems(recent_orders, positions):
         profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
         avg_win = float(wins["Realized P/L ($)"].mean()) if not wins.empty else 0.0
         avg_loss = float(losses["Realized P/L ($)"].mean()) if not losses.empty else 0.0
-        realized_net = gross_win - gross_loss
+        realized_net = float(eng_pm["Realized P/L ($)"].sum()) if not eng_pm.empty else 0.0
         unrealized_net = sum(p["unrealized_pl"] for p in eng_pos)
-        avg_hold = float(eng_pm["Hold (Hrs)"].mean()) if not eng_pm.empty else 0.0
+        avg_hold = float(eng_pm["Hold (Hrs)"].mean()) if not eng_pm.empty and "Hold (Hrs)" in eng_pm.columns else 0.0
 
         reward_sig = np.clip(((profit_factor - 1.0) * 0.25) + ((win_rate - 50.0) / 200.0), -0.35, 0.35) if n_closed > 0 else 0.0
         rl_mult = float(np.exp(reward_sig))
@@ -794,7 +961,7 @@ def parse_sheet_tab(ws):
         pass
     return pd.DataFrame()
 
-@st.cache_data(ttl=45)
+@st.cache_data(ttl=15)
 def fetch_all_sheet_logs():
     if not spreadsheet:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -899,11 +1066,11 @@ if "discord_cmd" in st.query_params:
         st.toast("🛑 Discord Command Executed: All Crypto positions liquidated!", icon="⚠️")
 
 # =====================================================================
-# 5. SIDEBAR TELEMETRY, 7-ENGINE DISPATCH & PRECISION ORDER DESK
+# 5. SIDEBAR TELEMETRY, 10-ENGINE DISPATCH & PRECISION ORDER DESK
 # =====================================================================
 with st.sidebar:
-    st.markdown("### 💠 AETHER QUANT `v8.5 OMEGA`")
-    st.caption("7-Engine Pod • L2 OBI • RL Meta • 10k Monte Carlo")
+    st.markdown("### 💠 AETHER QUANT `v8.6 OMEGA`")
+    st.caption("10-Engine Pod • L2 OBI • RL Meta • 10k Monte Carlo")
 
     @st.fragment(run_every="30s")
     def sidebar_clocks():
@@ -925,7 +1092,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.markdown("#### 🚀 7-Engine Remote Dispatch")
+    st.markdown("#### 🚀 10-Engine Remote Dispatch")
     custom_pat = st.text_input(
         "GitHub PAT Override (Optional):",
         value="",
@@ -936,7 +1103,7 @@ with st.sidebar:
 
     dispatch_choice = st.selectbox(
         "Select Engine Mode to Fire:",
-        ["auto (All Enabled Engines)", "all (Force All 7)", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge"],
+        ["auto (All Enabled Engines)", "all (Force All 10)", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "commodities", "defense", "predator"],
         index=0
     )
     if st.button("⚡ Dispatch Selected Mode Now", use_container_width=True):
@@ -1014,7 +1181,7 @@ with st.sidebar:
                 st.rerun()
 
 # =====================================================================
-# 6. PRO TECHNICAL CHART, BACKTESTER & v8.5 10,000-PATH MONTE CARLO
+# 6. PRO TECHNICAL CHART, BACKTESTER & v8.6 10,000-PATH MONTE CARLO
 # =====================================================================
 def build_pro_technical_chart(ticker, df_yf):
     df = df_yf.copy()
@@ -1456,7 +1623,7 @@ def render_live_terminal():
     macro_ok, spy_chg, vix_val, spy_30d, net_gex = fetch_macro_and_gex_telemetry()
     df_core, df_mom, df_crypto, df_disc, df_closed = fetch_all_sheet_logs()
     engine_cfg = fetch_engine_config()
-    df_attr, df_post_mortems = compute_trade_post_mortems(recent_orders, positions)
+    df_attr, df_post_mortems = compute_trade_post_mortems(recent_orders, positions, df_closed if spreadsheet and not df_closed.empty else None)
     _, bell_countdown = get_nyse_bell_countdown()
 
     equity = float(account.get('equity', 0.0))
@@ -1504,7 +1671,7 @@ def render_live_terminal():
         f'<span class="ticker-item"><span class="ticker-sym">VIX</span><span class="{"up" if vix_val<22 else "down"}">{vix_val:.2f}</span></span>',
         f'<span class="ticker-item"><span class="ticker-sym">GEX</span><span class="{"up" if net_gex>=0 else "down"}">{net_gex:+.2f}</span></span>',
         f'<span class="ticker-item"><span class="ticker-sym">95% VaR</span><span class="flat">${var_95:,.2f}</span></span>',
-        f'<span class="ticker-item"><span class="ticker-sym">ACTIVE PODS</span><span class="flat">{len(enabled_engines)}/7</span></span>'
+        f'<span class="ticker-item"><span class="ticker-sym">ACTIVE PODS</span><span class="flat">{len(enabled_engines)}/10</span></span>'
     ]
     for p in positions:
         ret_p = ((p['current_price'] - p['avg_entry_price']) / p['avg_entry_price']) * 100.0
@@ -1518,7 +1685,7 @@ def render_live_terminal():
 
     # 2. Top Institutional Header
     mkt_pill = f'<span class="hud-pill hud-emerald">● NYSE OPEN ({bell_countdown})</span>' if is_open else f'<span class="hud-pill hud-amber">● NYSE CLOSED ({bell_countdown})</span>'
-    cryp_pill = f'<span class="hud-pill hud-cyan">◈ {len(enabled_engines)}/7 ENGINES ACTIVE</span>'
+    cryp_pill = f'<span class="hud-pill hud-cyan">◈ {len(enabled_engines)}/10 ENGINES ACTIVE</span>'
     gex_pill = f'<span class="hud-pill {"hud-emerald" if net_gex>=0 else "hud-rose"}">SPY GEX: {net_gex:+.2f}</span>'
     pdt_pill = f'<span class="hud-pill hud-slate">PDT: {daytrades}/3</span>'
 
@@ -1527,8 +1694,8 @@ def render_live_terminal():
         <div class="brand-cluster">
             <div class="brand-orb"></div>
             <div>
-                <div class="brand-title">AETHER QUANTITATIVE COMMAND <span class="brand-version">v8.5 OMEGA INSTITUTIONAL</span></div>
-                <div class="brand-sub">7-Engine Pod Switchboard • Market-Wide AI Discovery Agent • v7.0 L2 OBI • v7.5 RL Meta-Allocator • v8.0 Options GEX • v8.5 10k Monte Carlo</div>
+                <div class="brand-title">AETHER QUANTITATIVE COMMAND <span class="brand-version">v8.6 OMEGA INSTITUTIONAL</span></div>
+                <div class="brand-sub">10-Engine Pod Switchboard • Market-Wide AI Discovery Agent • v7.0 L2 OBI • v7.5 RL Meta-Allocator • v8.0 Options GEX • v8.6 10k Monte Carlo</div>
             </div>
         </div>
         <div class="badge-cluster">
@@ -1607,10 +1774,10 @@ def render_live_terminal():
     </div>
     """, unsafe_allow_html=True)
 
-    # 5. Full 11-Tab Top Horizontal Navigation Bar (All 7 Engines Unlocked)
+    # 5. Full 11-Tab Top Horizontal Navigation Bar (All 10 Engines Configured)
     nav_options = [
         "🏛️ Master Overview & Attribution",
-        "🎛️ 7-Engine Pod Switchboard",
+        "🎛️ 10-Engine Pod Switchboard",
         "🛡️ Engine 1: Core Long-Term",
         "⚡ Engine 2: Momentum (14x/Day)",
         "🪙 Engine 3: Crypto AI (48x/Day)",
@@ -1640,7 +1807,7 @@ def render_live_terminal():
     # VIEW 1: MASTER HEDGE FUND OVERVIEW & RL ATTRIBUTION
     # =================================================================
     if selected_page == nav_options[0]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>7-Engine Performance Attribution & v7.5 RL Policy Meta-Allocator</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>10-Engine Performance Attribution & v7.5 RL Policy Meta-Allocator</div>', unsafe_allow_html=True)
         st.dataframe(
             df_attr,
             use_container_width=True,
@@ -1786,7 +1953,7 @@ def render_live_terminal():
                 st.info("Heatmap activates when positions are open.")
 
         with col_radar:
-            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Top Bullish Arbiter Signals Across All 7 Engines</div>', unsafe_allow_html=True)
+            st.markdown('<div class="sec-title"><span class="sec-dot"></span>Top Bullish Arbiter Signals Across All 10 Engines</div>', unsafe_allow_html=True)
             combined_logs = []
             for tag, d_f in [("CORE", df_core), ("MOMENTUM", df_mom), ("CRYPTO", df_crypto), ("DISC/SPEC", df_disc)]:
                 if not d_f.empty and "Ticker" in d_f.columns and "FinBERT Score" in d_f.columns:
@@ -1806,16 +1973,16 @@ def render_live_terminal():
                 st.info("No AI scan signals logged yet.")
 
     # =================================================================
-    # VIEW 2: 7-ENGINE MODE SWITCHBOARD
+    # VIEW 2: 10-ENGINE MODE SWITCHBOARD
     # =================================================================
     elif selected_page == nav_options[1]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>7-Engine Strategy Palette & Live Pod Switchboard</div>', unsafe_allow_html=True)
-        st.caption("Toggle any combination of the 7 trading engines ON or OFF (e.g., trade 1 specific mode, pick 3, or enable all 7). Changes sync directly to Google Sheets (`Engine Config`) and govern all automated GitHub Actions runs.")
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>10-Engine Strategy Palette & Live Pod Switchboard</div>', unsafe_allow_html=True)
+        st.caption("Toggle any combination of the 10 trading engines ON or OFF (e.g., trade one mode, pick a subset, or enable all 10). Changes sync directly to Google Sheets (`Engine Config`) and govern all automated GitHub Actions runs.")
 
         with st.form("engine_switchboard_form"):
             new_cfg = {}
-            cols_row1 = st.columns(4)
-            cols_row2 = st.columns(3)
+            cols_row1 = st.columns(5)
+            cols_row2 = st.columns(5)
             all_cols = cols_row1 + cols_row2
 
             for idx, (eng_k, eng_v) in enumerate(engine_cfg.items()):
@@ -1832,9 +1999,9 @@ def render_live_terminal():
                         "desc": eng_v["desc"]
                     }
 
-            if st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary"):
+            if st.form_submit_button("💾 Save 10-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary"):
                 if save_engine_config_to_sheet(new_cfg):
-                    st.success("✅ 7-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
+                    st.success("✅ 10-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
                     st.rerun()
 
     # =================================================================
@@ -1975,10 +2142,10 @@ def render_live_terminal():
         )
 
     # =================================================================
-    # VIEW 10: BACKTEST & v8.5 10,000-PATH MONTE CARLO SIMULATOR
+    # VIEW 10: BACKTEST & v8.6 10,000-PATH MONTE CARLO SIMULATOR
     # =================================================================
     elif selected_page == nav_options[9]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>In-Terminal Strategy Backtest & v8.5 10,000-Path Walk-Forward Monte Carlo Engine</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>In-Terminal Strategy Backtest & v8.6 10,000-Path Walk-Forward Monte Carlo Engine</div>', unsafe_allow_html=True)
         st.caption("Simulate historical Arbiter + Chandelier performance and stress-test parameter stability across 10,000 bootstrap-resampled Monte Carlo trajectories.")
 
         b_col1, b_col2, b_col3, b_col4 = st.columns(4)
@@ -2068,7 +2235,7 @@ def render_live_terminal():
 
         with mc_col2:
             if mc_res:
-                st.markdown('<div class="sec-title"><span class="sec-dot"></span>v8.5 10,000-Path Monte Carlo Fan Chart (5th–95th Percentiles)</div>', unsafe_allow_html=True)
+                st.markdown('<div class="sec-title"><span class="sec-dot"></span>v8.6 10,000-Path Monte Carlo Fan Chart (5th–95th Percentiles)</div>', unsafe_allow_html=True)
                 fig_mc = go.Figure()
                 fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p95"], line=dict(color="rgba(16,185,129,0.3)", width=1), name="95th Pct (Bull)"))
                 fig_mc.add_trace(go.Scatter(x=mc_res["steps"], y=mc_res["p05"], line=dict(color="rgba(244,63,94,0.3)", width=1), fill="tonexty", fillcolor="rgba(56,189,248,0.08)", name="5th Pct (Tail Risk)"))

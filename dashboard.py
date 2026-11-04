@@ -608,39 +608,54 @@ def fetch_alpaca_state():
 
     return is_open, account_data, positions_data, orders_data, recent_data, hist
 
-def compute_trade_post_mortems(df_closed, positions):
+def compute_trade_post_mortems(df_closed, positions, recent_orders):
     post_mortems = []
     
-    # 1. Map data directly from the Google Sheet ledger
-    if not df_closed.empty and "Engine" in df_closed.columns and "Realized P/L ($)" in df_closed.columns:
-        for _, row in df_closed.iterrows():
-            try:
-                # Clean currency strings to floats
-                pnl_str = str(row.get("Realized P/L ($)", "0")).replace("$", "").replace("+", "").replace(",", "")
-                pnl = float(pnl_str)
-                
-                ret_str = str(row.get("Return (%)", "0")).replace("%", "").replace("+", "")
-                ret = float(ret_str)
-                
+    # ATTEMPT A: Cloud Ledger (Strips whitespace for bulletproof matching)
+    if not df_closed.empty:
+        df_closed.columns = [str(c).strip() for c in df_closed.columns]
+        engine_col = next((c for c in df_closed.columns if "engine" in c.lower() or "tranche" in c.lower()), None)
+        pnl_col = next((c for c in df_closed.columns if "p/l" in c.lower() or "pnl" in c.lower() or "realized" in c.lower()), None)
+        
+        if engine_col and pnl_col:
+            for _, row in df_closed.iterrows():
+                try:
+                    pnl_str = str(row.get(pnl_col, "0")).replace("$", "").replace("+", "").replace(",", "")
+                    pnl = float(pnl_str if pnl_str.strip() else 0)
+                    
+                    engine_val = str(row.get(engine_col, "")).strip().upper()
+                    if engine_val:
+                        post_mortems.append({
+                            "Engine": engine_val,
+                            "Realized P/L ($)": pnl,
+                            "Hold (Hrs)": 24.0, 
+                            "Outcome": "WIN" if pnl > 0 else "LOSS"
+                        })
+                except Exception:
+                    continue
+
+    # ATTEMPT B: Fallback to Alpaca API if Google Sheet is empty/mismatched
+    if len(post_mortems) == 0 and recent_orders:
+        sells = [o for o in recent_orders if o['side'] == 'SELL' and o['status'] == 'FILLED']
+        buys = [o for o in recent_orders if o['side'] == 'BUY' and o['status'] == 'FILLED']
+        
+        for s in sells:
+            sym = s['symbol']
+            matching_buy = next((b for b in buys if b['symbol'] == sym and b['filled_at'] < s['filled_at']), None)
+            if matching_buy and s['filled_avg_price'] and matching_buy['filled_avg_price']:
+                qty = float(s['filled_qty'] or s['qty'])
+                pnl = (float(s['filled_avg_price']) - float(matching_buy['filled_avg_price'])) * qty
                 post_mortems.append({
-                    "Closed At": row.get("Closed At (UTC)", ""),
-                    "Engine": row.get("Engine", ""),
-                    "Ticker": row.get("Ticker", ""),
-                    "Qty": row.get("Qty", 0),
-                    "Entry ($)": row.get("Entry Price", "0"),
-                    "Exit ($)": row.get("Fill Price", "0"),
+                    "Engine": s.get('tranche', 'UNKNOWN'),
                     "Realized P/L ($)": pnl,
-                    "Return (%)": ret,
-                    "Hold (Hrs)": 24.0, 
+                    "Hold (Hrs)": 12.0,
                     "Outcome": "WIN" if pnl > 0 else "LOSS"
                 })
-            except Exception:
-                continue
                 
     df_pm = pd.DataFrame(post_mortems)
     attr_rows = []
     
-    # 2. Calculate Win Rates & RL Multipliers per Engine
+    # Calculate Win Rates & RL Multipliers per Engine
     for eng in DEFAULT_ENGINE_CONFIG.keys():
         eng_pm = df_pm[df_pm["Engine"] == eng] if not df_pm.empty else pd.DataFrame()
         eng_pos = [p for p in positions if p["tranche"] == eng]

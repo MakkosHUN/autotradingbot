@@ -1664,7 +1664,7 @@ def render_live_terminal():
         "🏛️ Master Overview & Attribution",
         "🎛️ 7-Engine Pod Switchboard",
         "🛡️ Engine 1: Core Long-Term",
-        "⚡ Engine 2: Momentum (14x/Day)",
+        "⚡ Engine 2: Momentum (14x/NYSE)",
         "🪙 Engine 3: Crypto AI (48x/Day)",
         "🛰️ Engine 4: AI Discovery Agent",
         "🧲 Engine 5: Mean-Reversion",

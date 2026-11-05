@@ -1316,9 +1316,13 @@ def render_strategy_engine_view(
     tranche_pl = sum(p['unrealized_pl'] for p in tranche_pos)
     tranche_exposure = (tranche_invested / equity) * 100 if equity > 0 else 0.0
 
-    dynamic_tickers = list(universe_tickers)
+   dynamic_tickers = list(universe_tickers)
     if not df_log.empty and "Ticker" in df_log.columns:
-        logged_syms = [str(x).strip() for x in df_log["Ticker"].unique() if str(x).strip()]
+        # Only accept valid stock tickers (1-6 uppercase letters, optional slash for crypto)
+        import re
+        logged_syms = [str(x).strip().upper() for x in df_log["Ticker"].unique() 
+                       if str(x).strip() and re.match(r'^[A-Z]{1,6}(/[A-Z]{1,4})?$', str(x).strip().upper())]
+        
         for s in reversed(logged_syms):
             if s not in dynamic_tickers:
                 dynamic_tickers.insert(0, s)

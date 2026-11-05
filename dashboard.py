@@ -1134,7 +1134,6 @@ def build_pro_technical_chart(ticker, df_yf):
         legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0.01, font=dict(size=11)),
         hovermode="x unified"
     )
-    )
     fig.update_yaxes(title_text="Price ($)", gridcolor="rgba(255,255,255,0.05)", row=1, col=1)
     fig.update_yaxes(title_text="RSI-14", range=[15, 85], gridcolor="rgba(255,255,255,0.05)", row=2, col=1)
     fig.update_xaxes(gridcolor="rgba(255,255,255,0.03)")

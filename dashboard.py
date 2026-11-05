@@ -1062,7 +1062,10 @@ if IS_ADMIN:
                     st.rerun()
             if st.button("🔥 Liquidate All to Cash", disabled=not unlock_kill, use_container_width=True):
                 if api:
-                    api.close_all_positions(cancel_orders=True)
+                    # 1. Cancel all open bracket/stop orders first to unlock shares
+                    api.cancel_all_orders()
+                    # 2. Liquidate all active positions at market price
+                    api.close_all_positions()
                     st.cache_data.clear()
                     st.error("Portfolio liquidated.")
                     st.rerun()

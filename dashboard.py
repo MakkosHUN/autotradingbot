@@ -1273,7 +1273,6 @@ elif gain_pct >= 0.005:
     # At +0.5%: Cut initial risk in half
     initial_risk = entry_px - stop_px
     stop_px = max(stop_px, entry_px - (initial_risk * 0.5))
-
                 if comp >= 0.16 and px_now >= float(row["EMA20"]) and rsi_now <= rsi_ceil:
                     stop_dist = max(sl_atr * atr_now, px_now * 0.01)
                     raw_q = (equity * (risk_bps / 100.0)) / stop_dist

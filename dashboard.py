@@ -378,6 +378,9 @@ GITHUB_PAT_SECRET = str(get_secret("GITHUB_PAT", "")).strip().strip('"').strip("
 DISCORD_WEBHOOK_SECRET = str(get_secret("DISCORD_WEBHOOK_URL", "")).strip()
 BASE_URL = "https://paper-api.alpaca.markets"
 
+# Check if admin key is present in URL (e.g. ?admin=peter123) for Read-Only Demo Mode
+IS_ADMIN = st.query_params.get("admin") == "peter123"
+
 @st.cache_resource
 def init_alpaca():
     if not API_KEY or not API_SECRET:
@@ -987,16 +990,23 @@ with st.sidebar:
         ["auto (All Enabled Engines)", "all (Force All 7)", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge"],
         index=0
     )
-    if st.button("⚡ Dispatch Selected Mode Now", use_container_width=True):
-        clean_mode = dispatch_choice.split(" ")[0]
-        trigger_github_workflow(active_pat, clean_mode)
+    
+    if st.button("⚡ Dispatch Selected Mode Now", use_container_width=True, disabled=not IS_ADMIN):
+        if IS_ADMIN:
+            clean_mode = dispatch_choice.split(" ")[0]
+            trigger_github_workflow(active_pat, clean_mode)
+        else:
+            st.sidebar.warning("⚠️ Action disabled in Demo Mode.")
 
     with st.expander("🎯 Manual Precision Order Desk"):
         st.caption("Execute an instant ATR Risk-Parity trade on any asset.")
         man_sym = st.selectbox("Select Asset:", ALL_ASSETS, index=0)
         man_risk_bps = st.slider("Risk Budget (% Equity):", 0.20, 1.00, 0.45, 0.05)
-        if st.button("🚀 Submit Risk-Parity Buy", use_container_width=True):
-            if api:
+        
+        if st.button("🚀 Submit Risk-Parity Buy", use_container_width=True, disabled=not IS_ADMIN):
+            if not IS_ADMIN:
+                st.sidebar.warning("⚠️ Order execution disabled in Demo Mode.")
+            elif api:
                 try:
                     _, acct_m, _, _, _, _ = fetch_alpaca_state()
                     eq_m = float(acct_m.get("equity", 100000.0))
@@ -1047,14 +1057,14 @@ with st.sidebar:
     sidebar_safeguards()
 
     with st.expander("🚨 Kill-Switch & Overrides"):
-        unlock_kill = st.checkbox("Arm Emergency Controls")
-        if st.button("Cancel Open Orders", disabled=not unlock_kill, use_container_width=True):
+        unlock_kill = st.checkbox("Arm Emergency Controls", disabled=not IS_ADMIN)
+        if st.button("Cancel Open Orders", disabled=not (unlock_kill and IS_ADMIN), use_container_width=True):
             if api:
                 api.cancel_all_orders()
                 st.cache_data.clear()
                 st.success("All open orders purged.")
                 st.rerun()
-        if st.button("🔥 Liquidate All to Cash", disabled=not unlock_kill, use_container_width=True):
+        if st.button("🔥 Liquidate All to Cash", disabled=not (unlock_kill and IS_ADMIN), use_container_width=True):
             if api:
                 api.close_all_positions(cancel_orders=True)
                 st.cache_data.clear()
@@ -1884,10 +1894,13 @@ def render_live_terminal():
                         "desc": eng_v["desc"]
                     }
 
-            if st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary"):
-                if save_engine_config_to_sheet(new_cfg):
-                    st.success("✅ 7-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
-                    st.rerun()
+            if st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary", disabled=not IS_ADMIN):
+                if not IS_ADMIN:
+                    st.error("⚠️ Configuration saving is disabled in Demo Mode.")
+                else:
+                    if save_engine_config_to_sheet(new_cfg):
+                        st.success("✅ 7-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
+                        st.rerun()
 
     # =================================================================
     # VIEW 3: ENGINE 1 — CORE LONG-TERM EQUITIES

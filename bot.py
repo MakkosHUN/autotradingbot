@@ -146,16 +146,16 @@ TAIL_HEDGE_POOL = ['SH', 'PSQ']
 CRYPTO_NORM = {c.replace("/", ""): c for c in CRYPTO_POOL}
 
 DEFAULT_ENGINE_CONFIG = {
-    "CORE":       {"enabled": True, "cap": 0.35, "risk_bps": 0.0050, "desc": "S&P 500 Blue-Chip Trend Equities"},
-    "MOMENTUM":   {"enabled": True, "cap": 0.25, "risk_bps": 0.0040, "desc": "High-Beta Tech & Growth Breakouts"},
-    "CRYPTO":     {"enabled": True, "cap": 0.15, "risk_bps": 0.0045, "desc": "24/7 Digital Asset Quant (48x/Day)"},
-    "DISCOVERY":  {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Unconstrained Market-Wide News Catalyst Agent"},
-    "MEAN_REV":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
-    "SMALL_CAP":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
-    "TAIL_HEDGE": {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"},
+    "CORE":        {"enabled": True, "cap": 0.35, "risk_bps": 0.0050, "desc": "S&P 500 Blue-Chip Trend Equities"},
+    "MOMENTUM":    {"enabled": True, "cap": 0.25, "risk_bps": 0.0040, "desc": "High-Beta Tech & Growth Breakouts"},
+    "CRYPTO":      {"enabled": True, "cap": 0.15, "risk_bps": 0.0045, "desc": "24/7 Digital Asset Quant (48x/Day)"},
+    "DISCOVERY":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Unconstrained Market-Wide News Catalyst Agent"},
+    "MEAN_REV":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
+    "SMALL_CAP":   {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
+    "TAIL_HEDGE":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"},
     "COMMODITIES":{"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Precious Metals & Energy Hard Assets"},
-    "DEFENSE":    {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Aerospace & Defense Safe Haven"},
-    "PREDATOR":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0050, "desc": "Engine 8: Retail Stop-Loss & Liquidity Flush Trapper"}
+    "DEFENSE":     {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Aerospace & Defense Safe Haven"},
+    "PREDATOR":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0050, "desc": "Engine 8: Retail Stop-Loss & Liquidity Flush Trapper"}
 }
 
 def load_or_init_engine_config():
@@ -1169,15 +1169,19 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
             if exit_reason:
                 try:
                     cancel_existing_orders_for_ticker(pair, active_orders)
+                    # --- FIXED: Use stop_limit with strict offset instead of blind market sell to prevent slippage ---
+                    stop_px = round(current_price * 0.992, 4)
+                    limit_px = round(current_price * 0.985, 4)
                     sell_order = api.submit_order(
-                        symbol=pair, qty=owned_qty, side='sell', type='market', time_in_force='gtc'
+                        symbol=pair, qty=owned_qty, side='sell', type='stop_limit',
+                        stop_price=stop_px, limit_price=limit_px, time_in_force='gtc'
                     )
                     decision = f"EXIT [{regime_tag}]"
-                    action_taken = f"Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
+                    action_taken = f"Stop-Limit Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
                     if closed_sheet:
                         closed_sheet.append_row([
                             now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28],
-                            f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_MKT')),
+                            f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_STPLMT')),
                             "CRYPTO", f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
                         ])
                     owned_qty = 0.0
@@ -1271,6 +1275,11 @@ def map_liquidity_clusters_and_bid(ticker, df_yf, equity, risk_bps):
     sma50 = float(df_yf["Close"].rolling(50).mean().iloc[-1])
     swing_low_20 = float(df_yf["Low"].rolling(20).min().iloc[-1])
     atr = float((df_yf["High"] - df_yf["Low"]).rolling(14).mean().iloc[-1])
+    
+    # --- FIXED: Check falling-knife velocity / recent momentum to avoid catching free-falling knives ---
+    recent_ret = float(df_yf["Close"].pct_change().iloc[-1])
+    if recent_ret < -0.06:  # Asset is crashing too violently (>6% single-day drop), skip knife-catching
+        return None
     
     clusters = []
     

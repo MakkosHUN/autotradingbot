@@ -1246,32 +1246,25 @@ def run_arbiter_backtest(tickers, period_str, sl_atr, tp_atr, risk_bps, w_news_o
                     equity_curve.append({"Date": dt_idx, "Equity": round(equity, 2)})
                     in_pos = False
                 else:
-                    gain_pct = (px_now - entry_px) / entry_px
+                        gain_pct = (px_now - entry_px) / entry_px
 
-if gain_pct >= 0.040:
-    # At +4% and above: Trail peak price closely with ATR
-    stop_px = max(stop_px, px_now - (1.0 * atr_now))
-elif gain_pct >= 0.035:
-    # At +3.5%: Lock in +2.5% guaranteed profit
-    stop_px = max(stop_px, entry_px * 1.025)
-elif gain_pct >= 0.030:
-    # At +3.0%: Lock in +2.0% guaranteed profit
-    stop_px = max(stop_px, entry_px * 1.020)
-elif gain_pct >= 0.025:
-    # At +2.5%: Lock in +1.5% guaranteed profit
-    stop_px = max(stop_px, entry_px * 1.015)
-elif gain_pct >= 0.020:
-    # At +2.0%: Lock in +1.0% guaranteed profit
-    stop_px = max(stop_px, entry_px * 1.010)
-elif gain_pct >= 0.015:
-    # At +1.5%: Lock in +0.5% guaranteed profit
-    stop_px = max(stop_px, entry_px * 1.005)
-elif gain_pct >= 0.010:
-    # At +1.0%: Move stop to exact Break-Even (Risk-Free Trade)
-    stop_px = max(stop_px, entry_px)
-elif gain_pct >= 0.005:
-                        initial_risk = entry_px - stop_px
-                        stop_px = max(stop_px, entry_px - (initial_risk * 0.5))
+                        if gain_pct >= 0.040:
+                            stop_px = max(stop_px, px_now - (1.0 * atr_now))
+                        elif gain_pct >= 0.035:
+                            stop_px = max(stop_px, entry_px * 1.025)
+                        elif gain_pct >= 0.030:
+                            stop_px = max(stop_px, entry_px * 1.020)
+                        elif gain_pct >= 0.025:
+                            stop_px = max(stop_px, entry_px * 1.015)
+                        elif gain_pct >= 0.020:
+                            stop_px = max(stop_px, entry_px * 1.010)
+                        elif gain_pct >= 0.015:
+                            stop_px = max(stop_px, entry_px * 1.005)
+                        elif gain_pct >= 0.010:
+                            stop_px = max(stop_px, entry_px)
+                        elif gain_pct >= 0.005:
+                            initial_risk = entry_px - stop_px
+                            stop_px = max(stop_px, entry_px - (initial_risk * 0.5))
 
             else:
                 if comp >= 0.16 and px_now >= float(row["EMA20"]) and rsi_now <= rsi_ceil:

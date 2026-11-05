@@ -952,124 +952,120 @@ if "discord_cmd" in st.query_params:
 # =====================================================================
 # 5. SIDEBAR TELEMETRY, 7-ENGINE DISPATCH & PRECISION ORDER DESK
 # =====================================================================
-with st.sidebar:
-    st.markdown("### 💠 AETHER QUANT `v8.5 OMEGA`")
-    st.caption("7-Engine Pod • L2 OBI • RL Meta • 10k Monte Carlo")
+if IS_ADMIN:
+    with st.sidebar:
+        st.markdown("### 💠 AETHER QUANT `v8.5 OMEGA`")
+        st.caption("7-Engine Pod • L2 OBI • RL Meta • 10k Monte Carlo")
 
-    @st.fragment(run_every="30s")
-    def sidebar_clocks():
-        ny_now = datetime.now(ZoneInfo("America/New_York"))
-        cet_now = datetime.now(ZoneInfo("Europe/Budapest"))
-        _, bell_str = get_nyse_bell_countdown()
-        st.markdown(f"""
-        <div style="background:rgba(15,23,42,0.65); border:1px solid rgba(255,255,255,0.07); border-radius:8px; padding:10px 12px; font-family:'JetBrains Mono',monospace; font-size:0.74rem; line-height:1.6;">
-            <div style="color:#94A3B8;">🗽 NYC: <span style="color:#F8FAFC; font-weight:600;">{ny_now.strftime('%H:%M:%S %p')}</span></div>
-            <div style="color:#94A3B8;">🇪🇺 CET: <span style="color:#F8FAFC; font-weight:600;">{cet_now.strftime('%H:%M:%S')}</span></div>
-            <div style="color:#38BDF8; font-weight:600; margin-top:4px;">⏱️ {bell_str}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        @st.fragment(run_every="30s")
+        def sidebar_clocks():
+            ny_now = datetime.now(ZoneInfo("America/New_York"))
+            cet_now = datetime.now(ZoneInfo("Europe/Budapest"))
+            _, bell_str = get_nyse_bell_countdown()
+            st.markdown(f"""
+            <div style="background:rgba(15,23,42,0.65); border:1px solid rgba(255,255,255,0.07); border-radius:8px; padding:10px 12px; font-family:'JetBrains Mono',monospace; font-size:0.74rem; line-height:1.6;">
+                <div style="color:#94A3B8;">🗽 NYC: <span style="color:#F8FAFC; font-weight:600;">{ny_now.strftime('%H:%M:%S %p')}</span></div>
+                <div style="color:#94A3B8;">🇪🇺 CET: <span style="color:#F8FAFC; font-weight:600;">{cet_now.strftime('%H:%M:%S')}</span></div>
+                <div style="color:#38BDF8; font-weight:600; margin-top:4px;">⏱️ {bell_str}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    sidebar_clocks()
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        sidebar_clocks()
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-    if st.button("🔄 Sync Live Telemetry", use_container_width=True, type="primary"):
-        st.cache_data.clear()
-        st.rerun()
+        if st.button("🔄 Sync Live Telemetry", use_container_width=True, type="primary"):
+            st.cache_data.clear()
+            st.rerun()
 
-    st.markdown("#### 🚀 7-Engine Remote Dispatch")
-    custom_pat = st.text_input(
-        "GitHub PAT Override (Optional):",
-        value="",
-        type="password",
-        placeholder="Uses GITHUB_PAT secret by default"
-    )
-    active_pat = custom_pat.strip() if custom_pat.strip() else GITHUB_PAT_SECRET
+        st.markdown("#### 🚀 7-Engine Remote Dispatch")
+        custom_pat = st.text_input(
+            "GitHub PAT Override (Optional):",
+            value="",
+            type="password",
+            placeholder="Uses GITHUB_PAT secret by default"
+        )
+        active_pat = custom_pat.strip() if custom_pat.strip() else GITHUB_PAT_SECRET
 
-    dispatch_choice = st.selectbox(
-        "Select Engine Mode to Fire:",
-        ["auto (All Enabled Engines)", "all (Force All 7)", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge"],
-        index=0
-    )
-    
-    if st.button("⚡ Dispatch Selected Mode Now", use_container_width=True, disabled=not IS_ADMIN):
-        if IS_ADMIN:
+        dispatch_choice = st.selectbox(
+            "Select Engine Mode to Fire:",
+            ["auto (All Enabled Engines)", "all (Force All 7)", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge"],
+            index=0
+        )
+        
+        if st.button("⚡ Dispatch Selected Mode Now", use_container_width=True):
             clean_mode = dispatch_choice.split(" ")[0]
             trigger_github_workflow(active_pat, clean_mode)
+
+        with st.expander("🎯 Manual Precision Order Desk"):
+            st.caption("Execute an instant ATR Risk-Parity trade on any asset.")
+            man_sym = st.selectbox("Select Asset:", ALL_ASSETS, index=0)
+            man_risk_bps = st.slider("Risk Budget (% Equity):", 0.20, 1.00, 0.45, 0.05)
+            
+            if st.button("🚀 Submit Risk-Parity Buy", use_container_width=True):
+                if api:
+                    try:
+                        _, acct_m, _, _, _, _ = fetch_alpaca_state()
+                        eq_m = float(acct_m.get("equity", 100000.0))
+                        df_m = fetch_ticker_history(man_sym, period="3mo")
+                        px_m = float(df_m["Close"].iloc[-1])
+                        tr_m = (df_m["High"] - df_m["Low"]).rolling(14).mean().iloc[-1]
+                        atr_m = max(float(tr_m), px_m * 0.015)
+                        is_c = "/" in man_sym
+                        stop_d = 1.2 * atr_m
+                        raw_q = (eq_m * (man_risk_bps / 100.0)) / stop_d
+                        max_q = (eq_m * 0.04) / px_m
+                        qty_m = round(min(raw_q, max_q), 4) if is_c else max(1, int(round(min(raw_q, max_q))))
+                        if is_c:
+                            api.submit_order(symbol=man_sym, qty=qty_m, side="buy", type="market", time_in_force="gtc")
+                        else:
+                            api.submit_order(
+                                symbol=man_sym, qty=qty_m, side="buy", type="market", time_in_force="gtc",
+                                order_class="bracket",
+                                take_profit={"limit_price": round(px_m + 2.8 * atr_m, 2)},
+                                stop_loss={"stop_price": round(px_m - stop_d, 2)}
+                            )
+                        st.cache_data.clear()
+                        st.success(f"Submitted Buy: {qty_m} {man_sym} @ ~${px_m:.2f}")
+                    except Exception as e:
+                        st.error(f"Order error: {e}")
+
+        st.markdown("#### 🛡️ System Safeguards")
+        if spreadsheet:
+            st.caption("🟢 **Cloud Audit & Config Ledger:** `Connected`")
         else:
-            st.sidebar.warning("⚠️ Action disabled in Demo Mode.")
+            st.warning(f"🔴 **Sheets Disconnected:** `{sheet_status}`")
 
-    with st.expander("🎯 Manual Precision Order Desk"):
-        st.caption("Execute an instant ATR Risk-Parity trade on any asset.")
-        man_sym = st.selectbox("Select Asset:", ALL_ASSETS, index=0)
-        man_risk_bps = st.slider("Risk Budget (% Equity):", 0.20, 1.00, 0.45, 0.05)
-        
-        if st.button("🚀 Submit Risk-Parity Buy", use_container_width=True, disabled=not IS_ADMIN):
-            if not IS_ADMIN:
-                st.sidebar.warning("⚠️ Order execution disabled in Demo Mode.")
-            elif api:
-                try:
-                    _, acct_m, _, _, _, _ = fetch_alpaca_state()
-                    eq_m = float(acct_m.get("equity", 100000.0))
-                    df_m = fetch_ticker_history(man_sym, period="3mo")
-                    px_m = float(df_m["Close"].iloc[-1])
-                    tr_m = (df_m["High"] - df_m["Low"]).rolling(14).mean().iloc[-1]
-                    atr_m = max(float(tr_m), px_m * 0.015)
-                    is_c = "/" in man_sym
-                    stop_d = 1.2 * atr_m
-                    raw_q = (eq_m * (man_risk_bps / 100.0)) / stop_d
-                    max_q = (eq_m * 0.04) / px_m
-                    qty_m = round(min(raw_q, max_q), 4) if is_c else max(1, int(round(min(raw_q, max_q))))
-                    if is_c:
-                        api.submit_order(symbol=man_sym, qty=qty_m, side="buy", type="market", time_in_force="gtc")
-                    else:
-                        api.submit_order(
-                            symbol=man_sym, qty=qty_m, side="buy", type="market", time_in_force="gtc",
-                            order_class="bracket",
-                            take_profit={"limit_price": round(px_m + 2.8 * atr_m, 2)},
-                            stop_loss={"stop_price": round(px_m - stop_d, 2)}
-                        )
+        @st.fragment(run_every="30s")
+        def sidebar_safeguards():
+            if api:
+                _, acct_s, _, _, _, _ = fetch_alpaca_state()
+                dt_count = int(acct_s.get('daytrade_count', 0))
+                st.progress(min(dt_count / 3.0, 1.0), text=f"FINRA PDT Shield: {dt_count} / 3 Day Trades")
+            _, spy_s, vix_s, _, gex_s = fetch_macro_and_gex_telemetry()
+            st.markdown(f"""
+            <div style="font-family:'JetBrains Mono',monospace; font-size:0.74rem; color:#94A3B8; margin-top:4px;">
+                SPY: <span style="color:{'#10B981' if spy_s>=0 else '#F43F5E'}; font-weight:600;">{spy_s:+.2f}%</span> |
+                VIX: <span style="color:{'#10B981' if vix_s<22 else '#F59E0B'}; font-weight:600;">{vix_s:.1f}</span> |
+                GEX: <span style="color:{'#10B981' if gex_s>=0 else '#F43F5E'}; font-weight:600;">{gex_s:+.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        sidebar_safeguards()
+
+        with st.expander("🚨 Kill-Switch & Overrides"):
+            unlock_kill = st.checkbox("Arm Emergency Controls")
+            if st.button("Cancel Open Orders", disabled=not unlock_kill, use_container_width=True):
+                if api:
+                    api.cancel_all_orders()
                     st.cache_data.clear()
-                    st.success(f"Submitted Buy: {qty_m} {man_sym} @ ~${px_m:.2f}")
-                except Exception as e:
-                    st.error(f"Order error: {e}")
-
-    st.markdown("#### 🛡️ System Safeguards")
-    if spreadsheet:
-        st.caption("🟢 **Cloud Audit & Config Ledger:** `Connected`")
-    else:
-        st.warning(f"🔴 **Sheets Disconnected:** `{sheet_status}`")
-
-    @st.fragment(run_every="30s")
-    def sidebar_safeguards():
-        if api:
-            _, acct_s, _, _, _, _ = fetch_alpaca_state()
-            dt_count = int(acct_s.get('daytrade_count', 0))
-            st.progress(min(dt_count / 3.0, 1.0), text=f"FINRA PDT Shield: {dt_count} / 3 Day Trades")
-        _, spy_s, vix_s, _, gex_s = fetch_macro_and_gex_telemetry()
-        st.markdown(f"""
-        <div style="font-family:'JetBrains Mono',monospace; font-size:0.74rem; color:#94A3B8; margin-top:4px;">
-            SPY: <span style="color:{'#10B981' if spy_s>=0 else '#F43F5E'}; font-weight:600;">{spy_s:+.2f}%</span> |
-            VIX: <span style="color:{'#10B981' if vix_s<22 else '#F59E0B'}; font-weight:600;">{vix_s:.1f}</span> |
-            GEX: <span style="color:{'#10B981' if gex_s>=0 else '#F43F5E'}; font-weight:600;">{gex_s:+.2f}</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-    sidebar_safeguards()
-
-    with st.expander("🚨 Kill-Switch & Overrides"):
-        unlock_kill = st.checkbox("Arm Emergency Controls", disabled=not IS_ADMIN)
-        if st.button("Cancel Open Orders", disabled=not (unlock_kill and IS_ADMIN), use_container_width=True):
-            if api:
-                api.cancel_all_orders()
-                st.cache_data.clear()
-                st.success("All open orders purged.")
-                st.rerun()
-        if st.button("🔥 Liquidate All to Cash", disabled=not (unlock_kill and IS_ADMIN), use_container_width=True):
-            if api:
-                api.close_all_positions(cancel_orders=True)
-                st.cache_data.clear()
-                st.error("Portfolio liquidated.")
-                st.rerun()
+                    st.success("All open orders purged.")
+                    st.rerun()
+            if st.button("🔥 Liquidate All to Cash", disabled=not unlock_kill, use_container_width=True):
+                if api:
+                    api.close_all_positions(cancel_orders=True)
+                    st.cache_data.clear()
+                    st.error("Portfolio liquidated.")
+                    st.rerun()
 
 # =====================================================================
 # 6. PRO TECHNICAL CHART, BACKTESTER & v8.5 10,000-PATH MONTE CARLO
@@ -1894,13 +1890,14 @@ def render_live_terminal():
                         "desc": eng_v["desc"]
                     }
 
-            if st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary", disabled=not IS_ADMIN):
-                if not IS_ADMIN:
-                    st.error("⚠️ Configuration saving is disabled in Demo Mode.")
-                else:
+            if IS_ADMIN:
+                if st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger", use_container_width=True, type="primary"):
                     if save_engine_config_to_sheet(new_cfg):
                         st.success("✅ 7-Engine configuration saved! Next scheduled or manual run will trade your exact active pod selection.")
                         st.rerun()
+            else:
+                st.form_submit_button("💾 Save 7-Engine Pod Configuration to Cloud Ledger (Disabled)", use_container_width=True, type="primary", disabled=True)
+                st.info("👀 Read-Only Mode: You are viewing a live demo. Configuration saving is disabled.")
 
     # =================================================================
     # VIEW 3: ENGINE 1 — CORE LONG-TERM EQUITIES

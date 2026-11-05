@@ -1316,7 +1316,7 @@ def render_strategy_engine_view(
     tranche_pl = sum(p['unrealized_pl'] for p in tranche_pos)
     tranche_exposure = (tranche_invested / equity) * 100 if equity > 0 else 0.0
 
-   dynamic_tickers = list(universe_tickers)
+    dynamic_tickers = list(universe_tickers)
     if not df_log.empty and "Ticker" in df_log.columns:
         # Only accept valid stock tickers (1-6 uppercase letters, optional slash for crypto)
         import re

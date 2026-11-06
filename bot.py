@@ -29,21 +29,28 @@ DASHBOARD_URL = raw_dash_url if raw_dash_url.startswith("http") else "https://sh
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-def repair_pem_key(pk_str):
-    pk_str = pk_str.replace("\\n", "\n").strip()
-    header = "-----BEGIN PRIVATE KEY-----"
-    footer = "-----END PRIVATE KEY-----"
-    if header in pk_str and footer in pk_str:
-        body = pk_str.split(header)[1].split(footer)[0]
-        clean_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', body).rstrip('=')
-        rem = len(clean_b64) % 4
-        if rem == 2:
-            clean_b64 += "=="
-        elif rem == 3:
-            clean_b64 += "="
-        lines = [clean_b64[i:i+64] for i in range(0, len(clean_b64), 64)]
-        return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
-    return pk_str
+import logging
+
+# Configure professional logging at the top of your file
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Standardized Google Auth
+CREDENTIALS_FILE = "service_account.json"
+if os.path.exists(CREDENTIALS_FILE):
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    try:
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open("Auto-Trading Bot Log")
+    except Exception as e:
+        logging.error(f"Google Sheets Auth Error: {e}")
+        spreadsheet = None
+else:
+    logging.warning("No service_account.json found. Running without Google Sheets logging.")
+    spreadsheet = None
 
 raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}").replace("\xa0", " ").replace("\u00a0", " ").strip()
 try:
@@ -178,8 +185,8 @@ def load_or_init_engine_config():
                 try:
                     cfg[eng]["cap"] = float(r[2])
                     cfg[eng]["risk_bps"] = float(r[3])
-                except Exception:
-                    pass
+                except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
     except Exception as e:
         print(f"Engine config read warning: {e}")
     return cfg
@@ -276,8 +283,8 @@ def get_orderbook_imbalance(ticker):
             ask_sz = float(getattr(q, "as", 0.0) or getattr(q, "ask_size", 0.0) or 1.0)
             if (bid_sz + ask_sz) > 0:
                 return round((bid_sz - ask_sz) / (bid_sz + ask_sz), 3)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
     return 0.0
 
 def check_macro_gex_and_circuit_breaker(equity, last_equity):
@@ -334,8 +341,8 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
                 sym = str(q.get("symbol", "")).strip().upper()
                 if sym and sym.isalpha() and len(sym) <= 5 and sym not in known_static and sym not in discovered_pool:
                     discovered_pool.insert(0, sym)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
 
     try:
         batch_query = ",".join(discovered_pool[:25])
@@ -576,18 +583,28 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
 def compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult, risk_bps=0.0045, max_notional_pct=0.040, is_crypto=False):
     if price <= 0 or equity <= 0:
         return 0
-    safe_atr = max(atr, price * 0.01)
-    stop_distance_dollars = max(sl_atr_mult * safe_atr, price * 0.008)
-    dollar_risk_budget = equity * risk_bps
+        
+    # Convert to strict Decimals for institutional precision
+    d_equity = Decimal(str(equity))
+    d_price = Decimal(str(price))
+    d_atr = Decimal(str(atr))
+    d_risk_bps = Decimal(str(risk_bps))
+    d_max_not = Decimal(str(max_notional_pct))
+    
+    safe_atr = max(d_atr, d_price * Decimal('0.01'))
+    stop_distance_dollars = max(Decimal(str(sl_atr_mult)) * safe_atr, d_price * Decimal('0.008'))
+    dollar_risk_budget = d_equity * d_risk_bps
 
     raw_qty = dollar_risk_budget / stop_distance_dollars
-    max_qty_by_notional = (equity * max_notional_pct) / price
+    max_qty_by_notional = (d_equity * d_max_not) / d_price
     target_qty = min(raw_qty, max_qty_by_notional)
 
     if is_crypto:
-        return round(max(0.0001, target_qty), 4)
-    return max(1, int(round(target_qty)))
-
+        # Crypto allows fractional quantities down to 4 decimals
+        return float(max(Decimal('0.0001'), target_qty).quantize(Decimal('0.0001'), rounding=ROUND_DOWN))
+    
+    # Equities require whole numbers
+    return max(1, int(target_qty.quantize(Decimal('1'), rounding=ROUND_DOWN)))
 def check_correlation_and_exposure_guard(candidate, tranche_name, raw_positions, equity, candidate_returns, held_returns_map, dynamic_caps):
     tranche_invested = sum(
         float(p.market_value) for p in raw_positions
@@ -633,12 +650,18 @@ def send_discord_alert(message):
     except Exception as e:
         print(f"Discord alert error: {e}")
 
-print("Loading ProsusAI/finbert financial AI model once into shared RAM...")
+# Import torch at the top of your file
+import torch
+
+print("Loading ProsusAI/finbert financial AI model...")
+device_id = 0 if torch.cuda.is_available() else -1
+
 finbert = pipeline(
     "sentiment-analysis",
     model="ProsusAI/finbert",
     tokenizer="ProsusAI/finbert",
-    top_k=None
+    top_k=None,
+    device=device_id
 )
 
 def get_fresh_dual_news(ticker):
@@ -666,8 +689,8 @@ def get_fresh_dual_news(ticker):
             else:
                 seen.add(title.lower())
                 headlines.append(title)
-    except Exception:
-        pass
+   except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
 
     yf_sym = to_yf_symbol(ticker)
     try:
@@ -682,8 +705,8 @@ def get_fresh_dual_news(ticker):
                 if title and title.lower() not in seen:
                     seen.add(title.lower())
                     headlines.append(title)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
 
     if not headlines and older_backup:
         headlines = older_backup[:5]
@@ -714,11 +737,26 @@ def get_finbert_sentiment(headlines):
     return round(sum(weighted_scores) / len(weighted_scores), 3)
 
 def get_technicals_and_atr(ticker):
-    yf_sym = to_yf_symbol(ticker)
-    df = yf.Ticker(yf_sym).history(period="1y")
-    if df.empty or len(df) < 25:
-        return None
-    close = df['Close'].dropna()
+    try:
+        # Request native data directly from Alpaca
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=365)).strftime('%Y-%m-%d')
+        
+        # Check if crypto or equity for proper data routing
+        if "/" in ticker or ticker in CRYPTO_POOL:
+            bars = api.get_crypto_bars(ticker, tradeapi.TimeFrame.Day, start=start).df
+        else:
+            bars = api.get_bars(ticker, tradeapi.TimeFrame.Day, start=start).df
+            
+        if bars.empty or len(bars) < 25:
+            return None
+            
+        # Standardize columns to match your existing logic
+        df = bars.copy()
+        if 'close' in df.columns:
+            df.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'volume': 'Volume'}, inplace=True)
+            
+        close = df['Close'].dropna()
     if len(close) < 25:
         return None
     current_price = float(close.iloc[-1])
@@ -811,8 +849,8 @@ def has_upcoming_earnings_48h(ticker):
                     val = val.date()
                 if hasattr(val, 'year') and abs((val - now_date).days) <= 2:
                     return True
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
     return False
 
 def fetch_active_and_held_orders():
@@ -1061,7 +1099,11 @@ def run_equity_tranche(
                         )
                         decision = f"BULLISH [{regime_tag}]"
                         action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}"
-                        owned_qty = qty_to_buy
+                        api.submit_order(...)
+decision = f"BULLISH [{regime_tag}]"
+action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f}..."
+owned_qty = qty_to_buy  # <-- DELETE THIS LINE
+held_returns_map[ticker] = tech["returns_60d"]
                         if tech and "returns_60d" in tech:
                             held_returns_map[ticker] = tech["returns_60d"]
                         tranche_alerts.append(f"🟢 **[{tranche_name} | {regime_tag}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, OBI: `{obi:+.2f}`, Comp: `{arb['composite']:+.2f}`)")
@@ -1259,7 +1301,11 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                             )
                             decision = f"BULLISH [{regime_tag}]"
                             action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | OBI {obi:+.2f} | TP +{dyn_tp}%)"
-                            owned_qty = qty_to_buy
+                            api.submit_order(...)
+decision = f"BULLISH [{regime_tag}]"
+action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f}..."
+owned_qty = qty_to_buy  # <-- DELETE THIS LINE
+held_returns_map[ticker] = tech["returns_60d"]
                             held_returns_map[pair] = tech["returns_60d"]
                             crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")
                         except Exception as e:
@@ -1471,8 +1517,8 @@ def run_bot(mode="auto"):
             df_h = yf.Ticker(to_yf_symbol(disp_sym)).history(period="3mo")
             if not df_h.empty and len(df_h) >= 20:
                 held_returns_map[disp_sym] = df_h["Close"].pct_change().dropna().tail(60)
-        except Exception:
-            pass
+        except Exception as e:
+        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
 
     active_orders = fetch_active_and_held_orders()
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()

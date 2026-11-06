@@ -5,8 +5,10 @@ import time
 import math
 import argparse
 import requests
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from decimal import Decimal, ROUND_DOWN
 import alpaca_trade_api as tradeapi
 import yfinance as yf
 import pandas as pd
@@ -14,6 +16,7 @@ import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 from transformers import pipeline
+import torch
 
 # =====================================================================
 # 1. INITIALIZE CONNECTIONS & SANITIZED CREDENTIALS
@@ -23,15 +26,12 @@ API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "").strip()
 BASE_URL = "https://paper-api.alpaca.markets"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
-# Fallback to https://share.streamlit.io if DASHBOARD_URL secret is empty
 raw_dash_url = os.environ.get("DASHBOARD_URL", "").strip().rstrip("/")
 DASHBOARD_URL = raw_dash_url if raw_dash_url.startswith("http") else "https://share.streamlit.io"
 
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
-import logging
-
-# Configure professional logging at the top of your file
+# Configure professional logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Standardized Google Auth
@@ -50,35 +50,6 @@ if os.path.exists(CREDENTIALS_FILE):
         spreadsheet = None
 else:
     logging.warning("No service_account.json found. Running without Google Sheets logging.")
-    spreadsheet = None
-
-raw_creds = os.environ.get("GOOGLE_CREDENTIALS", "{}").replace("\xa0", " ").replace("\u00a0", " ").strip()
-try:
-    creds_json = json.loads(raw_creds, strict=False)
-except json.JSONDecodeError:
-    try:
-        import tomllib
-        parsed = tomllib.loads(raw_creds)
-        creds_json = parsed.get("GOOGLE_CREDENTIALS", parsed)
-    except Exception:
-        creds_json = {}
-
-if "private_key" in creds_json:
-    creds_json["private_key"] = repair_pem_key(creds_json["private_key"])
-
-if creds_json:
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    try:
-        creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-        gc = gspread.authorize(creds)
-        spreadsheet = gc.open("Auto-Trading Bot Log")
-    except Exception as e:
-        print(f"Google Sheets Auth Error: {e}")
-        spreadsheet = None
-else:
     spreadsheet = None
 
 def get_or_create_worksheet(sh, title, headers):
@@ -120,7 +91,6 @@ MOMENTUM_POOL = [
     'SNOW', 'CRWD', 'PANW', 'DKNG', 'ROKU', 'HOOD', 'MARA', 'RIOT', 'SOFI', 'ARM',
     'SMCI', 'MU', 'INTC', 'MSTR'
 ]
-# --- UPGRADED CRYPTO UNIVERSE (CLEAN YF/ALPACA PAIRS) ---
 CRYPTO_MAJORS = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"]
 CRYPTO_ALTS = [
     "XRP/USD", "AVAX/USD", "LINK/USD", "SHIB/USD",
@@ -128,7 +98,6 @@ CRYPTO_ALTS = [
 ]
 CRYPTO_POOL = CRYPTO_MAJORS + CRYPTO_ALTS
 
-# Disjoint Mean-Reversion Pool (Sector ETFs & Oversold Value Pullbacks)
 MEAN_REV_POOL = [
     'QQQ', 'IWM', 'DIA', 'SMH', 'XLF', 'XLE', 'XLK', 'XLV', 'XBI', 'ARKK',
     'TLT', 'GDX', 'NKE', 'SBUX', 'PYPL', 'TGT', 'BA', 'LULU', 'DE', 'FDX'
@@ -137,12 +106,9 @@ SMALL_CAP_POOL = [
     'IONQ', 'RKLB', 'AFRM', 'UPST', 'HIMS', 'ASTS', 'LUNR', 'SMR', 'OKLO', 'SERV',
     'JOBY', 'ACHR', 'CELH', 'CVNA', 'AI', 'SOUN'
 ]
-
-# --- NEW: MULTI-ASSET DEFENSIVE TRANCHES ---
 COMMODITY_POOL = ['GLD', 'SLV', 'USO']
 DEFENSE_POOL = ['LMT', 'RTX', 'NOC', 'GD']
 
-# Broad Market Radar for Engine 4 Discovery Agent (Removed Defense overlaps)
 DISCOVERY_RADAR_POOL = [
     'DELL', 'ANET', 'VRT', 'CEG', 'VST', 'AXON', 'APP', 'TTD', 'NET', 'DDOG',
     'ZS', 'MDB', 'TEAM', 'NOW', 'WDAY', 'FTNT', 'GILD', 'AMGN', 'REGN', 'VRTX',
@@ -185,10 +151,10 @@ def load_or_init_engine_config():
                 try:
                     cfg[eng]["cap"] = float(r[2])
                     cfg[eng]["risk_bps"] = float(r[3])
-                except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"Engine config read warning: {e}")
+        logging.warning(f"Engine config read warning: {e}")
     return cfg
 
 def to_yf_symbol(ticker):
@@ -252,11 +218,10 @@ def compute_rl_meta_allocation(engine_cfg, net_gex_score=0.0):
                         mult = float(np.exp(r_score * 0.6))
                         adjusted_caps[eng] = round(float(np.clip(base_c * mult, 0.05, 0.45)), 3)
         except Exception as e:
-            print(f"RL Meta-Allocator note: {e}")
+            logging.warning(f"RL Meta-Allocator note: {e}")
 
-    # --- NEW: DEFENSIVE SHIFT BASED ON GEX ---
     if net_gex_score <= -0.15:
-        print(f"[RL META] GEX {net_gex_score:.2f} <= -0.15. Shifting capital defensively.")
+        logging.info(f"[RL META] GEX {net_gex_score:.2f} <= -0.15. Shifting capital defensively.")
         if "MOMENTUM" in adjusted_caps: adjusted_caps["MOMENTUM"] = round(max(0.05, adjusted_caps["MOMENTUM"] * 0.5), 3)
         if "SMALL_CAP" in adjusted_caps: adjusted_caps["SMALL_CAP"] = round(max(0.05, adjusted_caps["SMALL_CAP"] * 0.5), 3)
         if "CORE" in adjusted_caps: adjusted_caps["CORE"] = round(max(0.05, adjusted_caps["CORE"] * 0.7), 3)
@@ -265,7 +230,7 @@ def compute_rl_meta_allocation(engine_cfg, net_gex_score=0.0):
         for sh in safe_havens:
             adjusted_caps[sh] = round(min(0.50, adjusted_caps[sh] * 1.5), 3)
 
-    print(f"[v8.6 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
+    logging.info(f"[v8.6 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
     return adjusted_caps
 
 # =====================================================================
@@ -284,7 +249,7 @@ def get_orderbook_imbalance(ticker):
             if (bid_sz + ask_sz) > 0:
                 return round((bid_sz - ask_sz) / (bid_sz + ask_sz), 3)
     except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+        logging.warning(f"Error getting OBI for {ticker}: {e}")
     return 0.0
 
 def check_macro_gex_and_circuit_breaker(equity, last_equity):
@@ -313,7 +278,7 @@ def check_macro_gex_and_circuit_breaker(equity, last_equity):
             if (call_oi + put_oi) > 0:
                 net_gex_score = round((call_oi - put_oi) / (call_oi + put_oi), 3)
     except Exception as e:
-        print(f"GEX/Macro sensor warning: {e}")
+        logging.warning(f"GEX/Macro sensor warning: {e}")
 
     gex_lbl = f"GEX {net_gex_score:+.2f}"
     if spy_change <= -0.015:
@@ -342,7 +307,7 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
                 if sym and sym.isalpha() and len(sym) <= 5 and sym not in known_static and sym not in discovered_pool:
                     discovered_pool.insert(0, sym)
     except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+        logging.warning(f"Discovery screener error: {e}")
 
     try:
         batch_query = ",".join(discovered_pool[:25])
@@ -353,7 +318,7 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
                 if s_clean and s_clean.isalpha() and len(s_clean) <= 5 and s_clean not in known_static and s_clean not in discovered_pool:
                     discovered_pool.insert(0, s_clean)
     except Exception as e:
-        print(f"Discovery news batch note: {e}")
+        logging.warning(f"Discovery news batch note: {e}")
 
     screened = screen_top_candidates(discovered_pool[:45], top_n=top_n, owned_symbols=owned_symbols, mode="momentum")
     verified = []
@@ -365,7 +330,7 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
         except Exception:
             continue
 
-    print(f"[AI DISCOVERY AGENT] Selected {len(verified)} unconstrained market-wide catalysts: {verified}")
+    logging.info(f"[AI DISCOVERY AGENT] Selected {len(verified)} unconstrained market-wide catalysts: {verified}")
     return verified
 
 def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=None):
@@ -413,7 +378,7 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
             except Exception:
                 continue
     except Exception as e:
-        print(f"Screener batch warning ({mode}): {e}")
+        logging.warning(f"Screener batch warning ({mode}): {e}")
 
     scored.sort(key=lambda x: x[0], reverse=True)
     selected = [t for _, t in scored[:slots_left]]
@@ -425,7 +390,6 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
             selected.append(t)
 
     final_list = always_include + selected
-    print(f"[AI SCREENER - {mode.upper()}] Filtered {len(pool)} pool -> {len(final_list)} active candidates: {final_list}")
     return final_list
 
 # =====================================================================
@@ -434,15 +398,9 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
 def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05, base_exit_max=-0.15, strategy_mode="core"):
     if tech is None:
         return {
-            "regime": "NO-TECH",
-            "w_news": 1.0,
-            "w_tech": 0.0,
-            "composite": finbert_score,
-            "tp_adj": 1.0,
-            "rsi_max": 72.0,
-            "buy_signal": False,
-            "arbiter_exit_reason": None,
-            "fee_block_reason": None
+            "regime": "NO-TECH", "w_news": 1.0, "w_tech": 0.0,
+            "composite": finbert_score, "tp_adj": 1.0, "rsi_max": 72.0,
+            "buy_signal": False, "arbiter_exit_reason": None, "fee_block_reason": None
         }
 
     rel_vol = tech.get("rel_vol", 1.0)
@@ -463,101 +421,59 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
     else:
         tech_score -= 0.30
 
-    if ema20 > sma50:
-        tech_score += 0.15
-    else:
-        tech_score -= 0.15
+    if ema20 > sma50: tech_score += 0.15
+    else: tech_score -= 0.15
 
-    if price >= vwap5 and (mfm > 0.05 or obi_score > 0.10):
-        tech_score += 0.20
-    elif price < vwap5 and (mfm < -0.15 or obi_score < -0.15):
-        tech_score -= 0.20
+    if price >= vwap5 and (mfm > 0.05 or obi_score > 0.10): tech_score += 0.20
+    elif price < vwap5 and (mfm < -0.15 or obi_score < -0.15): tech_score -= 0.20
 
     tech_score += (obi_score * 0.20)
 
-    if rsi <= 32.0:
-        tech_score += 0.45
-    elif 45.0 <= rsi <= 66.0:
-        tech_score += 0.15
-    elif rsi >= 76.0:
-        tech_score -= 0.45
+    if rsi <= 32.0: tech_score += 0.45
+    elif 45.0 <= rsi <= 66.0: tech_score += 0.15
+    elif rsi >= 76.0: tech_score -= 0.45
 
     tech_score = max(-1.0, min(1.0, tech_score))
     abs_news = abs(finbert_score)
 
     if strategy_mode == "mean_rev":
         regime = "MEAN-REV"
-        w_news, w_tech = 0.25, 0.75
-        tp_adj = 0.75
-        rsi_max = 36.0
+        w_news, w_tech, tp_adj, rsi_max = 0.25, 0.75, 0.75, 36.0
         composite = round((w_news * finbert_score) + (w_tech * tech_score), 3)
         buy_signal = (rsi <= 33.0 or price <= bb_low * 1.005) and finbert_score > -0.30 and obi_score >= -0.25
         arbiter_exit_reason = f"Mean-Rev Snapback Target (RSI {rsi:.1f})" if rsi >= 58.0 else None
     else:
         if abs_news >= 0.65 or (abs_news >= 0.45 and rel_vol >= 1.8):
-            regime = "NEWS-90/10"
-            w_news, w_tech = 0.90, 0.10
-            tp_adj = 1.45
-            rsi_max = 84.0
+            regime, w_news, w_tech, tp_adj, rsi_max = "NEWS-90/10", 0.90, 0.10, 1.45, 84.0
         elif abs_news >= 0.20 or rel_vol >= 1.35:
-            regime = "HYBRID-50/50"
-            w_news, w_tech = 0.50, 0.50
-            tp_adj = 1.00
-            rsi_max = 73.0
+            regime, w_news, w_tech, tp_adj, rsi_max = "HYBRID-50/50", 0.50, 0.50, 1.00, 73.0
         else:
-            regime = "TECH-10/90"
-            w_news, w_tech = 0.10, 0.90
-            tp_adj = 0.85
-            rsi_max = 69.0
+            regime, w_news, w_tech, tp_adj, rsi_max = "TECH-10/90", 0.10, 0.90, 0.85, 69.0
 
         composite = round((w_news * finbert_score) + (w_tech * tech_score), 3)
-
         buy_signal = False
+        
         if regime == "NEWS-90/10" and finbert_score >= max(base_buy_min, 0.40) and price >= ema20 * 0.985 and obi_score >= -0.30:
             buy_signal = True
         elif regime == "HYBRID-50/50" and composite >= max(base_buy_min, 0.12) and price >= ema20 and price >= vwap5 * 0.99:
             buy_signal = True
-        elif regime == "TECH-10/90" and (
-            (composite >= 0.22 and price > ema9 > ema20 and price >= vwap5 and obi_score >= -0.10)
-            or (rsi <= 32.0 and finbert_score > -0.15)
-        ):
+        elif regime == "TECH-10/90" and ((composite >= 0.22 and price > ema9 > ema20 and price >= vwap5 and obi_score >= -0.10) or (rsi <= 32.0 and finbert_score > -0.15)):
             buy_signal = True
 
-        # Anti-Churn Crypto Arbiter
         if strategy_mode == "crypto":
-            is_crypto_oversold_snipe = (
-                (rsi <= 32.0 or price <= bb_low * 1.005)
-                and obi_score >= -0.02
-                and finbert_score > -0.15
-            )
-            is_crypto_quiet_breakout = (
-                price > ema20
-                and 42.0 <= rsi <= 72.0
-                and obi_score >= 0.00
-                and finbert_score >= 0.00
-            )
+            is_crypto_oversold_snipe = ((rsi <= 32.0 or price <= bb_low * 1.005) and obi_score >= -0.02 and finbert_score > -0.15)
+            is_crypto_quiet_breakout = (price > ema20 and 42.0 <= rsi <= 72.0 and obi_score >= 0.00 and finbert_score >= 0.00)
             if is_crypto_oversold_snipe:
-                regime = "CRYPTO-SNIPE"
-                composite = round(max(composite, 0.45), 3)
-                tp_adj = 0.85
-                rsi_max = 75.0
-                buy_signal = True
+                regime, composite, tp_adj, rsi_max, buy_signal = "CRYPTO-SNIPE", round(max(composite, 0.45), 3), 0.85, 75.0, True
             elif is_crypto_quiet_breakout and not buy_signal:
-                regime = "TECH-10/90"
-                composite = round(max(composite, 0.35), 3)
-                buy_signal = True
+                regime, composite, buy_signal = "TECH-10/90", round(max(composite, 0.35), 3), True
 
         arbiter_exit_reason = None
-        if regime == "CRYPTO-SNIPE" and rsi >= 60.0:
-            arbiter_exit_reason = f"Crypto Oversold Snapback Target (RSI {rsi:.1f})"
-        elif regime == "NEWS-90/10" and finbert_score <= base_exit_max:
-            arbiter_exit_reason = f"Arbiter 90/10 News Reversal ({finbert_score:+.3f})"
-        elif regime == "TECH-10/90" and rsi >= 74.0 and finbert_score < 0.25:
-            arbiter_exit_reason = f"Arbiter 10/90 Tech Overbought Profit-Take (RSI {rsi:.1f})"
-        elif regime == "HYBRID-50/50" and composite <= base_exit_max and price < ema9:
-            arbiter_exit_reason = f"Arbiter 50/50 Hybrid Breakdown (Comp {composite:+.3f})"
+        if regime == "CRYPTO-SNIPE" and rsi >= 60.0: arbiter_exit_reason = f"Crypto Oversold Snapback Target (RSI {rsi:.1f})"
+        elif regime == "NEWS-90/10" and finbert_score <= base_exit_max: arbiter_exit_reason = f"Arbiter 90/10 News Reversal ({finbert_score:+.3f})"
+        elif regime == "TECH-10/90" and rsi >= 74.0 and finbert_score < 0.25: arbiter_exit_reason = f"Arbiter 10/90 Tech Overbought Profit-Take (RSI {rsi:.1f})"
+        elif regime == "HYBRID-50/50" and composite <= base_exit_max and price < ema9: arbiter_exit_reason = f"Arbiter 50/50 Hybrid Breakdown (Comp {composite:+.3f})"
 
-    # --- NEW: Slippage & Fee-Aware Net Alpha Filter ---
     fee_block_reason = None
     fee_hurdle = 0.50 if strategy_mode == "crypto" else 0.20
     if price > 0:
@@ -568,23 +484,16 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
             fee_block_reason = f"Fee Hurdle: Alpha {expected_alpha_pct:.2f}% < {fee_hurdle}%"
 
     return {
-        "regime": regime,
-        "w_news": w_news,
-        "w_tech": w_tech,
-        "tech_score": round(tech_score, 3),
-        "composite": composite,
-        "tp_adj": tp_adj,
-        "rsi_max": rsi_max,
-        "buy_signal": buy_signal,
-        "arbiter_exit_reason": arbiter_exit_reason,
-        "fee_block_reason": fee_block_reason
+        "regime": regime, "w_news": w_news, "w_tech": w_tech,
+        "tech_score": round(tech_score, 3), "composite": composite,
+        "tp_adj": tp_adj, "rsi_max": rsi_max, "buy_signal": buy_signal,
+        "arbiter_exit_reason": arbiter_exit_reason, "fee_block_reason": fee_block_reason
     }
 
 def compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult, risk_bps=0.0045, max_notional_pct=0.040, is_crypto=False):
     if price <= 0 or equity <= 0:
         return 0
         
-    # Convert to strict Decimals for institutional precision
     d_equity = Decimal(str(equity))
     d_price = Decimal(str(price))
     d_atr = Decimal(str(atr))
@@ -600,11 +509,10 @@ def compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult, risk_bps=0.0045
     target_qty = min(raw_qty, max_qty_by_notional)
 
     if is_crypto:
-        # Crypto allows fractional quantities down to 4 decimals
         return float(max(Decimal('0.0001'), target_qty).quantize(Decimal('0.0001'), rounding=ROUND_DOWN))
     
-    # Equities require whole numbers
     return max(1, int(target_qty.quantize(Decimal('1'), rounding=ROUND_DOWN)))
+
 def check_correlation_and_exposure_guard(candidate, tranche_name, raw_positions, equity, candidate_returns, held_returns_map, dynamic_caps):
     tranche_invested = sum(
         float(p.market_value) for p in raw_positions
@@ -623,7 +531,6 @@ def check_correlation_and_exposure_guard(candidate, tranche_name, raw_positions,
                 corr_val = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
                 if not pd.isna(corr_val) and corr_val > 0.82:
                     return False, f"High Corr {corr_val:.2f} w/ {held_sym}"
-
     return True, "OK"
 
 # =====================================================================
@@ -648,12 +555,9 @@ def send_discord_alert(message):
             if chunk:
                 requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
     except Exception as e:
-        print(f"Discord alert error: {e}")
+        logging.warning(f"Discord alert error: {e}")
 
-# Import torch at the top of your file
-import torch
-
-print("Loading ProsusAI/finbert financial AI model...")
+logging.info("Loading ProsusAI/finbert financial AI model...")
 device_id = 0 if torch.cuda.is_available() else -1
 
 finbert = pipeline(
@@ -689,8 +593,8 @@ def get_fresh_dual_news(ticker):
             else:
                 seen.add(title.lower())
                 headlines.append(title)
-   except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+    except Exception as e:
+        logging.warning(f"Alpaca news error for {ticker}: {e}")
 
     yf_sym = to_yf_symbol(ticker)
     try:
@@ -706,7 +610,7 @@ def get_fresh_dual_news(ticker):
                     seen.add(title.lower())
                     headlines.append(title)
     except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+        logging.warning(f"YFinance news error for {ticker}: {e}")
 
     if not headlines and older_backup:
         headlines = older_backup[:5]
@@ -738,11 +642,9 @@ def get_finbert_sentiment(headlines):
 
 def get_technicals_and_atr(ticker):
     try:
-        # Request native data directly from Alpaca
         now = datetime.now(timezone.utc)
         start = (now - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        # Check if crypto or equity for proper data routing
         if "/" in ticker or ticker in CRYPTO_POOL:
             bars = api.get_crypto_bars(ticker, tradeapi.TimeFrame.Day, start=start).df
         else:
@@ -751,65 +653,59 @@ def get_technicals_and_atr(ticker):
         if bars.empty or len(bars) < 25:
             return None
             
-        # Standardize columns to match your existing logic
         df = bars.copy()
         if 'close' in df.columns:
             df.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'volume': 'Volume'}, inplace=True)
             
         close = df['Close'].dropna()
-    if len(close) < 25:
+        if len(close) < 25:
+            return None
+            
+        current_price = float(close.iloc[-1])
+        sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float(close.mean())
+        sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float(close.mean())
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema9 = float(close.ewm(span=9, adjust=False).mean().iloc[-1])
+        std20 = float(close.rolling(20).std().iloc[-1]) if len(close) >= 20 else (current_price * 0.02)
+        bb_low = ema20 - (2.0 * std20)
+
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        rs = gain / loss
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
+
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        atr_series = true_range.rolling(14).mean()
+        atr14 = float(atr_series.iloc[-1]) if not atr_series.empty and not pd.isna(atr_series.iloc[-1]) else (current_price * 0.02)
+
+        vol_series = df['Volume'] if 'Volume' in df.columns else pd.Series([1.0] * len(df), index=df.index)
+        vol_20d = float(vol_series.tail(20).mean()) if len(vol_series) >= 5 and float(vol_series.tail(20).mean()) > 0 else 1.0
+        vol_now = float(vol_series.iloc[-1]) if len(vol_series) > 0 else 1.0
+        rel_vol = round(vol_now / vol_20d, 2) if vol_20d > 0 else 1.0
+
+        recent5 = df.tail(5)
+        typ_p = (recent5['High'] + recent5['Low'] + recent5['Close']) / 3.0
+        vol_sum = float(recent5['Volume'].sum()) if 'Volume' in recent5.columns else 0.0
+        vwap5 = float((typ_p * recent5['Volume']).sum() / vol_sum) if vol_sum > 0 else current_price
+
+        hl_range = float(df['High'].iloc[-1] - df['Low'].iloc[-1])
+        mfm = float(((current_price - float(df['Low'].iloc[-1])) - (float(df['High'].iloc[-1]) - current_price)) / hl_range) if hl_range > 0 else 0.0
+        returns_60d = close.pct_change().dropna().tail(60)
+
+        return {
+            "price": current_price, "sma200": sma200, "sma50": sma50, "ema20": ema20,
+            "ema9": ema9, "bb_low": bb_low, "rsi14": rsi14, "atr14": atr14,
+            "rel_vol": rel_vol, "vwap5": vwap5, "mfm": round(mfm, 2), "returns_60d": returns_60d
+        }
+    except Exception as e:
+        logging.warning(f"Error fetching technicals for {ticker}: {e}")
         return None
-    current_price = float(close.iloc[-1])
-    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float(close.mean())
-    sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float(close.mean())
-    ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
-    ema9 = float(close.ewm(span=9, adjust=False).mean().iloc[-1])
-    std20 = float(close.rolling(20).std().iloc[-1]) if len(close) >= 20 else (current_price * 0.02)
-    bb_low = ema20 - (2.0 * std20)
-
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    rs = gain / loss
-    rsi_series = 100 - (100 / (1 + rs))
-    rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
-
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    atr_series = true_range.rolling(14).mean()
-    atr14 = float(atr_series.iloc[-1]) if not atr_series.empty and not pd.isna(atr_series.iloc[-1]) else (current_price * 0.02)
-
-    vol_series = df['Volume'] if 'Volume' in df.columns else pd.Series([1.0] * len(df), index=df.index)
-    vol_20d = float(vol_series.tail(20).mean()) if len(vol_series) >= 5 and float(vol_series.tail(20).mean()) > 0 else 1.0
-    vol_now = float(vol_series.iloc[-1]) if len(vol_series) > 0 else 1.0
-    rel_vol = round(vol_now / vol_20d, 2) if vol_20d > 0 else 1.0
-
-    recent5 = df.tail(5)
-    typ_p = (recent5['High'] + recent5['Low'] + recent5['Close']) / 3.0
-    vol_sum = float(recent5['Volume'].sum()) if 'Volume' in recent5.columns else 0.0
-    vwap5 = float((typ_p * recent5['Volume']).sum() / vol_sum) if vol_sum > 0 else current_price
-
-    hl_range = float(df['High'].iloc[-1] - df['Low'].iloc[-1])
-    mfm = float(((current_price - float(df['Low'].iloc[-1])) - (float(df['High'].iloc[-1]) - current_price)) / hl_range) if hl_range > 0 else 0.0
-    returns_60d = close.pct_change().dropna().tail(60)
-
-    return {
-        "price": current_price,
-        "sma200": sma200,
-        "sma50": sma50,
-        "ema20": ema20,
-        "ema9": ema9,
-        "bb_low": bb_low,
-        "rsi14": rsi14,
-        "atr14": atr14,
-        "rel_vol": rel_vol,
-        "vwap5": vwap5,
-        "mfm": round(mfm, 2),
-        "returns_60d": returns_60d
-    }
 
 def was_stopped_out_last_24h(ticker, closed_orders):
     norm = to_alpaca_pos_symbol(ticker)
@@ -850,7 +746,7 @@ def has_upcoming_earnings_48h(ticker):
                 if hasattr(val, 'year') and abs((val - now_date).days) <= 2:
                     return True
     except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+        logging.warning(f"Earnings fetch error for {ticker}: {e}")
     return False
 
 def fetch_active_and_held_orders():
@@ -868,7 +764,7 @@ def fetch_active_and_held_orders():
                     if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
                         active[leg.id] = leg
     except Exception as e:
-        print(f"Order fetch warning: {e}")
+        logging.warning(f"Order fetch warning: {e}")
     return list(active.values())
 
 def get_all_orders_for_ticker(ticker, active_orders):
@@ -882,7 +778,7 @@ def cancel_existing_orders_for_ticker(ticker, active_orders):
             api.cancel_order(o.id)
             canceled = True
         except Exception as e:
-            print(f"Cancel order warning for {ticker}: {e}")
+            logging.warning(f"Cancel order warning for {ticker}: {e}")
     if canceled:
         time.sleep(1.5)
 
@@ -925,39 +821,18 @@ def sync_recent_closed_sells(closed_orders):
                 elif o.type == 'limit':
                     new_fill_alerts.append(f"🎯 **TAKE-PROFIT HIT ({o.symbol} | {engine_tag})**: Sold {o.filled_qty} @ `${fill_price:.2f}` (P/L: `${realized_pl:+.2f}` / `{realized_pct:+.2f}%`)")
     except Exception as e:
-        print(f"Closed trades sheet sync warning: {e}")
+        logging.warning(f"Closed trades sheet sync warning: {e}")
     return new_fill_alerts
 
 # =====================================================================
 # 8. UNIVERSAL EQUITY TRANCHE EXECUTOR (STRICT TRANCHE OWNERSHIP GUARD)
 # =====================================================================
 def run_equity_tranche(
-    tranche_name,
-    tickers,
-    sheet_ws,
-    raw_positions,
-    positions_map,
-    held_returns_map,
-    dynamic_caps,
-    active_orders,
-    closed_orders_24h,
-    equity,
-    pdt_restricted,
-    macro_ok,
-    macro_reason,
-    is_nyse_open,
-    buy_score_min,
-    exit_score_max,
-    sl_atr_mult,
-    tp_atr_mult,
-    ratchet_trigger_pct,
-    risk_bps,
-    require_sma200=True,
-    strategy_mode="core"
+    tranche_name, tickers, sheet_ws, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders,
+    closed_orders_24h, equity, pdt_restricted, macro_ok, macro_reason, is_nyse_open, buy_score_min, exit_score_max,
+    sl_atr_mult, tp_atr_mult, ratchet_trigger_pct, risk_bps, require_sma200=True, strategy_mode="core"
 ):
-    tranche_alerts = []
-    scan_lines = []
-    rows_to_append = []
+    tranche_alerts, scan_lines, rows_to_append = [], [], []
 
     for ticker in tickers:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -966,20 +841,14 @@ def run_equity_tranche(
         tech = get_technicals_and_atr(ticker)
         obi = get_orderbook_imbalance(ticker)
         rsi_val = f"{tech['rsi14']:.1f}" if tech else "N/A"
-        arb = compute_arbiter_matrix(
-            score, tech, obi_score=obi,
-            base_buy_min=buy_score_min, base_exit_max=exit_score_max,
-            strategy_mode=strategy_mode
-        )
+        arb = compute_arbiter_matrix(score, tech, obi_score=obi, base_buy_min=buy_score_min, base_exit_max=exit_score_max, strategy_mode=strategy_mode)
         regime_tag = arb["regime"]
 
         pos = positions_map.get(ticker)
         owned_qty = float(pos.qty) if pos else 0.0
-        decision = f"HOLD [{regime_tag}]"
-        action_taken = "None"
+        decision, action_taken = f"HOLD [{regime_tag}]", "None"
 
-        if owned_qty > 0 and classify_symbol(ticker) != tranche_name:
-            continue
+        if owned_qty > 0 and classify_symbol(ticker) != tranche_name: continue
 
         if owned_qty > 0:
             entry_price = float(pos.avg_entry_price)
@@ -992,29 +861,23 @@ def run_equity_tranche(
 
             if should_exit:
                 if not is_nyse_open:
-                    decision = f"EXIT QUEUED [{regime_tag}]"
-                    action_taken = f"Awaiting NYSE Open ({exit_label})"
-                elif pdt_restricted and unrealized_pct > -0.04: # Allow emergency panic sells
+                    decision, action_taken = f"EXIT QUEUED [{regime_tag}]", f"Awaiting NYSE Open ({exit_label})"
+                elif pdt_restricted and unrealized_pct > -0.04:
                     decision = "EXIT BLOCKED (PDT Shield)"
                 else:
                     try:
                         cancel_existing_orders_for_ticker(ticker, active_orders)
-                        sell_ord = api.submit_order(
-                            symbol=ticker, qty=owned_qty, side='sell', type='market', time_in_force='gtc'
-                        )
-                        decision = f"ARBITER EXIT [{regime_tag}]"
-                        action_taken = f"Sold {int(owned_qty)} @ ~${current_price:.2f} ({exit_label})"
+                        sell_ord = api.submit_order(symbol=ticker, qty=owned_qty, side='sell', type='market', time_in_force='gtc')
+                        decision, action_taken = f"ARBITER EXIT [{regime_tag}]", f"Sold {int(owned_qty)} @ ~${current_price:.2f} ({exit_label})"
                         if closed_sheet:
                             closed_sheet.append_row([
-                                now_str[:19], ticker, str(int(owned_qty)), exit_label[:28],
-                                f"${current_price:.2f}", str(getattr(sell_ord, 'id', 'EQ_MKT')),
-                                tranche_name, f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
+                                now_str[:19], ticker, str(int(owned_qty)), exit_label[:28], f"${current_price:.2f}",
+                                str(getattr(sell_ord, 'id', 'EQ_MKT')), tranche_name, f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
                             ])
                         owned_qty = 0
                         tranche_alerts.append(f"🔴 **[{tranche_name} | {regime_tag}] EXIT {ticker}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
                     except Exception as e:
-                        decision = "BEARISH"
-                        action_taken = f"Sell Failed: {e}"
+                        decision, action_taken = "BEARISH", f"Sell Failed: {e}"
             else:
                 if is_nyse_open and unrealized_pct >= ratchet_trigger_pct:
                     ticker_orders = get_all_orders_for_ticker(ticker, active_orders)
@@ -1023,16 +886,10 @@ def run_equity_tranche(
                         stop_order = ticker_stops[0]
                         curr_stop = float(stop_order.stop_price)
                         atr_val = tech['atr14'] if tech else (current_price * 0.02)
-
-                        if unrealized_pct >= 0.060:
-                            new_stop = round(max(entry_price * 1.035, current_price - (1.2 * atr_val)), 2)
-                            stage_lbl = "Stage-3 Chandelier Trail"
-                        elif unrealized_pct >= 0.040:
-                            new_stop = round(entry_price * 1.020, 2)
-                            stage_lbl = "Stage-2 (+2.0% Profit Lock)"
-                        else:
-                            new_stop = round(entry_price, 2)
-                            stage_lbl = "Stage-1 Break-Even"
+                        
+                        if unrealized_pct >= 0.060: new_stop, stage_lbl = round(max(entry_price * 1.035, current_price - (1.2 * atr_val)), 2), "Stage-3 Chandelier Trail"
+                        elif unrealized_pct >= 0.040: new_stop, stage_lbl = round(entry_price * 1.020, 2), "Stage-2 (+2.0% Profit Lock)"
+                        else: new_stop, stage_lbl = round(entry_price, 2), "Stage-1 Break-Even"
 
                         if new_stop > curr_stop + 0.05:
                             try:
@@ -1040,92 +897,54 @@ def run_equity_tranche(
                                 action_taken = f"{stage_lbl} Stop -> ${new_stop:.2f}"
                                 tranche_alerts.append(f"🛡️ **[{tranche_name}] {stage_lbl.upper()} ({ticker})**: Stop ratcheted `${curr_stop:.2f}` ➔ `${new_stop:.2f}` (`+{unrealized_pct*100:.1f}%` open gain)")
                             except Exception as e:
-                                print(f"Chandelier ratchet note for {ticker}: {e}")
-
+                                logging.warning(f"Chandelier ratchet note for {ticker}: {e}")
                 decision = f"BULLISH (Owned | {regime_tag})" if arb["buy_signal"] else f"HOLD [{regime_tag}]"
         else:
             if arb.get("fee_block_reason"):
                 decision = f"BULLISH (Blocked: {arb['fee_block_reason']})"
             elif arb["buy_signal"]:
                 corr_ok, corr_reason = check_correlation_and_exposure_guard(
-                    candidate=ticker,
-                    tranche_name=tranche_name,
-                    raw_positions=raw_positions,
-                    equity=equity,
-                    candidate_returns=tech["returns_60d"] if tech else None,
-                    held_returns_map=held_returns_map,
-                    dynamic_caps=dynamic_caps
+                    candidate=ticker, tranche_name=tranche_name, raw_positions=raw_positions, equity=equity,
+                    candidate_returns=tech["returns_60d"] if tech else None, held_returns_map=held_returns_map, dynamic_caps=dynamic_caps
                 )
                 if not is_nyse_open:
-                    decision = f"BULLISH (Radar | {regime_tag})"
-                    action_taken = f"Pre-Market Target @ ~${tech['price']:.2f} (Comp {arb['composite']:+.2f}, OBI {obi:+.2f})" if tech else "Queued Radar"
-                elif not macro_ok:
-                    decision = f"BULLISH (Blocked: {macro_reason})"
-                elif not corr_ok:
-                    decision = f"BULLISH (Blocked: {corr_reason})"
-                elif pdt_restricted:
-                    decision = "BULLISH (Blocked: PDT Shield)"
-                elif was_stopped_out_last_24h(ticker, closed_orders_24h):
-                    decision = "BULLISH (Blocked: 24h Stop Cooldown)"
-                elif has_upcoming_earnings_48h(ticker):
-                    decision = "BULLISH (Blocked: 48h Earnings Shield)"
-                elif tech is None:
-                    decision = "BULLISH (Blocked: No Tech Data)"
-                elif require_sma200 and tech['price'] < tech['sma200']:
-                    decision = f"BULLISH (Blocked: Below 200-SMA ${tech['sma200']:.2f})"
-                elif not require_sma200 and strategy_mode != "mean_rev" and tech['ema20'] < tech['sma50'] and regime_tag != "NEWS-90/10":
-                    decision = "BULLISH (Blocked: 20-EMA < 50-SMA)"
-                elif tech['rsi14'] > arb["rsi_max"]:
-                    decision = f"BULLISH (Blocked: RSI {tech['rsi14']:.1f} > {arb['rsi_max']:.0f})"
+                    decision, action_taken = f"BULLISH (Radar | {regime_tag})", f"Pre-Market Target @ ~${tech['price']:.2f} (Comp {arb['composite']:+.2f}, OBI {obi:+.2f})" if tech else "Queued Radar"
+                elif not macro_ok: decision = f"BULLISH (Blocked: {macro_reason})"
+                elif not corr_ok: decision = f"BULLISH (Blocked: {corr_reason})"
+                elif pdt_restricted: decision = "BULLISH (Blocked: PDT Shield)"
+                elif was_stopped_out_last_24h(ticker, closed_orders_24h): decision = "BULLISH (Blocked: 24h Stop Cooldown)"
+                elif has_upcoming_earnings_48h(ticker): decision = "BULLISH (Blocked: 48h Earnings Shield)"
+                elif tech is None: decision = "BULLISH (Blocked: No Tech Data)"
+                elif require_sma200 and tech['price'] < tech['sma200']: decision = f"BULLISH (Blocked: Below 200-SMA ${tech['sma200']:.2f})"
+                elif not require_sma200 and strategy_mode != "mean_rev" and tech['ema20'] < tech['sma50'] and regime_tag != "NEWS-90/10": decision = "BULLISH (Blocked: 20-EMA < 50-SMA)"
+                elif tech['rsi14'] > arb["rsi_max"]: decision = f"BULLISH (Blocked: RSI {tech['rsi14']:.1f} > {arb['rsi_max']:.0f})"
                 else:
-                    price = tech['price']
-                    atr = max(tech['atr14'], price * 0.01)
-                    qty_to_buy = compute_atr_risk_parity_qty(
-                        equity=equity, price=price, atr=atr,
-                        sl_atr_mult=sl_atr_mult, risk_bps=risk_bps,
-                        max_notional_pct=0.040, is_crypto=False
-                    )
-
+                    price, atr = tech['price'], max(tech['atr14'], tech['price'] * 0.01)
+                    qty_to_buy = compute_atr_risk_parity_qty(equity=equity, price=price, atr=atr, sl_atr_mult=sl_atr_mult, risk_bps=risk_bps, max_notional_pct=0.040, is_crypto=False)
                     adj_tp_mult = round(tp_atr_mult * arb["tp_adj"], 2)
-                    stop_price = round(price - (sl_atr_mult * atr), 2)
-                    target_price = round(price + (adj_tp_mult * atr), 2)
-
+                    stop_price, target_price = round(price - (sl_atr_mult * atr), 2), round(price + (adj_tp_mult * atr), 2)
                     try:
                         api.submit_order(
-                            symbol=ticker, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc',
-                            order_class='bracket',
-                            take_profit={'limit_price': target_price},
-                            stop_loss={'stop_price': stop_price}
+                            symbol=ticker, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc', order_class='bracket',
+                            take_profit={'limit_price': target_price}, stop_loss={'stop_price': stop_price}
                         )
                         decision = f"BULLISH [{regime_tag}]"
                         action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}"
-                        api.submit_order(...)
-decision = f"BULLISH [{regime_tag}]"
-action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f}..."
-owned_qty = qty_to_buy  # <-- DELETE THIS LINE
-held_returns_map[ticker] = tech["returns_60d"]
-                        if tech and "returns_60d" in tech:
-                            held_returns_map[ticker] = tech["returns_60d"]
+                        if tech and "returns_60d" in tech: held_returns_map[ticker] = tech["returns_60d"]
                         tranche_alerts.append(f"🟢 **[{tranche_name} | {regime_tag}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, OBI: `{obi:+.2f}`, Comp: `{arb['composite']:+.2f}`)")
                     except Exception as e:
-                        decision = f"BULLISH [{regime_tag}]"
-                        action_taken = f"Buy Failed: {e}"
-            elif score <= -0.10:
-                decision = f"BEARISH (Not Owned | {regime_tag})"
-            else:
-                decision = f"HOLD [{regime_tag}]"
+                        decision, action_taken = f"BULLISH [{regime_tag}]", f"Buy Failed: {e}"
+            elif score <= -0.10: decision = f"BEARISH (Not Owned | {regime_tag})"
+            else: decision = f"HOLD [{regime_tag}]"
 
-        row = [now_str, ticker, f"{score:+.3f}", f"[{tranche_name}] {decision}", action_taken, f"Holding {int(owned_qty)} shares"]
-        rows_to_append.append(row)
-        print(f"[{tranche_name}] {ticker}: {score:+.3f} | OBI {obi:+.2f} | {decision} | {action_taken}")
+        rows_to_append.append([now_str, ticker, f"{score:+.3f}", f"[{tranche_name}] {decision}", action_taken, f"Holding {int(owned_qty)} shares"])
+        logging.info(f"[{tranche_name}] {ticker}: {score:+.3f} | OBI {obi:+.2f} | {decision} | {action_taken}")
         scan_lines.append(f"• **{ticker}** `[{tranche_name} | {regime_tag}]`: FinBERT `{score:+.3f}` | OBI `{obi:+.2f}` | RSI `{rsi_val}` ➔ `{decision}`")
         time.sleep(0.35)
 
     if rows_to_append and sheet_ws:
-        try:
-            sheet_ws.append_rows(rows_to_append)
-        except Exception as e:
-            print(f"Batch sheet write warning ({tranche_name}): {e}")
+        try: sheet_ws.append_rows(rows_to_append)
+        except Exception as e: logging.warning(f"Batch sheet write warning ({tranche_name}): {e}")
 
     return tranche_alerts, scan_lines
 
@@ -1133,14 +952,11 @@ held_returns_map[ticker] = tech["returns_60d"]
 # 9. ENGINE 7: v8.0 OPTIONS GEX & INVERSE ETF TAIL-HEDGE OVERLAY
 # =====================================================================
 def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, is_nyse_open, macro_ok, macro_reason, net_gex_score, risk_bps):
-    hedge_alerts = []
-    hedge_lines = []
-    hedge_sym = "SH"
+    hedge_alerts, hedge_lines, hedge_sym = [], [], "SH"
     pos = positions_map.get(hedge_sym)
     owned_qty = float(pos.qty) if pos else 0.0
     tech = get_technicals_and_atr(hedge_sym)
     price = tech["price"] if tech else 12.0
-
     needs_hedge = (not macro_ok) or (net_gex_score <= -0.18)
 
     if owned_qty > 0 and macro_ok and net_gex_score > -0.05 and is_nyse_open:
@@ -1150,7 +966,7 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
             hedge_alerts.append(f"🛡️ **[TAIL_HEDGE UNWOUND] Sold {int(owned_qty)} {hedge_sym}**: Macro & GEX normalized (`{macro_reason}`).")
             hedge_lines.append(f"• **{hedge_sym}** `[TAIL_HEDGE]`: Unwound hedge as Macro/GEX normalized.")
         except Exception as e:
-            print(f"Tail hedge unwind note: {e}")
+            logging.warning(f"Tail hedge unwind note: {e}")
     elif owned_qty == 0 and needs_hedge and is_nyse_open and tech is not None:
         atr = max(tech["atr14"], price * 0.01)
         qty_to_buy = compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult=1.2, risk_bps=risk_bps, max_notional_pct=0.05, is_crypto=False)
@@ -1159,7 +975,7 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
             hedge_alerts.append(f"🛡️ **[v8.0 TAIL_HEDGE DEPLOYED] Bought {qty_to_buy} {hedge_sym} @ ~${price:.2f}**: Triggered by `{macro_reason}`")
             hedge_lines.append(f"• **{hedge_sym}** `[TAIL_HEDGE]`: Deployed {qty_to_buy} sh inverse shield (`{macro_reason}`).")
         except Exception as e:
-            print(f"Tail hedge buy note: {e}")
+            logging.warning(f"Tail hedge buy note: {e}")
     else:
         status_str = f"Holding {int(owned_qty)} sh Active Shield" if owned_qty > 0 else f"Standby (GEX {net_gex_score:+.2f} Normal)"
         hedge_lines.append(f"• **{hedge_sym}** `[TAIL_HEDGE]`: `{status_str}`")
@@ -1167,12 +983,10 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
     return hedge_alerts, hedge_lines
 
 # =====================================================================
-# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (ANTI-CHURN + 4H COOLDOWN)
+# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR
 # =====================================================================
 def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, closed_orders_24h, equity, macro_ok, macro_reason, risk_bps):
-    crypto_alerts = []
-    scan_lines = []
-    rows_to_append = []
+    crypto_alerts, scan_lines, rows_to_append = [], [], []
 
     for pair in crypto_candidates:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1187,148 +1001,86 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
         norm_sym = to_alpaca_pos_symbol(pair)
         pos = positions_map.get(norm_sym) or positions_map.get(pair)
         owned_qty = float(pos.qty) if pos else 0.0
-        decision = f"HOLD [{regime_tag}]"
-        action_taken = "None"
+        decision, action_taken = f"HOLD [{regime_tag}]", "None"
 
         if owned_qty > 0:
-            entry_price = float(pos.avg_entry_price)
-            current_price = float(pos.current_price)
+            entry_price, current_price = float(pos.avg_entry_price), float(pos.current_price)
             unrealized_pct = (current_price - entry_price) / entry_price
             unrealized_dlr = (current_price - entry_price) * owned_qty
 
             dynamic_tp_pct = 0.060 * arb["tp_adj"]
             exit_reason = None
-            if unrealized_pct >= dynamic_tp_pct:
-                exit_reason = f"Arbiter Take-Profit Hit (+{unrealized_pct*100:.2f}% in {regime_tag})"
-            elif unrealized_pct <= -0.030:
-                exit_reason = f"Crypto Stop-Loss Hit ({unrealized_pct*100:.2f}%)"
-            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.008:
-                exit_reason = arb["arbiter_exit_reason"]
-            elif score <= -0.35:
-                exit_reason = f"Bearish Crypto Catalyst ({score:+.3f})"
+            if unrealized_pct >= dynamic_tp_pct: exit_reason = f"Arbiter Take-Profit Hit (+{unrealized_pct*100:.2f}% in {regime_tag})"
+            elif unrealized_pct <= -0.030: exit_reason = f"Crypto Stop-Loss Hit ({unrealized_pct*100:.2f}%)"
+            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.008: exit_reason = arb["arbiter_exit_reason"]
+            elif score <= -0.35: exit_reason = f"Bearish Crypto Catalyst ({score:+.3f})"
 
             if exit_reason:
                 try:
                     cancel_existing_orders_for_ticker(pair, active_orders)
-                    # --- FIXED: Use stop_limit with strict offset instead of blind market sell to prevent slippage ---
-                    stop_px = round(current_price * 0.992, 8)
-                    limit_px = round(current_price * 0.985, 8)
-                    sell_order = api.submit_order(
-                        symbol=pair, qty=owned_qty, side='sell', type='stop_limit',
-                        stop_price=stop_px, limit_price=limit_px, time_in_force='gtc'
-                    )
+                    stop_px, limit_px = round(current_price * 0.992, 8), round(current_price * 0.985, 8)
+                    sell_order = api.submit_order(symbol=pair, qty=owned_qty, side='sell', type='stop_limit', stop_price=stop_px, limit_price=limit_px, time_in_force='gtc')
 
-                    # Add this right AFTER your take-profit sell order in Code.py
-                    # Note: Added `if order.id != sell_order.id:` to ensure the exit order we JUST placed isn't canceled!
                     open_orders = api.list_orders(status='open', symbols=[pair])
                     for order in open_orders:
                         if order.id != getattr(sell_order, 'id', None):
                             api.cancel_order(order.id)
 
-                    decision = f"EXIT [{regime_tag}]"
-                    action_taken = f"Stop-Limit Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
+                    decision, action_taken = f"EXIT [{regime_tag}]", f"Stop-Limit Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
                     if closed_sheet:
                         closed_sheet.append_row([
-                            now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28],
-                            f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_STPLMT')),
-                            "CRYPTO", f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
+                            now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28], f"${current_price:.2f}",
+                            str(getattr(sell_order, 'id', 'CRYPTO_STPLMT')), "CRYPTO", f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
                         ])
                     owned_qty = 0.0
                     crypto_alerts.append(f"🪙 **[CRYPTO EXIT | {regime_tag}] {pair}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
                 except Exception as e:
-                    decision = "EXIT"
-                    action_taken = f"Crypto Sell Failed: {e}"
+                    decision, action_taken = "EXIT", f"Crypto Sell Failed: {e}"
             else:
-                if unrealized_pct >= 0.025:
-                    decision = f"HOLD (🛡️ +2.5% Trail | {regime_tag})"
-                elif arb.get("fee_block_reason"):
-                    decision = f"BULLISH (Blocked: {arb['fee_block_reason']})"
-                elif arb["buy_signal"]:
-                    decision = f"BULLISH (Holding | {regime_tag})"
-                else:
-                    decision = f"HOLD [{regime_tag}]"
+                if unrealized_pct >= 0.025: decision = f"HOLD (🛡️ +2.5% Trail | {regime_tag})"
+                elif arb.get("fee_block_reason"): decision = f"BULLISH (Blocked: {arb['fee_block_reason']})"
+                elif arb["buy_signal"]: decision = f"BULLISH (Holding | {regime_tag})"
+                else: decision = f"HOLD [{regime_tag}]"
         else:
-            if arb.get("fee_block_reason"):
-                decision = f"BULLISH (Blocked: {arb['fee_block_reason']})"
+            if arb.get("fee_block_reason"): decision = f"BULLISH (Blocked: {arb['fee_block_reason']})"
             elif arb["buy_signal"] and tech is not None:
                 corr_ok, corr_reason = check_correlation_and_exposure_guard(
-                    candidate=pair, tranche_name="CRYPTO", raw_positions=raw_positions,
-                    equity=equity, candidate_returns=tech["returns_60d"],
-                    held_returns_map=held_returns_map, dynamic_caps=dynamic_caps
+                    candidate=pair, tranche_name="CRYPTO", raw_positions=raw_positions, equity=equity,
+                    candidate_returns=tech["returns_60d"], held_returns_map=held_returns_map, dynamic_caps=dynamic_caps
                 )
-                if not macro_ok and "CIRCUIT BREAKER" in macro_reason:
-                    decision = f"BULLISH (Blocked: {macro_reason})"
-                elif was_crypto_sold_recently(pair, closed_orders_24h, hours=4):
-                    decision = "BULLISH (Blocked: 4h Exit Cooldown)"
-                elif not corr_ok:
-                    decision = f"BULLISH (Blocked: {corr_reason})"
-                elif regime_tag != "CRYPTO-SNIPE" and tech["price"] < tech["ema20"]:
-                    decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
+                if not macro_ok and "CIRCUIT BREAKER" in macro_reason: decision = f"BULLISH (Blocked: {macro_reason})"
+                elif was_crypto_sold_recently(pair, closed_orders_24h, hours=4): decision = "BULLISH (Blocked: 4h Exit Cooldown)"
+                elif not corr_ok: decision = f"BULLISH (Blocked: {corr_reason})"
+                elif regime_tag != "CRYPTO-SNIPE" and tech["price"] < tech["ema20"]: decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
                 else:
-                    price = tech['price']
-                    atr = max(tech['atr14'], price * 0.015)
-                    qty_to_buy = compute_atr_risk_parity_qty(
-                        equity=equity, price=price, atr=atr,
-                        sl_atr_mult=1.2, risk_bps=risk_bps,
-                        max_notional_pct=0.035, is_crypto=True
-                    )
+                    price, atr = tech['price'], max(tech['atr14'], tech['price'] * 0.015)
+                    qty_to_buy = compute_atr_risk_parity_qty(equity=equity, price=price, atr=atr, sl_atr_mult=1.2, risk_bps=risk_bps, max_notional_pct=0.035, is_crypto=True)
                     dyn_tp = round(6.0 * arb["tp_adj"], 1)
 
                     if qty_to_buy > 0:
                         try:
-                            # 1. Execute the market buy
-                            api.submit_order(
-                                symbol=pair, 
-                                qty=qty_to_buy, 
-                                side='buy', 
-                                type='market', 
-                                time_in_force='gtc'
-                            )
-
-                            # 2. Calculate precision stops (using 8 decimal places for altcoins)
-                            stop_price = round(current_price * 0.97, 8) 
-                            limit_price = round(current_price * 0.965, 8) 
-
-                            # 3. Immediately submit the server-side protective stop
-                            api.submit_order(
-                                symbol=pair,
-                                qty=qty_to_buy,
-                                side='sell',
-                                type='stop_limit',
-                                time_in_force='gtc',
-                                stop_price=stop_price,
-                                limit_price=limit_price
-                            )
+                            api.submit_order(symbol=pair, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc')
+                            stop_price, limit_price = round(current_price * 0.97, 8), round(current_price * 0.965, 8)
+                            api.submit_order(symbol=pair, qty=qty_to_buy, side='sell', type='stop_limit', time_in_force='gtc', stop_price=stop_price, limit_price=limit_price)
+                            
                             decision = f"BULLISH [{regime_tag}]"
                             action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | OBI {obi:+.2f} | TP +{dyn_tp}%)"
-                            api.submit_order(...)
-decision = f"BULLISH [{regime_tag}]"
-action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f}..."
-owned_qty = qty_to_buy  # <-- DELETE THIS LINE
-held_returns_map[ticker] = tech["returns_60d"]
                             held_returns_map[pair] = tech["returns_60d"]
                             crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")
                         except Exception as e:
-                            decision = f"BULLISH [{regime_tag}]"
-                            action_taken = f"Crypto Buy Failed: {e}"
-            elif tech is not None and score >= 0.15 and tech["price"] < tech["ema20"]:
-                decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
-            elif score <= -0.10:
-                decision = f"BEARISH (Not Owned | {regime_tag})"
-            else:
-                decision = f"HOLD [{regime_tag}]"
+                            decision, action_taken = f"BULLISH [{regime_tag}]", f"Crypto Buy Failed: {e}"
+            elif tech is not None and score >= 0.15 and tech["price"] < tech["ema20"]: decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
+            elif score <= -0.10: decision = f"BEARISH (Not Owned | {regime_tag})"
+            else: decision = f"HOLD [{regime_tag}]"
 
-        row = [now_str, pair, f"{score:+.3f}", decision, action_taken, f"Holding {owned_qty:.4f} units"]
-        rows_to_append.append(row)
-        print(f"[CRYPTO] {pair}: {score:+.3f} | OBI {obi:+.2f} | {decision} | {action_taken}")
+        rows_to_append.append([now_str, pair, f"{score:+.3f}", decision, action_taken, f"Holding {owned_qty:.4f} units"])
+        logging.info(f"[CRYPTO] {pair}: {score:+.3f} | OBI {obi:+.2f} | {decision} | {action_taken}")
         scan_lines.append(f"• **{pair}** `[{regime_tag}]`: FinBERT `{score:+.3f}` | OBI `{obi:+.2f}` | RSI `{rsi_val}` ➔ `{decision}`")
         time.sleep(0.35)
 
     if rows_to_append and crypto_sheet:
-        try:
-            crypto_sheet.append_rows(rows_to_append)
-        except Exception as e:
-            print(f"Batch sheet write warning (CRYPTO): {e}")
+        try: crypto_sheet.append_rows(rows_to_append)
+        except Exception as e: logging.warning(f"Batch sheet write warning (CRYPTO): {e}")
 
     return crypto_alerts, scan_lines
 
@@ -1336,10 +1088,6 @@ held_returns_map[ticker] = tech["returns_60d"]
 # 10.5. ENGINE 8: THE LIQUIDITY PREDATOR (FLUSH HUNTER)
 # =====================================================================
 def map_liquidity_clusters_and_bid(ticker, df_yf, equity, risk_bps):
-    """
-    Identifies retail stop-loss clusters (MAs, swing lows, psychological boundaries)
-    and formulates predatory limit bids to catch the slippage flush natively on the broker.
-    """
     if df_yf.empty or len(df_yf) < 200:
         return None
         
@@ -1349,123 +1097,81 @@ def map_liquidity_clusters_and_bid(ticker, df_yf, equity, risk_bps):
     swing_low_20 = float(df_yf["Low"].rolling(20).min().iloc[-1])
     atr = float((df_yf["High"] - df_yf["Low"]).rolling(14).mean().iloc[-1])
     
-    # --- FIXED: Check falling-knife velocity / recent momentum to avoid catching free-falling knives ---
     recent_ret = float(df_yf["Close"].pct_change().iloc[-1])
-    if recent_ret < -0.06:  # Asset is crashing too violently (>6% single-day drop), skip knife-catching
+    if recent_ret < -0.06:
         return None
     
     clusters = []
-    
-    # 1. Psychological Round Numbers (e.g., $100.00, $50.00)
     order_of_mag = 10 if close < 200 else 50
     nearest_round_floor = math.floor(close / order_of_mag) * order_of_mag
     if (close - nearest_round_floor) / close < 0.04 and nearest_round_floor < close:
         clusters.append({"type": "Psy-Round", "level": nearest_round_floor})
         
-    # 2. Moving Average Floors
-    if close > sma200 and (close - sma200) / close < 0.05:
-        clusters.append({"type": "200-SMA", "level": sma200})
-    if close > sma50 and (close - sma50) / close < 0.04:
-        clusters.append({"type": "50-SMA", "level": sma50})
+    if close > sma200 and (close - sma200) / close < 0.05: clusters.append({"type": "200-SMA", "level": sma200})
+    if close > sma50 and (close - sma50) / close < 0.04: clusters.append({"type": "50-SMA", "level": sma50})
+    if close > swing_low_20 and (close - swing_low_20) / close < 0.03: clusters.append({"type": "20D-Low", "level": swing_low_20})
         
-    # 3. Swing Lows
-    if close > swing_low_20 and (close - swing_low_20) / close < 0.03:
-        clusters.append({"type": "20D-Low", "level": swing_low_20})
+    if not clusters: return None
         
-    if not clusters:
-        return None
-        
-    # Find the most relevant cluster (closest below current price)
     clusters = sorted(clusters, key=lambda x: close - x["level"])
     target_cluster = clusters[0]
     cluster_px = target_cluster["level"]
     
-    # The Predator Bid: Set limit order 0.65% to 1.2% BELOW the cluster to catch stop-loss slippage
     flush_discount = max(0.0065, (atr / close) * 0.5) 
     predator_bid = cluster_px * (1.0 - flush_discount)
-    
-    # Risk-Parity Sizing based on a catastrophic hard stop 
     catastrophic_stop = predator_bid - (atr * 1.5)
     stop_dist = predator_bid - catastrophic_stop
+    
     raw_qty = (equity * (risk_bps / 100.0)) / stop_dist
     max_qty = (equity * 0.05) / predator_bid
     qty = max(1, int(min(raw_qty, max_qty)))
-    
-    # Instant Mean-Reversion Target (Snapback to the broken cluster level)
     snapback_tp = cluster_px * 1.015 
     
     return {
-        "Ticker": ticker,
-        "Cluster Level": round(cluster_px, 2),
-        "Cluster Type": target_cluster["type"],
-        "Live Price": round(close, 2),
-        "Predator Bid": round(predator_bid, 2),
-        "Snapback TP": round(snapback_tp, 2),
-        "Hard Stop": round(catastrophic_stop, 2),
-        "Qty": qty,
-        "Capital Req": round(qty * predator_bid, 2)
+        "Ticker": ticker, "Cluster Level": round(cluster_px, 2), "Cluster Type": target_cluster["type"],
+        "Live Price": round(close, 2), "Predator Bid": round(predator_bid, 2), "Snapback TP": round(snapback_tp, 2),
+        "Hard Stop": round(catastrophic_stop, 2), "Qty": qty, "Capital Req": round(qty * predator_bid, 2)
     }
 
 def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bps):
-    alerts = []
-    lines = []
-    rows_to_append = []
+    alerts, lines, rows_to_append = [], [], []
+    pool, now_str = CORE_POOL + MOMENTUM_POOL, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     
-    pool = CORE_POOL + MOMENTUM_POOL
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    
-    # Batch download for speed and efficiency
     yf_list = [to_yf_symbol(t) for t in pool]
     try:
         data = yf.download(yf_list, period="1y", interval="1d", group_by="ticker", threads=True, progress=False)
     except Exception as e:
-        print(f"Predator data fetch error: {e}")
+        logging.warning(f"Predator data fetch error: {e}")
         return alerts, lines
 
     for ticker in pool:
-        if ticker in positions_map or to_alpaca_pos_symbol(ticker) in positions_map:
-            continue
-            
-        # Check if we already have a resting buy limit order for this trap
+        if ticker in positions_map or to_alpaca_pos_symbol(ticker) in positions_map: continue
         existing_orders = [o for o in active_orders if to_alpaca_pos_symbol(o.symbol) == to_alpaca_pos_symbol(ticker) and o.side == 'buy' and o.type == 'limit']
-        if existing_orders:
-            continue
+        if existing_orders: continue
             
-        yf_sym = to_yf_symbol(ticker)
         try:
-            df_t = data[yf_sym] if len(yf_list) > 1 else data
+            df_t = data[to_yf_symbol(ticker)] if len(yf_list) > 1 else data
             df_t = df_t.dropna(subset=["Close"])
-        except Exception:
-            continue
+        except Exception: continue
             
         trap = map_liquidity_clusters_and_bid(ticker, df_t, equity, risk_bps)
         if trap:
             try:
                 api.submit_order(
-                    symbol=trap["Ticker"],
-                    qty=trap["Qty"],
-                    side="buy",
-                    type="limit",
-                    limit_price=trap["Predator Bid"],
-                    time_in_force="gtc",
-                    order_class="bracket",
-                    take_profit={"limit_price": trap["Snapback TP"]},
-                    stop_loss={"stop_price": trap["Hard Stop"]}
+                    symbol=trap["Ticker"], qty=trap["Qty"], side="buy", type="limit", limit_price=trap["Predator Bid"],
+                    time_in_force="gtc", order_class="bracket", take_profit={"limit_price": trap["Snapback TP"]}, stop_loss={"stop_price": trap["Hard Stop"]}
                 )
                 action_taken = f"Armed {trap['Cluster Type']} Trap: Limit Buy {trap['Qty']} @ ${trap['Predator Bid']} | TP ${trap['Snapback TP']}"
-                decision = "BULLISH [PREDATOR-FLUSH]"
                 alerts.append(f"🩸 **[PREDATOR TRAP ARMED] {ticker}**: {action_taken} (Cluster: `${trap['Cluster Level']}`)")
                 lines.append(f"• **{ticker}** `[PREDATOR]`: {action_taken}")
-                rows_to_append.append([now_str, ticker, "N/A (Predator)", decision, action_taken, f"Capital Req: ${trap['Capital Req']}"])
+                rows_to_append.append([now_str, ticker, "N/A (Predator)", "BULLISH [PREDATOR-FLUSH]", action_taken, f"Capital Req: ${trap['Capital Req']}"])
                 time.sleep(0.35)
             except Exception as e:
-                print(f"Predator order failed for {ticker}: {e}")
+                logging.warning(f"Predator order failed for {ticker}: {e}")
                 
     if rows_to_append and sheet_ws:
-        try:
-            sheet_ws.append_rows(rows_to_append)
-        except Exception as e:
-            print(f"Predator sheet write warning: {e}")
+        try: sheet_ws.append_rows(rows_to_append)
+        except Exception as e: logging.warning(f"Predator sheet write warning: {e}")
             
     return alerts, lines
 
@@ -1476,7 +1182,6 @@ def run_bot(mode="auto"):
     clock = api.get_clock()
     is_nyse_open = bool(clock.is_open)
 
-    # If triggered by fallback schedule while NYSE is closed, only run Crypto
     if mode in ["auto", "intraday"] and not is_nyse_open:
         mode = "crypto"
 
@@ -1487,25 +1192,18 @@ def run_bot(mode="auto"):
     pdt_restricted = daytrade_count >= 3
 
     engine_cfg = load_or_init_engine_config()
-    
     macro_ok, macro_reason, net_gex_score = check_macro_gex_and_circuit_breaker(equity, last_equity)
     dynamic_caps = compute_rl_meta_allocation(engine_cfg, net_gex_score)
 
     def should_run(eng_key):
-        if mode == "all":
-            return True
-        if mode == eng_key.lower():
-            return True
-        if mode == "intraday":
-            return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"] and engine_cfg.get(eng_key, {}).get("enabled", False)
-        if mode == "auto":
-            return engine_cfg.get(eng_key, {}).get("enabled", False)
+        if mode == "all": return True
+        if mode == eng_key.lower(): return True
+        if mode == "intraday": return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"] and engine_cfg.get(eng_key, {}).get("enabled", False)
+        if mode == "auto": return engine_cfg.get(eng_key, {}).get("enabled", False)
         return False
 
     raw_positions = api.list_positions()
-    positions_map = {}
-    owned_symbols = set()
-    held_returns_map = {}
+    positions_map, owned_symbols, held_returns_map = {}, set(), {}
 
     for p in raw_positions:
         disp_sym = CRYPTO_NORM.get(str(p.symbol), str(p.symbol))
@@ -1515,10 +1213,9 @@ def run_bot(mode="auto"):
         owned_symbols.add(to_alpaca_pos_symbol(p.symbol))
         try:
             df_h = yf.Ticker(to_yf_symbol(disp_sym)).history(period="3mo")
-            if not df_h.empty and len(df_h) >= 20:
-                held_returns_map[disp_sym] = df_h["Close"].pct_change().dropna().tail(60)
+            if not df_h.empty and len(df_h) >= 20: held_returns_map[disp_sym] = df_h["Close"].pct_change().dropna().tail(60)
         except Exception as e:
-        logging.warning(f"Error in [FunctionName] for {ticker}: {e}")
+            logging.warning(f"Error fetching held returns for {disp_sym}: {e}")
 
     active_orders = fetch_active_and_held_orders()
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -1529,149 +1226,108 @@ def run_bot(mode="auto"):
     section_reports = []
 
     if should_run("CRYPTO"):
-        print("=== Running Engine 3: 24/7 Crypto AI Quant ===")
+        logging.info("=== Running Engine 3: 24/7 Crypto AI Quant ===")
         alt_candidates = screen_top_candidates(CRYPTO_ALTS, top_n=4, owned_symbols=owned_symbols, mode="crypto", tranche_name="CRYPTO")
         crypto_candidates = list(dict.fromkeys(CRYPTO_MAJORS + alt_candidates))
         c_alerts, crypto_lines = run_crypto_tranche(
-            crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps,
-            active_orders, closed_orders_24h, equity, macro_ok, macro_reason, engine_cfg.get("CRYPTO", {}).get("risk_bps", 0.0045)
+            crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, closed_orders_24h, equity, macro_ok, macro_reason, engine_cfg.get("CRYPTO", {}).get("risk_bps", 0.0045)
         )
         all_alerts.extend(c_alerts)
-        if crypto_lines:
-            section_reports.append("🪙 **Engine 3 — 24/7 Crypto AI (48x/Day):**\n" + "\n".join(crypto_lines))
+        if crypto_lines: section_reports.append("🪙 **Engine 3 — 24/7 Crypto AI (48x/Day):**\n" + "\n".join(crypto_lines))
 
     if should_run("CORE"):
-        print("=== Running Engine 1: Core Long-Term Equities ===")
+        logging.info("=== Running Engine 1: Core Long-Term Equities ===")
         core_candidates = screen_top_candidates(CORE_POOL, top_n=8, owned_symbols=owned_symbols, mode="core", tranche_name="CORE")
         core_alerts, core_lines = run_equity_tranche(
-            tranche_name="CORE", tickers=core_candidates, sheet_ws=core_sheet,
-            raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-            equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-            is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.15,
-            sl_atr_mult=1.5, tp_atr_mult=3.5, ratchet_trigger_pct=0.025,
-            risk_bps=engine_cfg.get("CORE", {}).get("risk_bps", 0.0050), require_sma200=True, strategy_mode="core"
+            tranche_name="CORE", tickers=core_candidates, sheet_ws=core_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.15, sl_atr_mult=1.5, tp_atr_mult=3.5, ratchet_trigger_pct=0.025, risk_bps=engine_cfg.get("CORE", {}).get("risk_bps", 0.0050), require_sma200=True, strategy_mode="core"
         )
         all_alerts.extend(core_alerts)
-        if core_lines:
-            section_reports.append("🛡️ **Engine 1 — Core Blue-Chips:**\n" + "\n".join(core_lines))
+        if core_lines: section_reports.append("🛡️ **Engine 1 — Core Blue-Chips:**\n" + "\n".join(core_lines))
 
     if should_run("MOMENTUM"):
-        print("=== Running Engine 2: Short-Term Momentum ===")
+        logging.info("=== Running Engine 2: Short-Term Momentum ===")
         mom_candidates = screen_top_candidates(MOMENTUM_POOL, top_n=6, owned_symbols=owned_symbols, mode="momentum", tranche_name="MOMENTUM")
         mom_alerts, mom_lines = run_equity_tranche(
-            tranche_name="MOMENTUM", tickers=mom_candidates, sheet_ws=momentum_sheet,
-            raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-            equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-            is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.12,
-            sl_atr_mult=1.0, tp_atr_mult=2.0, ratchet_trigger_pct=0.015,
-            risk_bps=engine_cfg.get("MOMENTUM", {}).get("risk_bps", 0.0040), require_sma200=False, strategy_mode="momentum"
+            tranche_name="MOMENTUM", tickers=mom_candidates, sheet_ws=momentum_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.12, sl_atr_mult=1.0, tp_atr_mult=2.0, ratchet_trigger_pct=0.015, risk_bps=engine_cfg.get("MOMENTUM", {}).get("risk_bps", 0.0040), require_sma200=False, strategy_mode="momentum"
         )
         all_alerts.extend(mom_alerts)
-        if mom_lines:
-            section_reports.append("⚡ **Engine 2 — Short-Term Momentum (14x/Day):**\n" + "\n".join(mom_lines))
+        if mom_lines: section_reports.append("⚡ **Engine 2 — Short-Term Momentum (14x/Day):**\n" + "\n".join(mom_lines))
             
     if should_run("COMMODITIES"):
-        print("=== Running Engine: Commodities & Hard Assets ===")
+        logging.info("=== Running Engine: Commodities & Hard Assets ===")
         comm_candidates = screen_top_candidates(COMMODITY_POOL, top_n=3, owned_symbols=owned_symbols, mode="core", tranche_name="COMMODITIES")
         comm_alerts, comm_lines = run_equity_tranche(
-            tranche_name="COMMODITIES", tickers=comm_candidates, sheet_ws=core_sheet,
-            raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-            equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-            is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
-            sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("COMMODITIES", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
+            tranche_name="COMMODITIES", tickers=comm_candidates, sheet_ws=core_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20, sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020, risk_bps=engine_cfg.get("COMMODITIES", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
         )
         all_alerts.extend(comm_alerts)
-        if comm_lines:
-            section_reports.append("🛢️ **Engine — Commodities (Safe Haven):**\n" + "\n".join(comm_lines))
+        if comm_lines: section_reports.append("🛢️ **Engine — Commodities (Safe Haven):**\n" + "\n".join(comm_lines))
 
     if should_run("DEFENSE"):
-        print("=== Running Engine: Aerospace & Defense ===")
+        logging.info("=== Running Engine: Aerospace & Defense ===")
         def_candidates = screen_top_candidates(DEFENSE_POOL, top_n=4, owned_symbols=owned_symbols, mode="core", tranche_name="DEFENSE")
         def_alerts, def_lines = run_equity_tranche(
-            tranche_name="DEFENSE", tickers=def_candidates, sheet_ws=core_sheet,
-            raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-            equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-            is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
-            sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("DEFENSE", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
+            tranche_name="DEFENSE", tickers=def_candidates, sheet_ws=core_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20, sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020, risk_bps=engine_cfg.get("DEFENSE", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
         )
         all_alerts.extend(def_alerts)
-        if def_lines:
-            section_reports.append("🛡️ **Engine — Aerospace & Defense (Safe Haven):**\n" + "\n".join(def_lines))
+        if def_lines: section_reports.append("🛡️ **Engine — Aerospace & Defense (Safe Haven):**\n" + "\n".join(def_lines))
 
     if should_run("DISCOVERY"):
-        print("=== Running Engine 4: Market-Wide AI Discovery Agent ===")
+        logging.info("=== Running Engine 4: Market-Wide AI Discovery Agent ===")
         disc_candidates = discover_market_wide_catalysts(owned_symbols, top_n=5)
         if disc_candidates:
             disc_alerts, disc_lines = run_equity_tranche(
-                tranche_name="DISCOVERY", tickers=disc_candidates, sheet_ws=discovery_sheet,
-                raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-                dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-                equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-                is_nyse_open=is_nyse_open, buy_score_min=0.15, exit_score_max=-0.15,
-                sl_atr_mult=1.2, tp_atr_mult=2.8, ratchet_trigger_pct=0.020,
-                risk_bps=engine_cfg.get("DISCOVERY", {}).get("risk_bps", 0.0035), require_sma200=False, strategy_mode="discovery"
+                tranche_name="DISCOVERY", tickers=disc_candidates, sheet_ws=discovery_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+                dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+                is_nyse_open=is_nyse_open, buy_score_min=0.15, exit_score_max=-0.15, sl_atr_mult=1.2, tp_atr_mult=2.8, ratchet_trigger_pct=0.020, risk_bps=engine_cfg.get("DISCOVERY", {}).get("risk_bps", 0.0035), require_sma200=False, strategy_mode="discovery"
             )
             all_alerts.extend(disc_alerts)
-            if disc_lines:
-                section_reports.append("🛰️ **Engine 4 — Market-Wide AI Discovery Agent:**\n" + "\n".join(disc_lines))
+            if disc_lines: section_reports.append("🛰️ **Engine 4 — Market-Wide AI Discovery Agent:**\n" + "\n".join(disc_lines))
 
     if should_run("MEAN_REV"):
-        print("=== Running Engine 5: Statistical Mean-Reversion ===")
+        logging.info("=== Running Engine 5: Statistical Mean-Reversion ===")
         mr_candidates = screen_top_candidates(MEAN_REV_POOL, top_n=5, owned_symbols=owned_symbols, mode="mean_rev", tranche_name="MEAN_REV")
         mr_alerts, mr_lines = run_equity_tranche(
-            tranche_name="MEAN_REV", tickers=mr_candidates, sheet_ws=discovery_sheet,
-            raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-            equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-            is_nyse_open=is_nyse_open, buy_score_min=-0.10, exit_score_max=-0.30,
-            sl_atr_mult=1.0, tp_atr_mult=1.8, ratchet_trigger_pct=0.015,
-            risk_bps=engine_cfg.get("MEAN_REV", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="mean_rev"
+            tranche_name="MEAN_REV", tickers=mr_candidates, sheet_ws=discovery_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open, buy_score_min=-0.10, exit_score_max=-0.30, sl_atr_mult=1.0, tp_atr_mult=1.8, ratchet_trigger_pct=0.015, risk_bps=engine_cfg.get("MEAN_REV", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="mean_rev"
         )
         all_alerts.extend(mr_alerts)
-        if mr_lines:
-            section_reports.append("🧲 **Engine 5 — Statistical Mean-Reversion:**\n" + "\n".join(mr_lines))
+        if mr_lines: section_reports.append("🧲 **Engine 5 — Statistical Mean-Reversion:**\n" + "\n".join(mr_lines))
 
     if should_run("SMALL_CAP"):
-        print("=== Running Engine 6: Small-Cap Speculative Breakouts ===")
+        logging.info("=== Running Engine 6: Small-Cap Speculative Breakouts ===")
         sc_candidates = screen_top_candidates(SMALL_CAP_POOL, top_n=5, owned_symbols=owned_symbols, mode="small_cap", tranche_name="SMALL_CAP")
         sc_alerts, sc_lines = run_equity_tranche(
-            tranche_name="SMALL_CAP", tickers=sc_candidates, sheet_ws=discovery_sheet,
-            raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
-            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
-            equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
-            is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.12,
-            sl_atr_mult=1.2, tp_atr_mult=2.5, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("SMALL_CAP", {}).get("risk_bps", 0.0030), require_sma200=False, strategy_mode="small_cap"
+            tranche_name="SMALL_CAP", tickers=sc_candidates, sheet_ws=discovery_sheet, raw_positions=raw_positions, positions_map=positions_map, held_returns_map=held_returns_map,
+            dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h, equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
+            is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.12, sl_atr_mult=1.2, tp_atr_mult=2.5, ratchet_trigger_pct=0.020, risk_bps=engine_cfg.get("SMALL_CAP", {}).get("risk_bps", 0.0030), require_sma200=False, strategy_mode="small_cap"
         )
         all_alerts.extend(sc_alerts)
-        if sc_lines:
-            section_reports.append("🚀 **Engine 6 — Small-Cap Alpha Breakouts:**\n" + "\n".join(sc_lines))
+        if sc_lines: section_reports.append("🚀 **Engine 6 — Small-Cap Alpha Breakouts:**\n" + "\n".join(sc_lines))
 
     if should_run("TAIL_HEDGE"):
-        print("=== Running Engine 7: v8.0 Options GEX & Tail-Hedge Overlay ===")
+        logging.info("=== Running Engine 7: v8.0 Options GEX & Tail-Hedge Overlay ===")
         th_alerts, th_lines = run_tail_hedge_engine(
-            raw_positions, positions_map, active_orders, equity, is_nyse_open,
-            macro_ok, macro_reason, net_gex_score, engine_cfg.get("TAIL_HEDGE", {}).get("risk_bps", 0.0050)
+            raw_positions, positions_map, active_orders, equity, is_nyse_open, macro_ok, macro_reason, net_gex_score, engine_cfg.get("TAIL_HEDGE", {}).get("risk_bps", 0.0050)
         )
         all_alerts.extend(th_alerts)
-        if th_lines:
-            section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
+        if th_lines: section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
 
     if should_run("PREDATOR") and is_nyse_open:
-        print("=== Running Engine 8: Liquidity Predator ===")
+        logging.info("=== Running Engine 8: Liquidity Predator ===")
         pred_alerts, pred_lines = run_predator_tranche(
-            equity=equity, active_orders=active_orders, positions_map=positions_map,
-            sheet_ws=discovery_sheet, risk_bps=engine_cfg.get("PREDATOR", {}).get("risk_bps", 0.0050)
+            equity=equity, active_orders=active_orders, positions_map=positions_map, sheet_ws=discovery_sheet, risk_bps=engine_cfg.get("PREDATOR", {}).get("risk_bps", 0.0050)
         )
         all_alerts.extend(pred_alerts)
-        if pred_lines:
-            section_reports.append("🩸 **Engine 8 — Liquidity Predator (Flush Hunter):**\n" + "\n".join(pred_lines))
+        if pred_lines: section_reports.append("🩸 **Engine 8 — Liquidity Predator (Flush Hunter):**\n" + "\n".join(pred_lines))
 
     if all_alerts:
         send_discord_alert("🚨 **AETHER QUANT v8.6 Execution Alert (Multi-Asset Suites • RL Defensive Meta • Fee-Aware Arbiter):**\n" + "\n".join(all_alerts))
@@ -1679,8 +1335,7 @@ def run_bot(mode="auto"):
     try:
         time.sleep(2)
         account = api.get_account()
-        equity = float(account.equity)
-        last_equity = float(getattr(account, 'last_equity', equity) or equity)
+        equity, last_equity = float(account.equity), float(getattr(account, 'last_equity', account.equity) or account.equity)
         cash = float(getattr(account, 'cash', 0.0) or 0.0)
         day_pl = equity - last_equity
         day_pl_pct = (day_pl / last_equity) * 100 if last_equity > 0 else 0.0
@@ -1706,11 +1361,7 @@ def run_bot(mode="auto"):
 
         for p in sorted(positions_list, key=lambda x: float(x.market_value), reverse=True):
             sym = CRYPTO_NORM.get(str(p.symbol), str(p.symbol))
-            qty = float(p.qty)
-            entry = float(p.avg_entry_price)
-            curr = float(p.current_price)
-            mkt_val = float(p.market_value)
-            pl_dollar = float(p.unrealized_pl)
+            qty, entry, curr, mkt_val, pl_dollar = float(p.qty), float(p.avg_entry_price), float(p.current_price), float(p.market_value), float(p.unrealized_pl)
             pl_pct = float(p.unrealized_plpc) * 100 if hasattr(p, 'unrealized_plpc') and p.unrealized_plpc else ((curr - entry) / entry) * 100
 
             sym_orders = get_all_orders_for_ticker(sym, active_orders)
@@ -1718,26 +1369,17 @@ def run_bot(mode="auto"):
             tranche_tag = classify_symbol(sym)
 
             if tranche_tag == "CRYPTO":
-                qty_str = f"{qty:.4f} units"
-                stop_str = f"${entry * 0.97:.2f}"
-                tp_str = f"${entry * 1.06:.2f}"
+                qty_str, stop_str, tp_str = f"{qty:.4f} units", f"${entry * 0.97:.2f}", f"${entry * 1.06:.2f}"
             else:
                 qty_str = f"{int(qty)} sh"
                 for o in sym_orders:
                     if o.side == 'sell':
-                        if o.type in ['stop', 'stop_limit'] and o.stop_price:
-                            stop_str = f"${float(o.stop_price):.2f}"
-                        elif o.type == 'limit' and o.limit_price:
-                            tp_str = f"${float(o.limit_price):.2f}"
+                        if o.type in ['stop', 'stop_limit'] and o.stop_price: stop_str = f"${float(o.stop_price):.2f}"
+                        elif o.type == 'limit' and o.limit_price: tp_str = f"${float(o.limit_price):.2f}"
 
-            detailed_report += (
-                f"• **{sym}** `({tranche_tag})` ({qty_str} | `${mkt_val:,.0f}`): "
-                f"`${entry:.2f}` ➔ `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`) | "
-                f"🎯 TP: `{tp_str}` | 🛑 SL: `{stop_str}`\n"
-            )
+            detailed_report += (f"• **{sym}** `({tranche_tag})` ({qty_str} | `${mkt_val:,.0f}`): `${entry:.2f}` ➔ `${curr:.2f}` | P/L: `${pl_dollar:+,.2f}` (`{pl_pct:+.2f}%`) | 🎯 TP: `{tp_str}` | 🛑 SL: `{stop_str}`\n")
 
-        if section_reports:
-            detailed_report += "\n" + "\n\n".join(section_reports) + "\n"
+        if section_reports: detailed_report += "\n" + "\n\n".join(section_reports) + "\n"
 
         detailed_report += (
             f"\n🎛️ **Mobile One-Tap Command Deck:**\n"
@@ -1747,41 +1389,28 @@ def run_bot(mode="auto"):
             f"[📊 Push Snapshot]({DASHBOARD_URL}/?discord_cmd=snapshot)  |  "
             f"[🛑 Liquidate Crypto]({DASHBOARD_URL}/?discord_cmd=liquidate_crypto)"
         )
-
         send_discord_alert(detailed_report)
     except Exception as e:
-        print(f"Detailed portfolio report error: {e}")
+        logging.error(f"Detailed portfolio report error: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode",
-        default=os.environ.get("BOT_MODE", "smart_cron"),
-        choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "commodities", "defense", "predator", "smart_cron"]
-    )
+    parser.add_argument("--mode", default=os.environ.get("BOT_MODE", "smart_cron"), choices=["auto", "intraday", "all", "core", "momentum", "crypto", "discovery", "mean_rev", "small_cap", "tail_hedge", "commodities", "defense", "predator", "smart_cron"])
     args = parser.parse_args()
 
     if args.mode == "smart_cron":
         ny_now = datetime.now(ZoneInfo("America/New_York"))
-        is_weekday = ny_now.weekday() < 5
-        hr = ny_now.hour
-        mn = ny_now.minute
+        is_weekday, hr, mn = ny_now.weekday() < 5, ny_now.hour, ny_now.minute
 
-        print(f"🕰️ Smart Cron Router Triggered at NY Time: {hr:02d}:{mn:02d}")
-
-        # 1. NYSE Open/Close (Fires at 9:30-9:45 AM and 3:30-3:45 PM NY Time) -> Runs FULL SUITE
+        logging.info(f"🕰️ Smart Cron Router Triggered at NY Time: {hr:02d}:{mn:02d}")
         if is_weekday and ((hr == 9 and 30 <= mn <= 45) or (hr == 15 and 30 <= mn <= 45)):
-            print("➡️ Routing to: AUTO (Full Suite including Core)")
+            logging.info("➡️ Routing to: AUTO (Full Suite including Core)")
             run_bot(mode="auto")
-
-        # 2. Intraday Market Hours (10:00 AM to 3:00 PM NY Time) -> Runs HIGH-FREQ EQUITIES + CRYPTO
         elif is_weekday and ((hr == 9 and mn > 45) or (10 <= hr <= 14) or (hr == 15 and mn < 30) or (hr == 16 and mn == 0)):
-            print("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery + Predator, excluding Core)")
+            logging.info("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery + Predator, excluding Core)")
             run_bot(mode="intraday")
-
-        # 3. Overnight & Weekends -> Runs CRYPTO ONLY
         else:
-            print("➡️ Routing to: CRYPTO (24/7 Digital Asset Quant)")
+            logging.info("➡️ Routing to: CRYPTO (24/7 Digital Asset Quant)")
             run_bot(mode="crypto")
     else:
         run_bot(mode=args.mode)

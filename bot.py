@@ -153,7 +153,7 @@ DEFAULT_ENGINE_CONFIG = {
     "MEAN_REV":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
     "SMALL_CAP":   {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
     "TAIL_HEDGE":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"},
-    "COMMODITIES":{"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Precious Metals & Energy Hard Assets"},
+    "COMMODITIES": {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Precious Metals & Energy Hard Assets"},
     "DEFENSE":     {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "desc": "Aerospace & Defense Safe Haven"},
     "PREDATOR":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0050, "desc": "Engine 8: Retail Stop-Loss & Liquidity Flush Trapper"}
 }
@@ -957,7 +957,7 @@ def run_equity_tranche(
                     decision = f"EXIT QUEUED [{regime_tag}]"
                     action_taken = f"Awaiting NYSE Open ({exit_label})"
                 elif pdt_restricted and unrealized_pct > -0.04: # Allow emergency panic sells
-    decision = "EXIT BLOCKED (PDT Shield)"
+                    decision = "EXIT BLOCKED (PDT Shield)"
                 else:
                     try:
                         cancel_existing_orders_for_ticker(ticker, active_orders)
@@ -1175,6 +1175,14 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                         symbol=pair, qty=owned_qty, side='sell', type='stop_limit',
                         stop_price=stop_px, limit_price=limit_px, time_in_force='gtc'
                     )
+
+                    # Add this right AFTER your take-profit sell order in Code.py
+                    # Note: Added `if order.id != sell_order.id:` to ensure the exit order we JUST placed isn't canceled!
+                    open_orders = api.list_orders(status='open', symbols=[pair])
+                    for order in open_orders:
+                        if order.id != getattr(sell_order, 'id', None):
+                            api.cancel_order(order.id)
+
                     decision = f"EXIT [{regime_tag}]"
                     action_taken = f"Stop-Limit Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
                     if closed_sheet:
@@ -1227,29 +1235,27 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                     if qty_to_buy > 0:
                         try:
                             # 1. Execute the market buy
-api.submit_order(
-    symbol=pair, 
-    qty=qty_to_buy, 
-    side='buy', 
-    type='market', 
-    time_in_force='gtc'
-)
+                            api.submit_order(
+                                symbol=pair, 
+                                qty=qty_to_buy, 
+                                side='buy', 
+                                type='market', 
+                                time_in_force='gtc'
+                            )
 
-# 2. Calculate precision stops (using 8 decimal places for altcoins)
-# Adjust the 0.97 (3% drop) and 0.965 (3.5% limit) to match your exact risk tolerance
-stop_price = round(current_price * 0.97, 8) 
-limit_price = round(current_price * 0.965, 8) 
+                            # 2. Calculate precision stops (using 8 decimal places for altcoins)
+                            stop_price = round(current_price * 0.97, 8) 
+                            limit_price = round(current_price * 0.965, 8) 
 
-# 3. Immediately submit the server-side protective stop
-api.submit_order(
-    symbol=pair,
-    qty=qty_to_buy,
-    side='sell',
-    type='stop_limit',
-    time_in_force='gtc',
-    stop_price=stop_price,
-    limit_price=limit_price
-)
+                            # 3. Immediately submit the server-side protective stop
+                            api.submit_order(
+                                symbol=pair,
+                                qty=qty_to_buy,
+                                side='sell',
+                                type='stop_limit',
+                                time_in_force='gtc',
+                                stop_price=stop_price,
+                                limit_price=limit_price
                             )
                             decision = f"BULLISH [{regime_tag}]"
                             action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | OBI {obi:+.2f} | TP +{dyn_tp}%)"

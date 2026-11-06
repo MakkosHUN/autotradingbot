@@ -1226,8 +1226,30 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
 
                     if qty_to_buy > 0:
                         try:
-                            api.submit_order(
-                                symbol=pair, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc'
+                            # 1. Execute the market buy
+api.submit_order(
+    symbol=pair, 
+    qty=qty_to_buy, 
+    side='buy', 
+    type='market', 
+    time_in_force='gtc'
+)
+
+# 2. Calculate precision stops (using 8 decimal places for altcoins)
+# Adjust the 0.97 (3% drop) and 0.965 (3.5% limit) to match your exact risk tolerance
+stop_price = round(current_price * 0.97, 8) 
+limit_price = round(current_price * 0.965, 8) 
+
+# 3. Immediately submit the server-side protective stop
+api.submit_order(
+    symbol=pair,
+    qty=qty_to_buy,
+    side='sell',
+    type='stop_limit',
+    time_in_force='gtc',
+    stop_price=stop_price,
+    limit_price=limit_price
+)
                             )
                             decision = f"BULLISH [{regime_tag}]"
                             action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | OBI {obi:+.2f} | TP +{dyn_tp}%)"

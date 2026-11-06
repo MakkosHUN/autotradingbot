@@ -956,9 +956,8 @@ def run_equity_tranche(
                 if not is_nyse_open:
                     decision = f"EXIT QUEUED [{regime_tag}]"
                     action_taken = f"Awaiting NYSE Open ({exit_label})"
-                elif pdt_restricted:
-                    decision = "EXIT BLOCKED (PDT Shield)"
-                    action_taken = "Skipped sell to prevent PDT lock"
+                elif pdt_restricted and unrealized_pct > -0.04: # Allow emergency panic sells
+    decision = "EXIT BLOCKED (PDT Shield)"
                 else:
                     try:
                         cancel_existing_orders_for_ticker(ticker, active_orders)
@@ -1170,8 +1169,8 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                 try:
                     cancel_existing_orders_for_ticker(pair, active_orders)
                     # --- FIXED: Use stop_limit with strict offset instead of blind market sell to prevent slippage ---
-                    stop_px = round(current_price * 0.992, 4)
-                    limit_px = round(current_price * 0.985, 4)
+                    stop_px = round(current_price * 0.992, 8)
+                    limit_px = round(current_price * 0.985, 8)
                     sell_order = api.submit_order(
                         symbol=pair, qty=owned_qty, side='sell', type='stop_limit',
                         stop_price=stop_px, limit_price=limit_px, time_in_force='gtc'

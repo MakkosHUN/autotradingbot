@@ -1202,22 +1202,24 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
             if exit_reason:
                 try:
                     cancel_existing_orders_for_ticker(pair, active_orders)
-                    # Use 8-decimal precision so sub-penny altcoins (e.g. SHIB) never round to 0.0
-                    stop_px = round(current_price * 0.992, 8)
-                    limit_px = round(current_price * 0.985, 8)
-                    sell_order = api.submit_order(
-                        symbol=pair, qty=owned_qty, side='sell', type='stop_limit',
-                        stop_price=stop_px, limit_price=limit_px, time_in_force='gtc'
-                    )
+                    # Dynamic tick rounding: 8 decimals for sub-penny (SHIB), 4 for under $10, 2 for majors (BCH/BTC/ETH)
+                    price_decimals = 8 if current_price < 0.01 else (4 if current_price < 10.0 else 2)
+                    limit_px = round(current_price * 0.990, price_decimals)
 
-                    # Clean up any lingering open orders except the exit order just submitted
-                    open_orders = api.list_orders(status='open', symbols=[pair])
-                    for order in open_orders:
-                        if order.id != getattr(sell_order, 'id', None):
-                            api.cancel_order(order.id)
+                    try:
+                        # 1. Try a marketable LIMIT order (fills immediately right now, capped at 1% max slippage)
+                        sell_order = api.submit_order(
+                            symbol=pair, qty=pos.qty, side='sell', type='limit',
+                            limit_price=limit_px, time_in_force='ioc'
+                        )
+                        action_taken = f"Limit-Protected Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
+                    except Exception as lmt_err:
+                        logging.warning(f"Limit exit fallback to close_position for {pair}: {lmt_err}")
+                        # 2. Bulletproof fallback: native Alpaca close_position (handles SHIB precision & exact balances)
+                        sell_order = api.close_position(norm_sym)
+                        action_taken = f"Closed Position {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
 
                     decision = f"EXIT [{regime_tag}]"
-                    action_taken = f"Stop-Limit Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
                     if closed_sheet:
                         closed_sheet.append_row([
                             now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28],

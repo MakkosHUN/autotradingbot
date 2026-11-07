@@ -2201,13 +2201,17 @@ def render_live_terminal():
         with r_col1:
             st.markdown('<div class="sec-title"><span class="sec-dot"></span>60-Day Cross-Asset Pearson Correlation Matrix (Guard Threshold = 0.82)</div>', unsafe_allow_html=True)
             if not corr_matrix.empty and len(corr_matrix.columns) >= 2:
+                # Dynamically calculate height based on the number of active assets so it never squishes
+                num_assets = len(corr_matrix.columns)
+                dynamic_height = max(350, num_assets * 45)
+
                 fig_corr = px.imshow(
                     corr_matrix.round(2), text_auto=True,
                     color_continuous_scale=["#10B981", "#0F172A", "#F43F5E"], zmin=-1.0, zmax=1.0
                 )
                 fig_corr.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    height=350, margin=dict(t=10, b=10, l=10, r=10)
+                    height=dynamic_height, margin=dict(t=10, b=10, l=10, r=10)
                 )
                 st.plotly_chart(fig_corr, use_container_width=True)
             else:

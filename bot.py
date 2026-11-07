@@ -1474,9 +1474,13 @@ def run_bot(mode="auto"):
                 return
             time.sleep(5)
 
+    is_nyse_open = bool(clock.is_open)
+
     # If triggered by fallback schedule while NYSE is closed, only run Crypto
     if mode in ["auto", "intraday"] and not is_nyse_open:
         mode = "crypto"
+
+    equity = float(account.equity)
 
     account = api.get_account()
     equity = float(account.equity)

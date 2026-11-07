@@ -1481,6 +1481,7 @@ def run_bot(mode="auto"):
         mode = "crypto"
 
     equity = float(account.equity)
+    last_equity = float(getattr(account, 'last_equity', equity) or equity)
 
     account = api.get_account()
     equity = float(account.equity)

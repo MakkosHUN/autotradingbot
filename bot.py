@@ -1207,12 +1207,12 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                     limit_px = round(current_price * 0.990, price_decimals)
 
                     try:
-                        # 1. Try a marketable LIMIT order (fills immediately right now, capped at 1% max slippage)
-                        sell_order = api.submit_order(
-                            symbol=pair, qty=pos.qty, side='sell', type='limit',
-                            limit_price=limit_px, time_in_force='ioc'
-                        )
-                        action_taken = f"Limit-Protected Sold {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
+                        # Force native Alpaca position closure to bypass fractional lot-size and decimal rounding rejections
+                        sell_order = api.close_position(norm_sym)
+                        action_taken = f"Market-Liquidated Position {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
+                    except Exception as e:
+                        logging.error(f"Critical error closing crypto position {pair}: {e}")
+                        action_taken = f"Liquidation Failed: {e}"
                     except Exception as lmt_err:
                         logging.warning(f"Limit exit fallback to close_position for {pair}: {lmt_err}")
                         # 2. Bulletproof fallback: native Alpaca close_position (handles SHIB precision & exact balances)

@@ -1462,8 +1462,17 @@ def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bp
 # 11. MASTER ORCHESTRATOR
 # =====================================================================
 def run_bot(mode="auto"):
-    clock = api.get_clock()
-    is_nyse_open = bool(clock.is_open)
+    for attempt in range(3):
+        try:
+            clock = api.get_clock()
+            account = api.get_account()
+            break
+        except Exception as e:
+            logging.warning(f"Alpaca API temporarily unavailable (Attempt {attempt+1}/3): {e}")
+            if attempt == 2:
+                logging.error("Alpaca servers are undergoing maintenance. Exiting gracefully.")
+                return
+            time.sleep(5)
 
     # If triggered by fallback schedule while NYSE is closed, only run Crypto
     if mode in ["auto", "intraday"] and not is_nyse_open:

@@ -1754,13 +1754,35 @@ def render_live_terminal():
         with col_pie:
             st.markdown('<div class="sec-title"><span class="sec-dot"></span>Capital Allocation Ring & Exposure HUD</div>', unsafe_allow_html=True)
             if positions:
-                alloc_df = pd.DataFrame({
-                    "Asset": [f"{p['symbol']} ({p['tranche']})" for p in positions],
-                    "Value": [p["market_value"] for p in positions]
-                })
+                # Build raw dataframe
+                raw_alloc = pd.DataFrame([{
+                    "Asset": f"{p['symbol']} ({p['tranche']})",
+                    "Value": p["market_value"]
+                } for p in positions])
+                
+                # Group minor positions under 1.5% into an "Other" category to prevent label crowding
+                total_val = raw_alloc["Value"].sum()
+                if total_val > 0:
+                    raw_alloc["Pct"] = raw_alloc["Value"] / total_val
+                    threshold = 0.015  # 1.5% cutoff
+                    major_pos = raw_alloc[raw_alloc["Pct"] >= threshold]
+                    minor_pos = raw_alloc[raw_alloc["Pct"] < threshold]
+                    
+                    if not minor_pos.empty:
+                        other_row = pd.DataFrame({
+                            "Asset": ["Other (Micro-Positions)"],
+                            "Value": [minor_pos["Value"].sum()],
+                            "Pct": [minor_pos["Pct"].sum()]
+                        })
+                        alloc_df = pd.concat([major_pos, other_row], ignore_index=True)
+                    else:
+                        alloc_df = major_pos
+                else:
+                    alloc_df = raw_alloc
+
                 fig_pie = px.pie(
                     alloc_df, values="Value", names="Asset", hole=0.68,
-                    color_discrete_sequence=["#10B981", "#38BDF8", "#6366F1", "#8B5CF6", "#F59E0B", "#EC4899"]
+                    color_discrete_sequence=["#10B981", "#38BDF8", "#6366F1", "#8B5CF6", "#F59E0B", "#EC4899", "#64748B"]
                 )
                 fig_pie.update_traces(
                     textinfo="label+percent",

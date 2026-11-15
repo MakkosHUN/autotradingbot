@@ -1492,19 +1492,22 @@ def run_bot(mode="auto"):
     pdt_restricted = daytrade_count >= 3
 
     engine_cfg = load_or_init_engine_config()
-    
+
+    # If NYSE is closed (force-routed to crypto) and CRYPTO is disabled on Switchboard, exit immediately
+    if mode == "crypto" and not engine_cfg.get("CRYPTO", {}).get("enabled", False):
+        logging.info("NYSE is closed and CRYPTO engine is disabled on Switchboard. Exiting gracefully.")
+        return
+
     macro_ok, macro_reason, net_gex_score = check_macro_gex_and_circuit_breaker(equity, last_equity)
     dynamic_caps = compute_rl_meta_allocation(engine_cfg, net_gex_score)
 
     def should_run(eng_key):
-        if mode == "all":
-            return True
-        if mode == eng_key.lower():
+        if not engine_cfg.get(eng_key, {}).get("enabled", False):
+            return False
+        if mode in ["all", "auto"] or mode == eng_key.lower():
             return True
         if mode == "intraday":
-            return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"] and engine_cfg.get(eng_key, {}).get("enabled", False)
-        if mode == "auto":
-            return engine_cfg.get(eng_key, {}).get("enabled", False)
+            return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"]
         return False
 
     raw_positions = api.list_positions()

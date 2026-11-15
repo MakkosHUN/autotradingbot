@@ -533,31 +533,35 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
         ):
             buy_signal = True
 
-        # Anti-Churn Crypto Arbiter
+        # Permanent Crypto Arbiter: Requires real news/OBI catalyst + uptrend confirmation
         if strategy_mode == "crypto":
-    buy_signal = (
-        price > ema9 > ema20
-        and 48.0 <= rsi <= 68.0
-        and finbert_score >= 0.20
-        and obi_score >= 0.05
-    )
+            is_crypto_trend_breakout = (
+                price > ema9 > ema20
+                and price >= vwap5
+                and 46.0 <= rsi <= 68.0
+                and obi_score >= 0.08
+                and finbert_score >= 0.15
             )
-            is_crypto_quiet_breakout = (
-                price > ema20
-                and 42.0 <= rsi <= 72.0
-                and obi_score >= 0.15
-                and finbert_score >= 0.25
+            is_crypto_confirmed_reversal = (
+                rsi <= 30.0
+                and price > ema9  # Must already be bouncing above 9-EMA, never a free-falling knife
+                and obi_score >= 0.20  # Requires heavy +20% L2 order-book bid absorption
+                and finbert_score >= 0.05  # Blocks 0.000 "no-news" altcoin traps
             )
-            if is_crypto_oversold_snipe:
-                regime = "CRYPTO-SNIPE"
+            if is_crypto_confirmed_reversal:
+                regime = "CRYPTO-REVERSAL"
                 composite = round(max(composite, 0.45), 3)
-                tp_adj = 0.85
-                rsi_max = 75.0
+                tp_adj = 0.90
+                rsi_max = 70.0
                 buy_signal = True
-            elif is_crypto_quiet_breakout and not buy_signal:
-                regime = "TECH-10/90"
-                composite = round(max(composite, 0.35), 3)
+            elif is_crypto_trend_breakout:
+                regime = "CRYPTO-TREND"
+                composite = round(max(composite, 0.40), 3)
+                tp_adj = 1.15
+                rsi_max = 70.0
                 buy_signal = True
+            else:
+                buy_signal = False
 
         arbiter_exit_reason = None
         if regime == "CRYPTO-SNIPE" and rsi >= 60.0:
@@ -745,11 +749,17 @@ def get_finbert_sentiment(headlines):
 def get_technicals_and_atr(ticker):
     try:
         yf_sym = to_yf_symbol(ticker)
-        df = yf.Ticker(yf_sym).history(period="1y")
-        if df.empty or len(df) < 25:
+        is_crypto = "/" in ticker
+        if is_crypto:
+            # 1-hour intraday candles for 48x/day crypto execution
+            df = yf.Ticker(yf_sym).history(period="1mo", interval="1h")
+        else:
+            df = yf.Ticker(yf_sym).history(period="1y", interval="1d")
+
+        if df.empty or len(df) < 30:
             return None
         close = df['Close'].dropna()
-        if len(close) < 25:
+        if len(close) < 30:
             return None
         current_price = float(close.iloc[-1])
         sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float(close.mean())
@@ -786,7 +796,10 @@ def get_technicals_and_atr(ticker):
 
         hl_range = float(df['High'].iloc[-1] - df['Low'].iloc[-1])
         mfm = float(((current_price - float(df['Low'].iloc[-1])) - (float(df['High'].iloc[-1]) - current_price)) / hl_range) if hl_range > 0 else 0.0
-        returns_60d = close.pct_change().dropna().tail(60)
+       if is_crypto:
+            returns_60d = close.resample("1D").last().dropna().pct_change().dropna().tail(60)
+        else:
+            returns_60d = close.pct_change().dropna().tail(60)
 
         return {
             "price": current_price,
@@ -1158,21 +1171,50 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
     return hedge_alerts, hedge_lines
 
 # =====================================================================
-# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (ANTI-CHURN + 4H COOLDOWN)
+# 10. ENGINE 3: 24/7 CRYPTO AI QUANT EXECUTOR (SPREAD GUARD + BTC SHIELD + ATR STOPS)
 # =====================================================================
+def get_crypto_quote_and_spread(pair):
+    """Fetches live bid, ask, mid-price, and spread % from Alpaca US Crypto feed."""
+    try:
+        quotes = api.get_latest_crypto_quotes([pair], "us")
+        q = quotes.get(pair)
+        if q:
+            bid = float(getattr(q, "bp", 0.0) or getattr(q, "bid_price", 0.0) or 0.0)
+            ask = float(getattr(q, "ap", 0.0) or getattr(q, "ask_price", 0.0) or 0.0)
+            if bid > 0 and ask >= bid:
+                mid = (bid + ask) / 2.0
+                spread_pct = (ask - bid) / mid
+                return bid, ask, mid, spread_pct
+    except Exception as e:
+        logging.warning(f"Crypto quote check note for {pair}: {e}")
+    return 0.0, 0.0, 0.0, 0.0
+
 def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, closed_orders_24h, equity, macro_ok, macro_reason, risk_bps):
     crypto_alerts = []
     scan_lines = []
     rows_to_append = []
 
+    # --- 1. BITCOIN MACRO REGIME SHIELD ---
+    btc_headlines = get_fresh_dual_news("BTC/USD")
+    btc_score = get_finbert_sentiment(btc_headlines)
+    btc_tech = get_technicals_and_atr("BTC/USD")
+    btc_macro_ok = True
+    btc_macro_reason = "BTC Normal"
+    if btc_tech is not None:
+        if btc_score <= -0.15 or (btc_tech["price"] < btc_tech["ema20"] and btc_tech["rsi14"] < 42.0):
+            btc_macro_ok = False
+            btc_macro_reason = f"BTC Downtrend Shield (BTC FinBERT {btc_score:+.2f}, RSI {btc_tech['rsi14']:.1f})"
+
     for pair in crypto_candidates:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        headlines = get_fresh_dual_news(pair)
-        score = get_finbert_sentiment(headlines)
-        tech = get_technicals_and_atr(pair)
+        headlines = btc_headlines if pair == "BTC/USD" else get_fresh_dual_news(pair)
+        score = btc_score if pair == "BTC/USD" else get_finbert_sentiment(headlines)
+        tech = btc_tech if pair == "BTC/USD" else get_technicals_and_atr(pair)
         obi = get_orderbook_imbalance(pair)
+        bid_px, ask_px, mid_px, spread_pct = get_crypto_quote_and_spread(pair)
+
         rsi_val = f"{tech['rsi14']:.1f}" if tech else "N/A"
-        arb = compute_arbiter_matrix(score, tech, obi_score=obi, base_buy_min=0.05, base_exit_max=-0.35, strategy_mode="crypto")
+        arb = compute_arbiter_matrix(score, tech, obi_score=obi, base_buy_min=0.15, base_exit_max=-0.30, strategy_mode="crypto")
         regime_tag = arb["regime"]
 
         norm_sym = to_alpaca_pos_symbol(pair)
@@ -1187,54 +1229,41 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
             unrealized_pct = (current_price - entry_price) / entry_price
             unrealized_dlr = (current_price - entry_price) * owned_qty
 
-            dynamic_tp_pct = 0.060 * arb["tp_adj"]
+            # Dynamic 2.0x ATR Stop-Loss & 4.0x ATR Take-Profit (clamped for safety)
+            atr_val = tech["atr14"] if tech else (entry_price * 0.025)
+            dyn_sl_pct = -max(0.025, min(0.060, (2.0 * atr_val) / entry_price))
+            dyn_tp_pct = max(0.050, min(0.120, (4.0 * atr_val * arb["tp_adj"]) / entry_price))
+
             exit_reason = None
-            if unrealized_pct >= dynamic_tp_pct:
-                exit_reason = f"Arbiter Take-Profit Hit (+{unrealized_pct*100:.2f}% in {regime_tag})"
-            elif unrealized_pct <= -0.030:
-                exit_reason = f"Crypto Stop-Loss Hit ({unrealized_pct*100:.2f}%)"
-            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.008:
+            if unrealized_pct >= dyn_tp_pct:
+                exit_reason = f"ATR Take-Profit Hit (+{unrealized_pct*100:.2f}% >= +{dyn_tp_pct*100:.1f}%)"
+            elif unrealized_pct <= dyn_sl_pct:
+                exit_reason = f"ATR Stop-Loss Hit ({unrealized_pct*100:.2f}% <= {dyn_sl_pct*100:.1f}%)"
+            elif arb["arbiter_exit_reason"] and unrealized_pct > 0.015:
                 exit_reason = arb["arbiter_exit_reason"]
-            elif score <= -0.35:
+            elif score <= -0.35 and unrealized_pct < 0.01:
                 exit_reason = f"Bearish Crypto Catalyst ({score:+.3f})"
 
             if exit_reason:
                 try:
                     cancel_existing_orders_for_ticker(pair, active_orders)
-                    # Dynamic tick rounding: 8 decimals for sub-penny (SHIB), 4 for under $10, 2 for majors (BCH/BTC/ETH)
-                    price_decimals = 8 if current_price < 0.01 else (4 if current_price < 10.0 else 2)
-                    limit_px = round(current_price * 0.990, price_decimals)
-
-                    try:
-                        # Force native Alpaca position closure to bypass fractional lot-size and decimal rounding rejections
-                        sell_order = api.close_position(norm_sym)
-                        action_taken = f"Market-Liquidated Position {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
-                    except Exception as e:
-                        logging.error(f"Critical error closing crypto position {pair}: {e}")
-                        action_taken = f"Liquidation Failed: {e}"
-                    except Exception as lmt_err:
-                        logging.warning(f"Limit exit fallback to close_position for {pair}: {lmt_err}")
-                        # 2. Bulletproof fallback: native Alpaca close_position (handles SHIB precision & exact balances)
-                        sell_order = api.close_position(norm_sym)
-                        action_taken = f"Closed Position {owned_qty:.4f} @ ~${current_price:.2f} ({exit_reason})"
-
+                    sell_order = api.close_position(norm_sym)
                     decision = f"EXIT [{regime_tag}]"
+                    action_taken = f"Liquidated Position {owned_qty:.4f} @ ~${current_price:.4f} ({exit_reason})"
                     if closed_sheet:
                         closed_sheet.append_row([
                             now_str[:19], pair, f"{owned_qty:.4f}", exit_reason[:28],
-                            f"${current_price:.2f}", str(getattr(sell_order, 'id', 'CRYPTO_STPLMT')),
-                            "CRYPTO", f"${entry_price:.2f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
+                            f"${current_price:.4f}", str(getattr(sell_order, 'id', 'CRYPTO_CLOSE')),
+                            "CRYPTO", f"${entry_price:.4f}", f"${unrealized_dlr:+.2f}", f"{unrealized_pct*100:+.2f}%"
                         ])
                     owned_qty = 0.0
                     crypto_alerts.append(f"🪙 **[CRYPTO EXIT | {regime_tag}] {pair}**: {action_taken} (P/L: `${unrealized_dlr:+.2f}`)")
                 except Exception as e:
                     decision = "EXIT"
-                    action_taken = f"Crypto Sell Failed: {e}"
+                    action_taken = f"Crypto Liquidation Failed: {e}"
             else:
-                if unrealized_pct >= 0.025:
-                    decision = f"HOLD (🛡️ +2.5% Trail | {regime_tag})"
-                elif arb.get("fee_block_reason"):
-                    decision = f"BULLISH (Blocked: {arb['fee_block_reason']})"
+                if unrealized_pct >= 0.030:
+                    decision = f"HOLD (🛡️ +{unrealized_pct*100:.1f}% Open Gain | {regime_tag})"
                 elif arb["buy_signal"]:
                     decision = f"BULLISH (Holding | {regime_tag})"
                 else:
@@ -1250,67 +1279,53 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                 )
                 if not macro_ok and "CIRCUIT BREAKER" in macro_reason:
                     decision = f"BULLISH (Blocked: {macro_reason})"
-                elif was_crypto_sold_recently(pair, closed_orders_24h, hours=4):
-                    decision = "BULLISH (Blocked: 4h Exit Cooldown)"
+                elif not btc_macro_ok:
+                    decision = f"BULLISH (Blocked: {btc_macro_reason})"
+                elif spread_pct > 0.0035:
+                    decision = f"BULLISH (Blocked: Spread {spread_pct*100:.2f}% > 0.35% Max)"
+                elif was_crypto_sold_recently(pair, closed_orders_24h, hours=6):
+                    decision = "BULLISH (Blocked: 6h Exit Cooldown)"
                 elif not corr_ok:
                     decision = f"BULLISH (Blocked: {corr_reason})"
-                elif regime_tag != "CRYPTO-SNIPE" and tech["price"] < tech["ema20"]:
-                    decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
+                elif tech["price"] < tech["ema20"]:
+                    decision = f"BULLISH (Blocked: Below 1h 20-EMA ${tech['ema20']:.2f})"
                 else:
-                    price = tech['price']
+                    price = ask_px if ask_px > 0 else tech['price']
                     atr = max(tech['atr14'], price * 0.015)
+                    # Size using 2.0x ATR stop distance so dollar risk is strictly capped
                     qty_to_buy = compute_atr_risk_parity_qty(
                         equity=equity, price=price, atr=atr,
-                        sl_atr_mult=1.2, risk_bps=risk_bps,
-                        max_notional_pct=0.035, is_crypto=True
+                        sl_atr_mult=2.0, risk_bps=risk_bps,
+                        max_notional_pct=0.030, is_crypto=True
                     )
-                    dyn_tp = round(6.0 * arb["tp_adj"], 1)
+                    price_decimals = 4 if price < 10.0 else 2
+                    limit_buy_px = round(price * 1.001, price_decimals)
 
                     if qty_to_buy > 0:
                         try:
-                            # 1. Execute the market buy
                             api.submit_order(
                                 symbol=pair,
                                 qty=qty_to_buy,
                                 side='buy',
-                                type='market',
+                                type='limit',
+                                limit_price=limit_buy_px,
                                 time_in_force='gtc'
                             )
-
-                            # 2. Wait briefly for settlement, then attach server-side protective stop using `price`
-                            time.sleep(1.5)
-                            stop_price = round(price * 0.97, 8)
-                            limit_price = round(price * 0.965, 8)
-                            try:
-                                api.submit_order(
-                                    symbol=pair,
-                                    qty=qty_to_buy,
-                                    side='sell',
-                                    type='stop_limit',
-                                    time_in_force='gtc',
-                                    stop_price=stop_price,
-                                    limit_price=limit_price
-                                )
-                            except Exception as stop_err:
-                                logging.warning(f"Server-side crypto stop note for {pair}: {stop_err}")
-
                             decision = f"BULLISH [{regime_tag}]"
-                            action_taken = f"Risk-Parity Bought {qty_to_buy:.4f} @ ~${price:.2f} ({regime_tag} | OBI {obi:+.2f} | TP +{dyn_tp}%)"
+                            action_taken = f"Limit Bought {qty_to_buy:.4f} @ ${limit_buy_px:.4f} (Spread {spread_pct*100:.2f}% | OBI {obi:+.2f})"
                             held_returns_map[pair] = tech["returns_60d"]
                             crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")
                         except Exception as e:
                             decision = f"BULLISH [{regime_tag}]"
                             action_taken = f"Crypto Buy Failed: {e}"
-            elif tech is not None and score >= 0.15 and tech["price"] < tech["ema20"]:
-                decision = f"BULLISH (Blocked: Below 20-EMA ${tech['ema20']:.2f})"
-            elif score <= -0.10:
+            elif score <= -0.15:
                 decision = f"BEARISH (Not Owned | {regime_tag})"
             else:
                 decision = f"HOLD [{regime_tag}]"
 
         row = [now_str, pair, f"{score:+.3f}", decision, action_taken, f"Holding {owned_qty:.4f} units"]
         rows_to_append.append(row)
-        logging.info(f"[CRYPTO] {pair}: {score:+.3f} | OBI {obi:+.2f} | {decision} | {action_taken}")
+        logging.info(f"[CRYPTO] {pair}: {score:+.3f} | OBI {obi:+.2f} | Spread {spread_pct*100:.2f}% | {decision} | {action_taken}")
         scan_lines.append(f"• **{pair}** `[{regime_tag}]`: FinBERT `{score:+.3f}` | OBI `{obi:+.2f}` | RSI `{rsi_val}` ➔ `{decision}`")
         time.sleep(0.35)
 
@@ -1492,7 +1507,7 @@ def run_bot(mode="auto"):
 
     engine_cfg = load_or_init_engine_config()
 
-    # If NYSE is closed (force-routed to crypto) and CRYPTO is disabled on Switchboard, exit immediately
+    # If NYSE is closed (routed to crypto) and CRYPTO is disabled on Switchboard, exit cleanly
     if mode == "crypto" and not engine_cfg.get("CRYPTO", {}).get("enabled", False):
         logging.info("NYSE is closed and CRYPTO engine is disabled on Switchboard. Exiting gracefully.")
         return

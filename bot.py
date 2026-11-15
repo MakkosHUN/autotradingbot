@@ -564,7 +564,7 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
                 buy_signal = False
 
         arbiter_exit_reason = None
-        if regime == "CRYPTO-SNIPE" and rsi >= 60.0:
+        if regime == "CRYPTO-REVERSAL" and rsi >= 60.0:
             arbiter_exit_reason = f"Crypto Oversold Snapback Target (RSI {rsi:.1f})"
         elif regime == "NEWS-90/10" and finbert_score <= base_exit_max:
             arbiter_exit_reason = f"Arbiter 90/10 News Reversal ({finbert_score:+.3f})"

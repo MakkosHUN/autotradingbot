@@ -573,12 +573,13 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
         elif regime == "HYBRID-50/50" and composite <= base_exit_max and price < ema9:
             arbiter_exit_reason = f"Arbiter 50/50 Hybrid Breakdown (Comp {composite:+.3f})"
 
-    # --- NEW: Slippage & Fee-Aware Net Alpha Filter ---
+    # --- Slippage & Fee-Aware Net Alpha Filter (Scaled for 1h Crypto ATR vs 1d Equity ATR) ---
     fee_block_reason = None
-    fee_hurdle = 0.50 if strategy_mode == "crypto" else 0.20
+    fee_hurdle = 0.45 if strategy_mode == "crypto" else 0.20
+    atr_horizon_mult = 4.0 if strategy_mode == "crypto" else 2.0
     if price > 0:
         atr = tech["atr14"]
-        expected_alpha_pct = abs(composite) * (atr / price) * 100.0 * 2.0
+        expected_alpha_pct = abs(composite) * (atr / price) * 100.0 * atr_horizon_mult
         if buy_signal and expected_alpha_pct < fee_hurdle:
             buy_signal = False
             fee_block_reason = f"Fee Hurdle: Alpha {expected_alpha_pct:.2f}% < {fee_hurdle}%"

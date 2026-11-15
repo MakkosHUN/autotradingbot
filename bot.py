@@ -796,7 +796,7 @@ def get_technicals_and_atr(ticker):
 
         hl_range = float(df['High'].iloc[-1] - df['Low'].iloc[-1])
         mfm = float(((current_price - float(df['Low'].iloc[-1])) - (float(df['High'].iloc[-1]) - current_price)) / hl_range) if hl_range > 0 else 0.0
-       if is_crypto:
+        if is_crypto:
             returns_60d = close.resample("1D").last().dropna().pct_change().dropna().tail(60)
         else:
             returns_60d = close.pct_change().dropna().tail(60)

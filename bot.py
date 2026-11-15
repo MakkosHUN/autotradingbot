@@ -546,8 +546,8 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
             is_crypto_quiet_breakout = (
                 price > ema20
                 and 42.0 <= rsi <= 72.0
-                and obi_score >= 0.00
-                and finbert_score >= 0.00
+                and obi_score >= 0.15
+                and finbert_score >= 0.25
             )
             if is_crypto_oversold_snipe:
                 regime = "CRYPTO-SNIPE"
@@ -983,7 +983,7 @@ def run_equity_tranche(
             unrealized_pct = (current_price - entry_price) / entry_price
             unrealized_dlr = (current_price - entry_price) * owned_qty
 
-            should_exit = (score <= exit_score_max) or (arb["arbiter_exit_reason"] is not None and unrealized_pct > 0.005)
+            should_exit = (score <= exit_score_max) or (arb["arbiter_exit_reason"] is not None and unrealized_pct > 0.025)
             exit_label = arb["arbiter_exit_reason"] or f"Bearish Sentiment ({score:+.3f})"
 
             if should_exit:

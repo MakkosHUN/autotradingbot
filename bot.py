@@ -535,10 +535,12 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
 
         # Anti-Churn Crypto Arbiter
         if strategy_mode == "crypto":
-            is_crypto_oversold_snipe = (
-                (rsi <= 32.0 or price <= bb_low * 1.005)
-                and obi_score >= -0.02
-                and finbert_score > -0.15
+    buy_signal = (
+        price > ema9 > ema20
+        and 48.0 <= rsi <= 68.0
+        and finbert_score >= 0.20
+        and obi_score >= 0.05
+    )
             )
             is_crypto_quiet_breakout = (
                 price > ema20

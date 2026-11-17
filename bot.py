@@ -620,11 +620,15 @@ def compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult, risk_bps=0.0045
         return float(max(Decimal('0.0001'), target_qty).quantize(Decimal('0.0001'), rounding=ROUND_DOWN))
     return max(1, int(target_qty.quantize(Decimal('1'), rounding=ROUND_DOWN)))
 
-def check_correlation_and_exposure_guard(candidate, tranche_name, raw_positions, equity, candidate_returns, held_returns_map, dynamic_caps):
+def check_correlation_and_exposure_guard(candidate, tranche_name, raw_positions, equity, candidate_returns, held_returns_map, dynamic_caps, pending_tranche_spend=0.0, max_total_exposure=0.65):
+    total_invested = sum(float(p.market_value) for p in raw_positions) + pending_tranche_spend
+    if equity > 0 and (total_invested / equity) >= max_total_exposure:
+        return False, f"Portfolio Max Exposure {max_total_exposure*100:.0f}% Reached (35% Dry Powder Guard)"
+
     tranche_invested = sum(
         float(p.market_value) for p in raw_positions
         if classify_symbol(CRYPTO_NORM.get(str(p.symbol), str(p.symbol))) == tranche_name
-    )
+    ) + pending_tranche_spend
     max_cap = dynamic_caps.get(tranche_name, 0.25)
     if equity > 0 and (tranche_invested / equity) >= max_cap:
         return False, f"RL Cap {max_cap*100:.1f}% Reached"

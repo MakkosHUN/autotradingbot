@@ -1582,7 +1582,7 @@ def run_bot(mode="auto"):
             dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.15,
-            sl_atr_mult=1.5, tp_atr_mult=3.5, ratchet_trigger_pct=0.020,
+            sl_atr_mult=1.5, tp_atr_mult=3.5, ratchet_trigger_pct=0.015,
             risk_bps=engine_cfg.get("CORE", {}).get("risk_bps", 0.0050), require_sma200=True, strategy_mode="core"
         )
         all_alerts.extend(core_alerts)
@@ -1598,7 +1598,7 @@ def run_bot(mode="auto"):
             dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.12,
-            sl_atr_mult=1.0, tp_atr_mult=2.0, ratchet_trigger_pct=0.020,
+            sl_atr_mult=1.0, tp_atr_mult=2.0, ratchet_trigger_pct=0.015,
             risk_bps=engine_cfg.get("MOMENTUM", {}).get("risk_bps", 0.0040), require_sma200=False, strategy_mode="momentum"
         )
         all_alerts.extend(mom_alerts)
@@ -1614,7 +1614,7 @@ def run_bot(mode="auto"):
             dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
-            sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
+            sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.015,
             risk_bps=engine_cfg.get("COMMODITIES", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
         )
         all_alerts.extend(comm_alerts)
@@ -1630,7 +1630,7 @@ def run_bot(mode="auto"):
             dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
-            sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
+            sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.015,
             risk_bps=engine_cfg.get("DEFENSE", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
         )
         all_alerts.extend(def_alerts)
@@ -1647,7 +1647,7 @@ def run_bot(mode="auto"):
                 dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
                 equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
                 is_nyse_open=is_nyse_open, buy_score_min=0.15, exit_score_max=-0.15,
-                sl_atr_mult=1.2, tp_atr_mult=2.8, ratchet_trigger_pct=0.020,
+                sl_atr_mult=1.2, tp_atr_mult=2.8, ratchet_trigger_pct=0.015,
                 risk_bps=engine_cfg.get("DISCOVERY", {}).get("risk_bps", 0.0035), require_sma200=False, strategy_mode="discovery"
             )
             all_alerts.extend(disc_alerts)
@@ -1663,7 +1663,7 @@ def run_bot(mode="auto"):
             dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=-0.10, exit_score_max=-0.30,
-            sl_atr_mult=1.0, tp_atr_mult=1.8, ratchet_trigger_pct=0.020,
+            sl_atr_mult=1.0, tp_atr_mult=1.8, ratchet_trigger_pct=0.015,
             risk_bps=engine_cfg.get("MEAN_REV", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="mean_rev"
         )
         all_alerts.extend(mr_alerts)
@@ -1679,7 +1679,7 @@ def run_bot(mode="auto"):
             dynamic_caps=dynamic_caps, active_orders=active_orders, closed_orders_24h=closed_orders_24h,
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.12,
-            sl_atr_mult=1.2, tp_atr_mult=2.5, ratchet_trigger_pct=0.020,
+            sl_atr_mult=1.2, tp_atr_mult=2.5, ratchet_trigger_pct=0.015,
             risk_bps=engine_cfg.get("SMALL_CAP", {}).get("risk_bps", 0.0030), require_sma200=False, strategy_mode="small_cap"
         )
         all_alerts.extend(sc_alerts)

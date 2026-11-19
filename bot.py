@@ -388,7 +388,8 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
     remaining_pool = [t for t in pool if t not in always_include]
     slots_left = max(0, top_n - len(always_include))
     if slots_left == 0 or not remaining_pool:
-        return always_include[:top_n]
+        if slots_left == 0 or not remaining_pool:
+        return always_include
 
     yf_map = {to_yf_symbol(t): t for t in remaining_pool}
     yf_list = list(yf_map.keys())
@@ -869,13 +870,12 @@ def has_upcoming_earnings_48h(ticker):
 def fetch_active_and_held_orders():
     active = {}
     try:
+        # Flat query captures all open and 'held' bracket legs directly, even on older positions
+        for o in api.list_orders(status='open', nested=False, limit=500):
+            if o.status in ['new', 'held', 'accepted', 'partially_filled']:
+                active[o.id] = o
         for o in api.list_orders(status='open', nested=True, limit=200):
             active[o.id] = o
-            if hasattr(o, 'legs') and o.legs:
-                for leg in o.legs:
-                    if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
-                        active[leg.id] = leg
-        for o in api.list_orders(status='closed', nested=True, limit=200):
             if hasattr(o, 'legs') and o.legs:
                 for leg in o.legs:
                     if leg.status in ['new', 'held', 'accepted', 'partially_filled']:
@@ -1532,7 +1532,7 @@ def run_bot(mode="auto"):
         if mode in ["all", "auto"] or mode == eng_key.lower():
             return True
         if mode == "intraday":
-            return eng_key in ["MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"]
+            return eng_key in ["CORE", "MOMENTUM", "CRYPTO", "DISCOVERY", "MEAN_REV", "SMALL_CAP", "TAIL_HEDGE", "COMMODITIES", "DEFENSE", "PREDATOR"]
         return False
 
     raw_positions = api.list_positions()
@@ -1802,14 +1802,14 @@ if __name__ == "__main__":
 
         logging.info(f"🕰️ Smart Cron Router Triggered at NY Time: {hr:02d}:{mn:02d}")
 
-        # 1. NYSE Open/Close (Fires at 9:30-9:45 AM and 3:30-3:45 PM NY Time) -> Runs FULL SUITE
-        if is_weekday and ((hr == 9 and 30 <= mn <= 45) or (hr == 15 and 30 <= mn <= 45)):
+        # 1. NYSE Open/Close (9:30-9:45 AM and 3:30-3:59 PM NY Time) -> Runs FULL SUITE
+        if is_weekday and ((hr == 9 and 30 <= mn <= 45) or (hr == 15 and mn >= 30)):
             logging.info("➡️ Routing to: AUTO (Full Suite including Core)")
             run_bot(mode="auto")
 
-        # 2. Intraday Market Hours (10:00 AM to 3:00 PM NY Time) -> Runs HIGH-FREQ EQUITIES + CRYPTO
-        elif is_weekday and ((hr == 9 and mn > 45) or (10 <= hr <= 14) or (hr == 15 and mn < 30) or (hr == 16 and mn == 0)):
-            logging.info("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery + Predator, excluding Core)")
+        # 2. Intraday Market Hours (9:46 AM to 3:29 PM NY Time) -> Runs HIGH-FREQ EQUITIES + CRYPTO
+        elif is_weekday and ((hr == 9 and mn > 45) or (10 <= hr <= 14) or (hr == 15 and mn < 30)):
+            logging.info("➡️ Routing to: INTRADAY (Equities + Crypto + Discovery + Predator)")
             run_bot(mode="intraday")
 
         # 3. Overnight & Weekends -> Runs CRYPTO ONLY

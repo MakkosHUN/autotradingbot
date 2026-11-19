@@ -1735,7 +1735,8 @@ def run_bot(mode="auto"):
         logging.info("=== Running Engine 8: Liquidity Predator ===")
         pred_alerts, pred_lines = run_predator_tranche(
             equity=equity, active_orders=active_orders, positions_map=positions_map,
-            sheet_ws=discovery_sheet, risk_bps=engine_cfg.get("PREDATOR", {}).get("risk_bps", 0.0050)
+            sheet_ws=discovery_sheet, risk_bps=engine_cfg.get("PREDATOR", {}).get("risk_bps", 0.0050),
+            raw_positions=raw_positions, dynamic_caps=dynamic_caps, macro_ok=macro_ok
         )
         all_alerts.extend(pred_alerts)
         if pred_lines:

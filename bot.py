@@ -1031,10 +1031,26 @@ def run_equity_tranche(
                         decision = "BEARISH"
                         action_taken = f"Sell Failed: {e}"
             else:
-                if is_nyse_open and unrealized_pct >= ratchet_trigger_pct:
+                if is_nyse_open:
                     ticker_orders = get_all_orders_for_ticker(ticker, active_orders)
                     ticker_stops = [o for o in ticker_orders if o.side == 'sell' and o.type in ['stop', 'stop_limit']]
-                    if ticker_stops:
+                    if not ticker_stops and tech is not None:
+                        atr_val = max(tech['atr14'], current_price * 0.01)
+                        repair_stop = round(min(entry_price, current_price) - (sl_atr_mult * atr_val), 2)
+                        try:
+                            api.submit_order(
+                                symbol=ticker,
+                                qty=owned_qty,
+                                side='sell',
+                                type='stop',
+                                stop_price=repair_stop,
+                                time_in_force='gtc'
+                            )
+                            action_taken = f"Self-Healing Stop Attached -> ${repair_stop:.2f}"
+                            tranche_alerts.append(f"🛡️ **[{tranche_name}] SELF-HEALING STOP ({ticker})**: Attached missing GTC Stop-Loss @ `${repair_stop:.2f}`")
+                        except Exception as e:
+                            logging.warning(f"Self-healing stop note for {ticker}: {e}")
+                    elif ticker_stops and unrealized_pct >= ratchet_trigger_pct:
                         stop_order = ticker_stops[0]
                         curr_stop = float(stop_order.stop_price)
                         atr_val = tech['atr14'] if tech else (current_price * 0.02)

@@ -1448,9 +1448,23 @@ def map_liquidity_clusters_and_bid(ticker, df_yf, equity, risk_bps):
     }
 
 def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bps):
+def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bps, raw_positions=None, dynamic_caps=None, macro_ok=True):
     alerts = []
     lines = []
     rows_to_append = []
+
+    if not macro_ok or equity <= 0:
+        return alerts, lines
+
+    invested_now = sum(float(p.market_value) for p in (raw_positions or []))
+    resting_buy_orders = [o for o in active_orders if o.side == 'buy' and o.type == 'limit' and getattr(o, 'limit_price', None)]
+    resting_buy_notional = sum(float(o.qty) * float(o.limit_price) for o in resting_buy_orders)
+    max_predator_cap = (dynamic_caps or {}).get("PREDATOR", 0.15)
+    pending_predator_spend = 0.0
+
+    if ((invested_now + resting_buy_notional) / equity) >= 0.65:
+        logging.info("[PREDATOR] Skipping new traps: Total exposure + resting bids >= 65% Dry Powder Guard.")
+        return alerts, lines
 
     pool = CORE_POOL + MOMENTUM_POOL
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1464,6 +1478,11 @@ def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bp
         return alerts, lines
 
     for ticker in pool:
+        if ((invested_now + resting_buy_notional + pending_predator_spend) / equity) >= 0.65:
+            break
+        if ((resting_buy_notional + pending_predator_spend) / equity) >= max_predator_cap:
+            break
+
         if ticker in positions_map or to_alpaca_pos_symbol(ticker) in positions_map:
             continue
 
@@ -1493,6 +1512,7 @@ def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bp
                     take_profit={"limit_price": trap["Snapback TP"]},
                     stop_loss={"stop_price": trap["Hard Stop"]}
                 )
+                pending_predator_spend += trap["Capital Req"]
                 action_taken = f"Armed {trap['Cluster Type']} Trap: Limit Buy {trap['Qty']} @ ${trap['Predator Bid']} | TP ${trap['Snapback TP']}"
                 decision = "BULLISH [PREDATOR-FLUSH]"
                 alerts.append(f"🩸 **[PREDATOR TRAP ARMED] {ticker}**: {action_taken} (Cluster: `${trap['Cluster Level']}`)")
@@ -1501,12 +1521,6 @@ def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bp
                 time.sleep(0.35)
             except Exception as e:
                 logging.warning(f"Predator order failed for {ticker}: {e}")
-
-    if rows_to_append and sheet_ws:
-        try:
-            sheet_ws.append_rows(rows_to_append)
-        except Exception as e:
-            logging.warning(f"Predator sheet write warning: {e}")
 
     return alerts, lines
 

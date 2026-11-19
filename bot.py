@@ -1447,7 +1447,6 @@ def map_liquidity_clusters_and_bid(ticker, df_yf, equity, risk_bps):
         "Capital Req": round(qty * predator_bid, 2)
     }
 
-def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bps):
 def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bps, raw_positions=None, dynamic_caps=None, macro_ok=True):
     alerts = []
     lines = []
@@ -1521,6 +1520,12 @@ def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bp
                 time.sleep(0.35)
             except Exception as e:
                 logging.warning(f"Predator order failed for {ticker}: {e}")
+
+    if rows_to_append and sheet_ws:
+        try:
+            sheet_ws.append_rows(rows_to_append)
+        except Exception as e:
+            logging.warning(f"Predator sheet write warning: {e}")
 
     return alerts, lines
 

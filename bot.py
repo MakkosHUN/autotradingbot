@@ -1068,7 +1068,8 @@ def run_equity_tranche(
                     equity=equity,
                     candidate_returns=tech["returns_60d"] if tech else None,
                     held_returns_map=held_returns_map,
-                    dynamic_caps=dynamic_caps
+                    dynamic_caps=dynamic_caps,
+                    pending_tranche_spend=pending_tranche_spend
                 )
                 if not is_nyse_open:
                     decision = f"BULLISH (Radar | {regime_tag})"

@@ -1113,15 +1113,11 @@ def run_equity_tranche(
                             take_profit={'limit_price': target_price},
                             stop_loss={'stop_price': stop_price}
                         )
-                        decision = f"BULLISH [{regime_tag}]"
+                       decision = f"BULLISH [{regime_tag}]"
                         action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}"
                         pending_tranche_spend += (qty_to_buy * price)
                         if tech and "returns_60d" in tech:
                             held_returns_map[ticker] = tech["returns_60d"]
-                        try:
-                            raw_positions[:] = api.list_positions()
-                        except Exception:
-                            pass
                         tranche_alerts.append(f"🟢 **[{tranche_name} | {regime_tag}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, OBI: `{obi:+.2f}`, Comp: `{arb['composite']:+.2f}`)")
                     except Exception as e:
                         decision = f"BULLISH [{regime_tag}]"

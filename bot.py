@@ -388,7 +388,6 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
     remaining_pool = [t for t in pool if t not in always_include]
     slots_left = max(0, top_n - len(always_include))
     if slots_left == 0 or not remaining_pool:
-        if slots_left == 0 or not remaining_pool:
         return always_include
 
     yf_map = {to_yf_symbol(t): t for t in remaining_pool}

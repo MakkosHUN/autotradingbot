@@ -533,20 +533,21 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
         ):
             buy_signal = True
 
-        # Permanent Crypto Arbiter: Requires real news/OBI catalyst + uptrend confirmation
+        # Balanced Crypto Arbiter: Allows verified 1h uptrends when news/OBI are neutral (0.00)
         if strategy_mode == "crypto":
             is_crypto_trend_breakout = (
                 price > ema9 > ema20
                 and price >= vwap5
-                and 46.0 <= rsi <= 68.0
-                and obi_score >= 0.08
-                and finbert_score >= 0.15
+                and 50.0 <= rsi <= 68.0
+                and finbert_score >= 0.0
+                and obi_score >= -0.05
+                and (rel_vol >= 1.10 or finbert_score >= 0.15 or obi_score >= 0.08)
             )
             is_crypto_confirmed_reversal = (
-                rsi <= 30.0
+                rsi <= 32.0
                 and price > ema9  # Must already be bouncing above 9-EMA, never a free-falling knife
-                and obi_score >= 0.20  # Requires heavy +20% L2 order-book bid absorption
                 and finbert_score >= 0.05  # Blocks 0.000 "no-news" altcoin traps
+                and obi_score >= 0.10
             )
             if is_crypto_confirmed_reversal:
                 regime = "CRYPTO-REVERSAL"
@@ -1114,6 +1115,7 @@ def run_equity_tranche(
                         )
                         decision = f"BULLISH [{regime_tag}]"
                         action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}"
+                        pending_tranche_spend += (qty_to_buy * price)
                         if tech and "returns_60d" in tech:
                             held_returns_map[ticker] = tech["returns_60d"]
                         try:
@@ -1140,6 +1142,12 @@ def run_equity_tranche(
             sheet_ws.append_rows(rows_to_append)
         except Exception as e:
             logging.warning(f"Batch sheet write warning ({tranche_name}): {e}")
+
+    if pending_tranche_spend > 0:
+        try:
+            raw_positions[:] = api.list_positions()
+        except Exception:
+            pass
 
     return tranche_alerts, scan_lines
 

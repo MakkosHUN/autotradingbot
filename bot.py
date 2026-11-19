@@ -970,6 +970,7 @@ def run_equity_tranche(
     tranche_alerts = []
     scan_lines = []
     rows_to_append = []
+    pending_tranche_spend = 0.0
 
     for ticker in tickers:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")

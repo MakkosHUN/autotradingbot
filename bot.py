@@ -1105,7 +1105,7 @@ def run_equity_tranche(
                     decision = "BULLISH (Blocked: No Tech Data)"
                 elif require_sma200 and tech['price'] < tech['sma200']:
                     decision = f"BULLISH (Blocked: Below 200-SMA ${tech['sma200']:.2f})"
-                elif not require_sma200 and strategy_mode != "mean_rev" and tech['ema20'] < tech['sma50'] and regime_tag != "NEWS-90/10":
+                elif strategy_mode != "mean_rev" and tech['ema20'] < tech['sma50'] and regime_tag != "NEWS-90/10":
                     decision = "BULLISH (Blocked: 20-EMA < 50-SMA)"
                 elif tech['rsi14'] > arb["rsi_max"]:
                     decision = f"BULLISH (Blocked: RSI {tech['rsi14']:.1f} > {arb['rsi_max']:.0f})"
@@ -1176,6 +1176,7 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
     price = tech["price"] if tech else 12.0
 
     needs_hedge = (not macro_ok) or (net_gex_score <= -0.18)
+    hedge_notional_cap = 0.12 if not macro_ok else 0.08
 
     if owned_qty > 0 and macro_ok and net_gex_score > -0.05 and is_nyse_open:
         try:
@@ -1187,7 +1188,7 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
             logging.warning(f"Tail hedge unwind note: {e}")
     elif owned_qty == 0 and needs_hedge and is_nyse_open and tech is not None:
         atr = max(tech["atr14"], price * 0.01)
-        qty_to_buy = compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult=1.2, risk_bps=risk_bps, max_notional_pct=0.05, is_crypto=False)
+        qty_to_buy = compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult=1.2, risk_bps=risk_bps * 1.5, max_notional_pct=hedge_notional_cap, is_crypto=False)
         try:
             api.submit_order(symbol=hedge_sym, qty=qty_to_buy, side="buy", type="market", time_in_force="gtc")
             hedge_alerts.append(f"🛡️ **[v8.0 TAIL_HEDGE DEPLOYED] Bought {qty_to_buy} {hedge_sym} @ ~${price:.2f}**: Triggered by `{macro_reason}`")
@@ -1452,11 +1453,21 @@ def run_predator_tranche(equity, active_orders, positions_map, sheet_ws, risk_bp
     lines = []
     rows_to_append = []
 
-    if not macro_ok or equity <= 0:
+    if equity <= 0:
         return alerts, lines
 
     invested_now = sum(float(p.market_value) for p in (raw_positions or []))
     resting_buy_orders = [o for o in active_orders if o.side == 'buy' and o.type == 'limit' and getattr(o, 'limit_price', None)]
+
+    if not macro_ok or (invested_now / equity) >= 0.65:
+        for o in resting_buy_orders:
+            try:
+                api.cancel_order(o.id)
+            except Exception as e:
+                logging.warning(f"Predator trap cancel warning for {o.symbol}: {e}")
+        logging.info("[PREDATOR] Paused/cleared traps: Macro block or Exposure >= 65% Dry Powder Guard.")
+        return alerts, lines
+
     resting_buy_notional = sum(float(o.qty) * float(o.limit_price) for o in resting_buy_orders)
     max_predator_cap = (dynamic_caps or {}).get("PREDATOR", 0.15)
     pending_predator_spend = 0.0

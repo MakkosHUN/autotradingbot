@@ -285,7 +285,7 @@ def compute_rl_meta_allocation(engine_cfg, net_gex_score=0.0):
         for sh in safe_havens:
             adjusted_caps[sh] = round(min(0.50, adjusted_caps[sh] * 1.5), 3)
 
-    logging.info(f"[v8.6 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
+    logging.info(f"[v8.7 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
     return adjusted_caps
 
 # =====================================================================
@@ -305,6 +305,24 @@ def get_orderbook_imbalance(ticker):
                 return round((bid_sz - ask_sz) / (bid_sz + ask_sz), 3)
     except Exception as e:
         logging.warning(f"OBI fetch note for {ticker}: {e}")
+    return 0.0
+
+def get_spy_5d_return():
+    """Fetches SPY 5-trading-day return once per cycle for cross-engine relative strength confirmation."""
+    try:
+        spy_hist = yf.Ticker("SPY").history(period="15d").dropna(subset=["Close"])
+        if len(spy_hist) >= 6:
+            c_now = float(spy_hist["Close"].iloc[-1])
+            c_5d = float(spy_hist["Close"].iloc[-6])
+            if c_5d > 0 and not pd.isna(c_now) and not pd.isna(c_5d):
+                return round((c_now - c_5d) / c_5d, 4)
+        elif len(spy_hist) >= 2:
+            c_now = float(spy_hist["Close"].iloc[-1])
+            c_first = float(spy_hist["Close"].iloc[0])
+            if c_first > 0 and not pd.isna(c_now) and not pd.isna(c_first):
+                return round((c_now - c_first) / c_first, 4)
+    except Exception as e:
+        logging.warning(f"SPY 5D return fetch note: {e}")
     return 0.0
 
 def _bs_option_gamma(spot, strike, t_years, sigma, r=0.045):
@@ -536,7 +554,7 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
     return final_list
 
 # =====================================================================
-# 6. MATHEMATICAL ARBITER MATRIX (FEE-AWARE NET ALPHA FILTER)
+# 6. MATHEMATICAL ARBITER MATRIX & v8.7 MULTI-TIMEFRAME PERSISTENCE FILTER
 # =====================================================================
 def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05, base_exit_max=-0.15, strategy_mode="core"):
     if tech is None:
@@ -695,6 +713,146 @@ def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05
         "arbiter_exit_reason": arbiter_exit_reason,
         "fee_block_reason": fee_block_reason
     }
+
+def load_sheet_signal_history(sheet_ws, lookback_days=5):
+    """
+    Reads an engine's Google Sheet ONCE per cycle to compute:
+      1) Rolling 3-5 day average FinBERT sentiment per ticker
+      2) Whether the prior scan (5-180 min ago) staged a bullish confirmation (for 2-scan persistence)
+    """
+    history_map = {}
+    if not sheet_ws:
+        return history_map
+    try:
+        rows = sheet_ws.get_all_values()
+        if len(rows) <= 1:
+            return history_map
+
+        now_utc = datetime.now(timezone.utc)
+        cutoff_sec = lookback_days * 86400.0
+        per_ticker_scores = {}
+        per_ticker_latest = {}
+
+        for r in rows[-350:]:
+            if len(r) < 4:
+                continue
+            ts_raw = str(r[0]).strip()
+            sym = str(r[1]).strip().upper()
+            score_raw = str(r[2]).strip()
+            dec_raw = str(r[3]).strip()
+            if not sym or ts_raw == "Timestamp":
+                continue
+
+            row_dt = None
+            ts_clean = ts_raw.replace(" UTC", "").strip()[:19]
+            try:
+                row_dt = datetime.strptime(ts_clean, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            age_sec = (now_utc - row_dt).total_seconds()
+            if age_sec < 0 or age_sec > cutoff_sec:
+                continue
+
+            try:
+                s_val = float(score_raw)
+                per_ticker_scores.setdefault(sym, []).append(s_val)
+            except Exception:
+                pass
+
+            prev_latest = per_ticker_latest.get(sym)
+            if prev_latest is None or row_dt >= prev_latest[0]:
+                per_ticker_latest[sym] = (row_dt, dec_raw)
+
+        for sym in set(list(per_ticker_scores.keys()) + list(per_ticker_latest.keys())):
+            scores = per_ticker_scores.get(sym, [])
+            latest_info = per_ticker_latest.get(sym)
+            was_staged_prev = False
+            last_dec = ""
+            if latest_info is not None:
+                last_dt, last_dec = latest_info
+                age_min = (now_utc - last_dt).total_seconds() / 60.0
+                if 5.0 <= age_min <= 180.0:
+                    if ("STAGING 1/2" in last_dec) or ("EOD-WAIT" in last_dec):
+                        was_staged_prev = True
+                    elif ("BULLISH" in last_dec) and ("Blocked:" not in last_dec) and ("Owned" not in last_dec):
+                        was_staged_prev = True
+
+            history_map[sym] = {
+                "last_decision": last_dec,
+                "was_staged_prev": was_staged_prev,
+                "rolling_sent_avg": round(sum(scores) / len(scores), 3) if scores else None,
+                "sent_samples": len(scores)
+            }
+    except Exception as e:
+        logging.warning(f"Signal history read note: {e}")
+    return history_map
+
+def evaluate_multi_timeframe_confirmation(ticker, tranche_name, strategy_mode, score, tech, spy_5d_ret, hist_entry, ny_now):
+    """
+    v8.7 Multi-Timeframe Confirmation & Anti-Whipsaw Entry Gate:
+      - Anti-'Sell the News' reaction check (rejects positive news dumping below VWAP)
+      - 5-day rolling sentiment drift check (rejects sharply fading hype)
+      - 5-day relative strength vs. SPY for trend & catalyst engines
+      - End-of-Day entry window (15:15-15:59 NY) for CORE / COMMODITIES / DEFENSE
+      - 2-scan consecutive persistence for MOMENTUM / DISCOVERY / SMALL_CAP / CRYPTO
+      - Multi-day pullback + intraday stabilization for MEAN_REV
+    (Never delays exits, OCO self-healing, ratchets, or TAIL_HEDGE.)
+    """
+    rolling_avg = hist_entry.get("rolling_sent_avg") if hist_entry else None
+    sent_samples = hist_entry.get("sent_samples", 0) if hist_entry else 0
+    was_staged_prev = hist_entry.get("was_staged_prev", False) if hist_entry else False
+
+    sent_drift = round(score - rolling_avg, 3) if (rolling_avg is not None and sent_samples >= 2) else None
+    drift_txt = f"SentDrift {sent_drift:+.2f}" if sent_drift is not None else "SentDrift N/A"
+
+    ret_1d = float(tech.get("ret_1d", 0.0))
+    ret_5d = float(tech.get("ret_5d", 0.0))
+    candle_pos = float(tech.get("candle_pos", 0.5))
+    vwap5 = float(tech.get("vwap5", tech["price"]))
+    rs_5d = round(ret_5d - spy_5d_ret, 4)
+    rs_txt = f"5D-RS {rs_5d*100:+.1f}% vs SPY"
+
+    # 1. Anti-'Sell the News' Price-Reaction Filter
+    if strategy_mode != "mean_rev":
+        if score >= 0.25 and ret_1d < -0.015 and tech["price"] < vwap5:
+            return False, f"Blocked: Sell-The-News Dump ({ret_1d*100:+.1f}% < VWAP)", ""
+
+    # 2. Rolling 3-5D Sentiment Deterioration Filter (Equity Trend / Catalyst Engines)
+    if strategy_mode not in ["mean_rev", "crypto"] and sent_drift is not None:
+        if sent_drift < -0.20 and score < 0.35:
+            return False, f"Blocked: Fading 5D Sentiment ({drift_txt}, Avg {rolling_avg:+.2f})", ""
+
+    # 3. Mean-Reversion Multi-Day Exhaustion + Intraday Stabilization
+    if strategy_mode == "mean_rev":
+        if ret_5d > -0.010:
+            return False, f"Blocked: No 5D Pullback ({ret_5d*100:+.1f}% > -1.0%)", ""
+        if candle_pos < 0.30 and tech.get("mfm", 0.0) < -0.20:
+            return False, f"Blocked: Falling Knife (CandlePos {candle_pos:.2f}, MFM {tech.get('mfm', 0.0):+.2f})", ""
+        return True, "CONFIRMED", f"5D Pullback {ret_5d*100:+.1f}% | CandlePos {candle_pos:.2f}"
+
+    # 4. Crypto 2-Scan Consecutive Persistence
+    if strategy_mode == "crypto":
+        if not was_staged_prev:
+            return False, "STAGING 1/2 — Awaiting 2nd Scan Confirm", ""
+        return True, "CONFIRMED 2/2", f"2-Scan Confirmed | {drift_txt}"
+
+    # 5. Trend & Catalyst Equities: 5-Day Relative Strength vs. SPY
+    if rs_5d < -0.005:
+        return False, f"Blocked: Weak {rs_txt}", ""
+
+    # 6. Slow Swing & Safe-Haven Engines: End-of-Day Confirmation Window (15:15-15:59 NY)
+    if tranche_name in ["CORE", "COMMODITIES", "DEFENSE"]:
+        in_eod_window = (ny_now.hour == 15 and ny_now.minute >= 15)
+        if not in_eod_window:
+            return False, f"EOD-WAIT (Fires 15:15-15:59 NY | {rs_txt}, {drift_txt})", ""
+        return True, "EOD-CONFIRMED", f"EOD Confirmed | {rs_txt} | {drift_txt}"
+
+    # 7. Fast Catalyst Engines (MOMENTUM / DISCOVERY / SMALL_CAP): 2-Scan Consecutive Persistence
+    if not was_staged_prev:
+        return False, f"STAGING 1/2 — Awaiting 2nd Scan Confirm ({rs_txt})", ""
+
+    return True, "CONFIRMED 2/2", f"2-Scan Confirmed | {rs_txt} | {drift_txt}"
 
 def compute_atr_risk_parity_qty(equity, price, atr, sl_atr_mult, risk_bps=0.0045, max_notional_pct=0.040, is_crypto=False):
     if price <= 0 or equity <= 0:
@@ -903,10 +1061,17 @@ def get_technicals_and_atr(ticker):
 
         hl_range = float(df['High'].iloc[-1] - df['Low'].iloc[-1])
         mfm = float(((current_price - float(df['Low'].iloc[-1])) - (float(df['High'].iloc[-1]) - current_price)) / hl_range) if hl_range > 0 else 0.0
+        candle_pos = float((current_price - float(df['Low'].iloc[-1])) / hl_range) if hl_range > 0 else 0.5
+
         if is_crypto:
-            returns_60d = close.resample("1D").last().dropna().pct_change().dropna().tail(60)
+            daily_close = close.resample("1D").last().dropna()
+            returns_60d = daily_close.pct_change().dropna().tail(60)
+            ret_1d = float((daily_close.iloc[-1] - daily_close.iloc[-2]) / daily_close.iloc[-2]) if len(daily_close) >= 2 and float(daily_close.iloc[-2]) > 0 else 0.0
+            ret_5d = float((daily_close.iloc[-1] - daily_close.iloc[-6]) / daily_close.iloc[-6]) if len(daily_close) >= 6 and float(daily_close.iloc[-6]) > 0 else ret_1d
         else:
             returns_60d = close.pct_change().dropna().tail(60)
+            ret_1d = float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) if len(close) >= 2 and float(close.iloc[-2]) > 0 else 0.0
+            ret_5d = float((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) if len(close) >= 6 and float(close.iloc[-6]) > 0 else ret_1d
 
         return {
             "price": current_price,
@@ -920,6 +1085,9 @@ def get_technicals_and_atr(ticker):
             "rel_vol": rel_vol,
             "vwap5": vwap5,
             "mfm": round(mfm, 2),
+            "candle_pos": round(candle_pos, 3),
+            "ret_1d": round(ret_1d, 4),
+            "ret_5d": round(ret_5d, 4),
             "returns_60d": returns_60d
         }
     except Exception as e:
@@ -1389,12 +1557,16 @@ def run_equity_tranche(
     risk_bps,
     require_sma200=True,
     strategy_mode="core",
-    reserved_exposure_pct=0.0
+    reserved_exposure_pct=0.0,
+    spy_5d_ret=0.0,
+    ny_now=None
 ):
     tranche_alerts = []
     scan_lines = []
     rows_to_append = []
     pending_tranche_spend = 0.0
+    ny_clock = ny_now or datetime.now(ZoneInfo("America/New_York"))
+    signal_history = load_sheet_signal_history(sheet_ws, lookback_days=5)
 
     for ticker in tickers:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1565,35 +1737,52 @@ def run_equity_tranche(
                 elif tech['rsi14'] > arb["rsi_max"]:
                     decision = f"BULLISH (Blocked: RSI {tech['rsi14']:.1f} > {arb['rsi_max']:.0f})"
                 else:
-                    price = tech['price']
-                    atr = max(tech['atr14'], price * 0.01)
-                    qty_to_buy = compute_atr_risk_parity_qty(
-                        equity=equity, price=price, atr=atr,
-                        sl_atr_mult=sl_atr_mult, risk_bps=risk_bps,
-                        max_notional_pct=0.040, is_crypto=False
+                    # v8.7 Multi-Timeframe Confirmation, 5D RS vs SPY, Sentiment Drift & Persistence Gate
+                    mtf_ok, mtf_status, mtf_note = evaluate_multi_timeframe_confirmation(
+                        ticker=ticker,
+                        tranche_name=tranche_name,
+                        strategy_mode=strategy_mode,
+                        score=score,
+                        tech=tech,
+                        spy_5d_ret=spy_5d_ret,
+                        hist_entry=signal_history.get(ticker.upper()),
+                        ny_now=ny_clock
                     )
-
-                    adj_tp_mult = round(tp_atr_mult * arb["tp_adj"], 2)
-                    stop_price = round(min(price - (sl_atr_mult * atr), price - 0.05), 2)
-                    target_price = round(max(price + (adj_tp_mult * atr), price + 0.05), 2)
-
-                    try:
-                        api.submit_order(
-                            symbol=ticker, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc',
-                            order_class='bracket',
-                            take_profit={'limit_price': target_price},
-                            stop_loss={'stop_price': stop_price}
+                    if not mtf_ok:
+                        decision = f"BULLISH ({mtf_status})"
+                        if "STAGING 1/2" in mtf_status or "EOD-WAIT" in mtf_status:
+                            action_taken = mtf_status
+                    else:
+                        price = tech['price']
+                        atr = max(tech['atr14'], price * 0.01)
+                        qty_to_buy = compute_atr_risk_parity_qty(
+                            equity=equity, price=price, atr=atr,
+                            sl_atr_mult=sl_atr_mult, risk_bps=risk_bps,
+                            max_notional_pct=0.040, is_crypto=False
                         )
-                        decision = f"BULLISH [{regime_tag}]"
-                        trend_note = f" | EMA20 ${tech['ema20']:.2f}>=SMA50 ${tech['sma50']:.2f}" if tranche_name == "CORE" else ""
-                        action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}{trend_note}"
-                        pending_tranche_spend += (qty_to_buy * price)
-                        if tech and "returns_60d" in tech:
-                            held_returns_map[ticker] = tech["returns_60d"]
-                        tranche_alerts.append(f"🟢 **[{tranche_name} | {regime_tag}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, OBI: `{obi:+.2f}`, Comp: `{arb['composite']:+.2f}`)")
-                    except Exception as e:
-                        decision = f"BULLISH [{regime_tag}]"
-                        action_taken = f"Buy Failed: {e}"
+
+                        adj_tp_mult = round(tp_atr_mult * arb["tp_adj"], 2)
+                        stop_price = round(min(price - (sl_atr_mult * atr), price - 0.05), 2)
+                        target_price = round(max(price + (adj_tp_mult * atr), price + 0.05), 2)
+
+                        try:
+                            api.submit_order(
+                                symbol=ticker, qty=qty_to_buy, side='buy', type='market', time_in_force='gtc',
+                                order_class='bracket',
+                                take_profit={'limit_price': target_price},
+                                stop_loss={'stop_price': stop_price}
+                            )
+                            decision = f"BULLISH [{regime_tag} | {mtf_status}]"
+                            trend_note = f" | EMA20 ${tech['ema20']:.2f}>=SMA50 ${tech['sma50']:.2f}" if tranche_name == "CORE" else ""
+                            mtf_suffix = f" | {mtf_note}" if mtf_note else ""
+                            action_taken = f"Risk-Parity Bought {qty_to_buy} @ ~${price:.2f} | TP: ${target_price:.2f} ({adj_tp_mult}x ATR), SL: ${stop_price:.2f}{trend_note}{mtf_suffix}"
+                            pending_tranche_spend += (qty_to_buy * price)
+                            if tech and "returns_60d" in tech:
+                                held_returns_map[ticker] = tech["returns_60d"]
+                            tranche_alerts.append(f"🟢 **[{tranche_name} | {regime_tag}] BUY {ticker}**: {action_taken} (FinBERT: `{score:+.3f}`, OBI: `{obi:+.2f}`, Comp: `{arb['composite']:+.2f}`)")
+                        except Exception as e:
+                            decision = f"BULLISH [{regime_tag}]"
+                            action_taken = f"Buy Failed: {e}"
             elif score <= -0.10:
                 decision = f"BEARISH (Not Owned | {regime_tag})"
             else:
@@ -1673,7 +1862,7 @@ def run_tail_hedge_engine(raw_positions, positions_map, active_orders, equity, i
             logging.warning(f"Tail hedge buy note: {e}")
     else:
         status_str = f"Holding {int(owned_qty)} sh Active Shield" if owned_qty > 0 else f"Standby (GEX {net_gex_score:+.2f} Normal)"
-        decision = f"HOLD [TAIL_HEDGE]" if owned_qty > 0 else "STANDBY [TAIL_HEDGE]"
+        decision = "HOLD [TAIL_HEDGE]" if owned_qty > 0 else "STANDBY [TAIL_HEDGE]"
         action_taken = status_str
         hedge_lines.append(f"• **{hedge_sym}** `[TAIL_HEDGE]`: `{status_str}`")
 
@@ -1704,10 +1893,12 @@ def get_crypto_quote_and_spread(pair):
         logging.warning(f"Crypto quote check note for {pair}: {e}")
     return 0.0, 0.0, 0.0, 0.0
 
-def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, closed_orders_24h, equity, macro_ok, macro_reason, risk_bps):
+def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps, active_orders, closed_orders_24h, equity, macro_ok, macro_reason, risk_bps, ny_now=None):
     crypto_alerts = []
     scan_lines = []
     rows_to_append = []
+    ny_clock = ny_now or datetime.now(ZoneInfo("America/New_York"))
+    crypto_history = load_sheet_signal_history(crypto_sheet, lookback_days=5)
 
     # --- 1. BITCOIN MACRO REGIME SHIELD ---
     btc_headlines = get_fresh_dual_news("BTC/USD")
@@ -1805,40 +1996,57 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                 elif tech["price"] < tech["ema20"]:
                     decision = f"BULLISH (Blocked: Below 1h 20-EMA ${tech['ema20']:.2f})"
                 else:
-                    price = ask_px if ask_px > 0 else tech['price']
-                    atr = max(tech['atr14'], price * 0.015)
-                    # Size using 2.0x ATR stop distance so dollar risk is strictly capped
-                    qty_to_buy = compute_atr_risk_parity_qty(
-                        equity=equity, price=price, atr=atr,
-                        sl_atr_mult=2.0, risk_bps=risk_bps,
-                        max_notional_pct=0.030, is_crypto=True
+                    # v8.7 Crypto 2-Scan Persistence & Anti-'Sell the News' Filter
+                    mtf_ok, mtf_status, mtf_note = evaluate_multi_timeframe_confirmation(
+                        ticker=pair,
+                        tranche_name="CRYPTO",
+                        strategy_mode="crypto",
+                        score=score,
+                        tech=tech,
+                        spy_5d_ret=0.0,
+                        hist_entry=crypto_history.get(pair.upper()),
+                        ny_now=ny_clock
                     )
-                    price_decimals = 4 if price < 10.0 else 2
-                    limit_buy_px = round(price * 1.001, price_decimals)
+                    if not mtf_ok:
+                        decision = f"BULLISH ({mtf_status})"
+                        if "STAGING 1/2" in mtf_status:
+                            action_taken = mtf_status
+                    else:
+                        price = ask_px if ask_px > 0 else tech['price']
+                        atr = max(tech['atr14'], price * 0.015)
+                        # Size using 2.0x ATR stop distance so dollar risk is strictly capped
+                        qty_to_buy = compute_atr_risk_parity_qty(
+                            equity=equity, price=price, atr=atr,
+                            sl_atr_mult=2.0, risk_bps=risk_bps,
+                            max_notional_pct=0.030, is_crypto=True
+                        )
+                        price_decimals = 4 if price < 10.0 else 2
+                        limit_buy_px = round(price * 1.001, price_decimals)
 
-                    if qty_to_buy > 0:
-                        try:
-                            # Cancel any unfilled resting orders first so limit buys never stack
-                            cancel_existing_orders_for_ticker(pair, active_orders)
-                            api.submit_order(
-                                symbol=pair,
-                                qty=qty_to_buy,
-                                side='buy',
-                                type='limit',
-                                limit_price=limit_buy_px,
-                                time_in_force='ioc'
-                            )
-                            decision = f"BULLISH [{regime_tag}]"
-                            action_taken = f"Limit IOC Bought {qty_to_buy:.4f} @ ${limit_buy_px:.4f} (Spread {spread_pct*100:.2f}% | OBI {obi:+.2f})"
-                            held_returns_map[pair] = tech["returns_60d"]
+                        if qty_to_buy > 0:
                             try:
-                                raw_positions[:] = api.list_positions()
-                            except Exception:
-                                pass
-                            crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")
-                        except Exception as e:
-                            decision = f"BULLISH [{regime_tag}]"
-                            action_taken = f"Crypto Buy Failed: {e}"
+                                # Cancel any unfilled resting orders first so limit buys never stack
+                                cancel_existing_orders_for_ticker(pair, active_orders)
+                                api.submit_order(
+                                    symbol=pair,
+                                    qty=qty_to_buy,
+                                    side='buy',
+                                    type='limit',
+                                    limit_price=limit_buy_px,
+                                    time_in_force='ioc'
+                                )
+                                decision = f"BULLISH [{regime_tag} | {mtf_status}]"
+                                mtf_suffix = f" | {mtf_note}" if mtf_note else ""
+                                action_taken = f"Limit IOC Bought {qty_to_buy:.4f} @ ${limit_buy_px:.4f} (Spread {spread_pct*100:.2f}% | OBI {obi:+.2f}){mtf_suffix}"
+                                held_returns_map[pair] = tech["returns_60d"]
+                                try:
+                                    raw_positions[:] = api.list_positions()
+                                except Exception:
+                                    pass
+                                crypto_alerts.append(f"🪙 **[CRYPTO BUY | {regime_tag}] {pair}**: {action_taken} (FinBERT: `{score:+.3f}`, Comp: `{arb['composite']:+.2f}`)")
+                            except Exception as e:
+                                decision = f"BULLISH [{regime_tag}]"
+                                action_taken = f"Crypto Buy Failed: {e}"
             elif score <= -0.15:
                 decision = f"BEARISH (Not Owned | {regime_tag})"
             else:
@@ -2041,6 +2249,7 @@ def run_bot(mode="auto"):
             time.sleep(5)
 
     is_nyse_open = bool(clock.is_open)
+    ny_now = datetime.now(ZoneInfo("America/New_York"))
 
     # If triggered by fallback schedule while NYSE is closed, only run Crypto
     if mode in ["auto", "intraday"] and not is_nyse_open:
@@ -2059,6 +2268,7 @@ def run_bot(mode="auto"):
         return
 
     macro_ok, macro_reason, net_gex_score = check_macro_gex_and_circuit_breaker(equity, last_equity)
+    spy_5d_ret = get_spy_5d_return()
     dynamic_caps = compute_rl_meta_allocation(engine_cfg, net_gex_score)
 
     def should_run(eng_key):
@@ -2112,7 +2322,7 @@ def run_bot(mode="auto"):
                     reserved += (target_floor - opp_pct)
         return round(min(reserved, 0.15), 3)
 
-    # 1. Crash Protection First
+    # 1. Crash Protection First (Immediate, never delayed)
     if should_run("TAIL_HEDGE"):
         logging.info("=== Running Engine 7: v8.0 Options GEX & Tail-Hedge Overlay ===")
         th_alerts, th_lines = run_tail_hedge_engine(
@@ -2124,14 +2334,15 @@ def run_bot(mode="auto"):
         if th_lines:
             section_reports.append("🛡️ **Engine 7 — Options GEX & Tail-Hedge Overlay:**\n" + "\n".join(th_lines))
 
-    # 2. 24/7 Crypto AI Quant
+    # 2. 24/7 Crypto AI Quant (2-Scan Persistence)
     if should_run("CRYPTO"):
         logging.info("=== Running Engine 3: 24/7 Crypto AI Quant ===")
         alt_candidates = screen_top_candidates(CRYPTO_ALTS, top_n=4, owned_symbols=owned_symbols, mode="crypto", tranche_name="CRYPTO")
         crypto_candidates = list(dict.fromkeys(CRYPTO_MAJORS + alt_candidates))
         c_alerts, crypto_lines = run_crypto_tranche(
             crypto_candidates, raw_positions, positions_map, held_returns_map, dynamic_caps,
-            active_orders, closed_orders_24h, equity, macro_ok, macro_reason, engine_cfg.get("CRYPTO", {}).get("risk_bps", 0.0045)
+            active_orders, closed_orders_24h, equity, macro_ok, macro_reason,
+            engine_cfg.get("CRYPTO", {}).get("risk_bps", 0.0045), ny_now=ny_now
         )
         all_alerts.extend(c_alerts)
         if crypto_lines:
@@ -2148,7 +2359,8 @@ def run_bot(mode="auto"):
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=-0.10, exit_score_max=-0.30,
             sl_atr_mult=1.0, tp_atr_mult=1.8, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("MEAN_REV", {}).get("risk_bps", 0.0035), require_sma200=False, strategy_mode="mean_rev"
+            risk_bps=engine_cfg.get("MEAN_REV", {}).get("risk_bps", 0.0035), require_sma200=False,
+            strategy_mode="mean_rev", spy_5d_ret=spy_5d_ret, ny_now=ny_now
         )
         all_alerts.extend(mr_alerts)
         if mr_lines:
@@ -2164,7 +2376,8 @@ def run_bot(mode="auto"):
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.12,
             sl_atr_mult=1.2, tp_atr_mult=2.5, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("SMALL_CAP", {}).get("risk_bps", 0.0030), require_sma200=False, strategy_mode="small_cap"
+            risk_bps=engine_cfg.get("SMALL_CAP", {}).get("risk_bps", 0.0030), require_sma200=False,
+            strategy_mode="small_cap", spy_5d_ret=spy_5d_ret, ny_now=ny_now
         )
         all_alerts.extend(sc_alerts)
         if sc_lines:
@@ -2182,7 +2395,8 @@ def run_bot(mode="auto"):
                 equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
                 is_nyse_open=is_nyse_open, buy_score_min=0.15, exit_score_max=-0.15,
                 sl_atr_mult=1.2, tp_atr_mult=2.8, ratchet_trigger_pct=0.020,
-                risk_bps=engine_cfg.get("DISCOVERY", {}).get("risk_bps", 0.0035), require_sma200=False, strategy_mode="discovery"
+                risk_bps=engine_cfg.get("DISCOVERY", {}).get("risk_bps", 0.0035), require_sma200=False,
+                strategy_mode="discovery", spy_5d_ret=spy_5d_ret, ny_now=ny_now
             )
             all_alerts.extend(disc_alerts)
             if disc_lines:
@@ -2198,7 +2412,8 @@ def run_bot(mode="auto"):
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
             sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("COMMODITIES", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
+            risk_bps=engine_cfg.get("COMMODITIES", {}).get("risk_bps", 0.0035), require_sma200=True,
+            strategy_mode="core", spy_5d_ret=spy_5d_ret, ny_now=ny_now
         )
         all_alerts.extend(comm_alerts)
         if comm_lines:
@@ -2214,7 +2429,8 @@ def run_bot(mode="auto"):
             equity=equity, pdt_restricted=pdt_restricted, macro_ok=macro_ok, macro_reason=macro_reason,
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
             sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
-            risk_bps=engine_cfg.get("DEFENSE", {}).get("risk_bps", 0.0035), require_sma200=True, strategy_mode="core"
+            risk_bps=engine_cfg.get("DEFENSE", {}).get("risk_bps", 0.0035), require_sma200=True,
+            strategy_mode="core", spy_5d_ret=spy_5d_ret, ny_now=ny_now
         )
         all_alerts.extend(def_alerts)
         if def_lines:
@@ -2232,7 +2448,7 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.15,
             sl_atr_mult=1.5, tp_atr_mult=3.5, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("CORE", {}).get("risk_bps", 0.0050), require_sma200=True, strategy_mode="core",
-            reserved_exposure_pct=calc_reserved_opportunity_headroom()
+            reserved_exposure_pct=calc_reserved_opportunity_headroom(), spy_5d_ret=spy_5d_ret, ny_now=ny_now
         )
         all_alerts.extend(core_alerts)
         if core_lines:
@@ -2249,7 +2465,7 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.12,
             sl_atr_mult=1.0, tp_atr_mult=2.0, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("MOMENTUM", {}).get("risk_bps", 0.0040), require_sma200=False, strategy_mode="momentum",
-            reserved_exposure_pct=calc_reserved_opportunity_headroom()
+            reserved_exposure_pct=calc_reserved_opportunity_headroom(), spy_5d_ret=spy_5d_ret, ny_now=ny_now
         )
         all_alerts.extend(mom_alerts)
         if mom_lines:
@@ -2267,7 +2483,7 @@ def run_bot(mode="auto"):
         if pred_lines:
             section_reports.append("🩸 **Engine 8 — Liquidity Predator (Flush Hunter):**\n" + "\n".join(pred_lines))
 
-    # 7. Universal OCO Self-Healer & 3-Stage Ratchet Safety Net (Covers ALL open equities incl. SH & PREDATOR fills)
+    # 7. Universal OCO Self-Healer & 3-Stage Ratchet Safety Net (Immediate, covers ALL open equities incl. SH & PREDATOR fills)
     try:
         oco_alerts = enforce_oco_protection_all_positions(is_nyse_open=is_nyse_open)
         all_alerts.extend(oco_alerts)
@@ -2275,7 +2491,7 @@ def run_bot(mode="auto"):
         logging.error(f"[OCO-GUARD] Top-level safety net error: {e}")
 
     if all_alerts:
-        send_discord_alert("🚨 **AETHER QUANT v8.6 Execution Alert (Multi-Asset Suites • RL Defensive Meta • Fee-Aware Arbiter):**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **AETHER QUANT v8.7 Execution Alert (Multi-Timeframe Persistence • RL Defensive Meta • OCO Guard):**\n" + "\n".join(all_alerts))
 
     try:
         time.sleep(2)
@@ -2296,8 +2512,8 @@ def run_bot(mode="auto"):
         enabled_list = [k for k, v in engine_cfg.items() if v["enabled"]]
 
         detailed_report = (
-            f"💠 **AETHER QUANT v8.6 OMEGA Telemetry (Multi-Asset Suites • GEX Defensive Meta)**\n"
-            f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}`\n"
+            f"💠 **AETHER QUANT v8.7 OMEGA Telemetry (Multi-Timeframe Persistence • GEX Defensive Meta)**\n"
+            f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}` | 🧭 **SPY 5D:** `{spy_5d_ret*100:+.2f}%`\n"
             f"🎛️ **Active Engines ({len(enabled_list)}/10):** `{', '.join(enabled_list)}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"
             f"📅 **Today's Change:** `${day_pl:+,.2f}` (`{day_pl_pct:+.2f}%`) | 📊 **Open P/L:** `${total_unrealized_pl:+,.2f}`\n"

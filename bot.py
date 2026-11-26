@@ -28,6 +28,7 @@ API_KEY = os.environ.get("APCA_API_KEY_ID", "").strip()
 API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "").strip()
 BASE_URL = "https://paper-api.alpaca.markets"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 
 # Fallback to https://share.streamlit.io if DASHBOARD_URL secret is empty
 raw_dash_url = os.environ.get("DASHBOARD_URL", "").strip().rstrip("/")
@@ -51,10 +52,21 @@ def repair_pem_key(pk_str):
         return f"{header}\n" + "\n".join(lines) + f"\n{footer}\n"
     return pk_str
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+# Drop Google Drive API scope completely whenever GOOGLE_SHEET_ID is configured
+SCOPES = (
+    ["https://www.googleapis.com/auth/spreadsheets"]
+    if GOOGLE_SHEET_ID
+    else [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+)
+
+def open_trading_spreadsheet(gc_client):
+    if GOOGLE_SHEET_ID:
+        return gc_client.open_by_key(GOOGLE_SHEET_ID)
+    return gc_client.open("Auto-Trading Bot Log")
+
 CREDENTIALS_FILE = "service_account.json"
 spreadsheet = None
 
@@ -63,7 +75,7 @@ if os.path.exists(CREDENTIALS_FILE):
     try:
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
         gc = gspread.authorize(creds)
-        spreadsheet = gc.open("Auto-Trading Bot Log")
+        spreadsheet = open_trading_spreadsheet(gc)
     except Exception as e:
         logging.error(f"Google Sheets File Auth Error: {e}")
 else:
@@ -85,7 +97,7 @@ else:
         try:
             creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
             gc = gspread.authorize(creds)
-            spreadsheet = gc.open("Auto-Trading Bot Log")
+            spreadsheet = open_trading_spreadsheet(gc)
         except Exception as e:
             logging.error(f"Google Sheets Env Auth Error: {e}")
             spreadsheet = None
@@ -235,7 +247,7 @@ def classify_symbol(sym):
     return "DISCOVERY"
 
 # =====================================================================
-# 3. v8.6 REINFORCEMENT LEARNING META-ALLOCATOR (GEX DEFENSIVE SHIFT)
+# 3. v8.8 REINFORCEMENT LEARNING META-ALLOCATOR (GEX DEFENSIVE SHIFT)
 # =====================================================================
 def compute_rl_meta_allocation(engine_cfg, net_gex_score=0.0):
     base_caps = {k: v["cap"] for k, v in engine_cfg.items()}
@@ -285,7 +297,7 @@ def compute_rl_meta_allocation(engine_cfg, net_gex_score=0.0):
         for sh in safe_havens:
             adjusted_caps[sh] = round(min(0.50, adjusted_caps[sh] * 1.5), 3)
 
-    logging.info(f"[v8.7 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
+    logging.info(f"[v8.8 RL META-ALLOCATOR] Dynamic Tranche Caps: {adjusted_caps}")
     return adjusted_caps
 
 # =====================================================================
@@ -436,7 +448,7 @@ def discover_market_wide_catalysts(owned_symbols, top_n=6):
         + [c.replace("/", "") for c in CRYPTO_POOL]
     )
 
-    # Always force-include every currently owned DISCOVERY ticker (fixes NTSK exit/ratchet blind spot)
+    # Always force-include every currently owned DISCOVERY ticker
     owned_discovery = []
     for sym in owned_symbols:
         s_clean = str(sym).strip().upper()
@@ -554,7 +566,7 @@ def screen_top_candidates(pool, top_n, owned_symbols, mode="core", tranche_name=
     return final_list
 
 # =====================================================================
-# 6. MATHEMATICAL ARBITER MATRIX & v8.7 MULTI-TIMEFRAME PERSISTENCE FILTER
+# 6. MATHEMATICAL ARBITER MATRIX & v8.8 MULTI-TIMEFRAME PERSISTENCE FILTER
 # =====================================================================
 def compute_arbiter_matrix(finbert_score, tech, obi_score=0.0, base_buy_min=0.05, base_exit_max=-0.15, strategy_mode="core"):
     if tech is None:
@@ -743,7 +755,6 @@ def load_sheet_signal_history(sheet_ws, lookback_days=5):
             if not sym or ts_raw == "Timestamp":
                 continue
 
-            row_dt = None
             ts_clean = ts_raw.replace(" UTC", "").strip()[:19]
             try:
                 row_dt = datetime.strptime(ts_clean, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -788,14 +799,25 @@ def load_sheet_signal_history(sheet_ws, lookback_days=5):
         logging.warning(f"Signal history read note: {e}")
     return history_map
 
-def evaluate_multi_timeframe_confirmation(ticker, tranche_name, strategy_mode, score, tech, spy_5d_ret, hist_entry, ny_now):
+def evaluate_multi_timeframe_confirmation(
+    ticker,
+    tranche_name,
+    strategy_mode,
+    score,
+    tech,
+    spy_5d_ret,
+    hist_entry,
+    ny_now,
+    regime_tag="",
+    next_close_ny=None
+):
     """
-    v8.7 Multi-Timeframe Confirmation & Anti-Whipsaw Entry Gate:
+    v8.8 Multi-Timeframe Confirmation & Anti-Whipsaw Entry Gate:
       - Anti-'Sell the News' reaction check (rejects positive news dumping below VWAP)
       - 5-day rolling sentiment drift check (rejects sharply fading hype)
       - 5-day relative strength vs. SPY for trend & catalyst engines
-      - End-of-Day entry window (15:15-15:59 NY) for CORE / COMMODITIES / DEFENSE
-      - 2-scan consecutive persistence for MOMENTUM / DISCOVERY / SMALL_CAP / CRYPTO
+      - Dynamic End-of-Day entry window (last 45 min before live clock.next_close) for CORE / COMMODITIES / DEFENSE
+      - 1-scan fast-track for high-conviction DISCOVERY NEWS-90/10 catalysts; 2-scan persistence otherwise
       - Multi-day pullback + intraday stabilization for MEAN_REV
     (Never delays exits, OCO self-healing, ratchets, or TAIL_HEDGE.)
     """
@@ -841,14 +863,32 @@ def evaluate_multi_timeframe_confirmation(ticker, tranche_name, strategy_mode, s
     if rs_5d < -0.005:
         return False, f"Blocked: Weak {rs_txt}", ""
 
-    # 6. Slow Swing & Safe-Haven Engines: End-of-Day Confirmation Window (15:15-15:59 NY)
+    # 6. Slow Swing & Safe-Haven Engines: Dynamic EOD Window (Last 45m before live NYSE close)
     if tranche_name in ["CORE", "COMMODITIES", "DEFENSE"]:
-        in_eod_window = (ny_now.hour == 15 and ny_now.minute >= 15)
-        if not in_eod_window:
-            return False, f"EOD-WAIT (Fires 15:15-15:59 NY | {rs_txt}, {drift_txt})", ""
-        return True, "EOD-CONFIRMED", f"EOD Confirmed | {rs_txt} | {drift_txt}"
+        if next_close_ny is not None:
+            mins_to_close = (next_close_ny - ny_now).total_seconds() / 60.0
+            in_eod_window = (0.0 <= mins_to_close <= 45.0)
+            win_start = (next_close_ny - timedelta(minutes=45)).strftime("%H:%M")
+            win_end = next_close_ny.strftime("%H:%M")
+            eod_window_lbl = f"{win_start}-{win_end} NY"
+        else:
+            in_eod_window = (ny_now.hour == 15 and ny_now.minute >= 15)
+            eod_window_lbl = "15:15-15:59 NY"
 
-    # 7. Fast Catalyst Engines (MOMENTUM / DISCOVERY / SMALL_CAP): 2-Scan Consecutive Persistence
+        if not in_eod_window:
+            return False, f"EOD-WAIT (Fires {eod_window_lbl} | {rs_txt}, {drift_txt})", ""
+        return True, "EOD-CONFIRMED", f"EOD Confirmed ({eod_window_lbl}) | {rs_txt} | {drift_txt}"
+
+    # 7. Fast Catalyst Engines: 1-Scan Fast Track strictly for high-conviction DISCOVERY NEWS-90/10
+    is_discovery_fast_track = (
+        tranche_name == "DISCOVERY"
+        and regime_tag == "NEWS-90/10"
+        and score >= 0.65
+        and float(tech.get("rel_vol", 1.0)) >= 1.8
+    )
+    if is_discovery_fast_track:
+        return True, "FAST-TRACK 1/1", f"High-Conviction NEWS-90/10 Fast-Track | {rs_txt} | {drift_txt}"
+
     if not was_staged_prev:
         return False, f"STAGING 1/2 — Awaiting 2nd Scan Confirm ({rs_txt})", ""
 
@@ -1107,8 +1147,13 @@ def was_crypto_sold_recently(pair, closed_orders, hours=4):
     for o in closed_orders:
         if to_alpaca_pos_symbol(o.symbol) == norm and o.side == 'sell' and o.status == 'filled':
             filled_at = getattr(o, 'filled_at', None)
-            if filled_at and hasattr(filled_at, 'tzinfo') and filled_at.tzinfo is not None:
-                if filled_at >= cutoff:
+            if filled_at is not None:
+                try:
+                    ft_ts = pd.Timestamp(filled_at)
+                    ft_ts = ft_ts.tz_localize("UTC") if ft_ts.tzinfo is None else ft_ts.tz_convert("UTC")
+                    if ft_ts.to_pydatetime() >= cutoff:
+                        return True
+                except Exception:
                     return True
             else:
                 return True
@@ -1301,8 +1346,8 @@ def replace_with_atomic_oco(symbol, qty, live_price, target_sl, target_tp, activ
 def enforce_oco_protection_all_positions(is_nyse_open=True):
     """
     Universal OCO Self-Healer & 3-Stage Ratchet Safety Net.
-    Runs across ALL open equity positions (CORE, MOMENTUM, DISCOVERY, MEAN_REV,
-    SMALL_CAP, COMMODITIES, DEFENSE, TAIL_HEDGE, and filled PREDATOR traps).
+    Covers ALL open equity positions. TAIL_HEDGE (SH/PSQ) keeps its wide disaster OCO
+    bracket and is exempt from Stage-1/2/3 ratcheting to prevent hedge churn.
     """
     guard_alerts = []
     try:
@@ -1336,7 +1381,9 @@ def enforce_oco_protection_all_positions(is_nyse_open=True):
         tech = get_technicals_and_atr(symbol)
         atr = max(tech["atr14"], live * 0.01) if (tech and tech.get("atr14")) else (live * 0.02)
 
-        if symbol in TAIL_HEDGE_POOL or symbol == "SQQQ":
+        is_tail_hedge = (tranche_tag == "TAIL_HEDGE") or (symbol in TAIL_HEDGE_POOL) or (symbol == "SQQQ")
+
+        if is_tail_hedge:
             base_sl = round(min(entry, live) * 0.965, 2)
             base_tp = round(max(entry, live) * 1.12, 2)
         elif tranche_tag == "CORE":
@@ -1357,27 +1404,29 @@ def enforce_oco_protection_all_positions(is_nyse_open=True):
 
         desired_sl = current_sl if current_sl is not None else base_sl
         stage_lbl = None
-        if ret_pct >= 0.060:
-            trail_sl = round(max(entry * 1.035, live - (1.2 * atr)), 2)
-            if trail_sl > desired_sl:
-                desired_sl = trail_sl
-                stage_lbl = "Stage-3 Chandelier Trail"
-        elif ret_pct >= 0.040:
-            s2_sl = round(entry * 1.020, 2)
-            if s2_sl > desired_sl:
-                desired_sl = s2_sl
-                stage_lbl = "Stage-2 (+2.0% Profit Lock)"
-        elif ret_pct >= 0.020:
-            s1_sl = round(entry * 1.002, 2)
-            if s1_sl > desired_sl:
-                desired_sl = s1_sl
-                stage_lbl = "Stage-1 Break-Even"
+        if not is_tail_hedge:
+            if ret_pct >= 0.060:
+                trail_sl = round(max(entry * 1.035, live - (1.2 * atr)), 2)
+                if trail_sl > desired_sl:
+                    desired_sl = trail_sl
+                    stage_lbl = "Stage-3 Chandelier Trail"
+            elif ret_pct >= 0.040:
+                s2_sl = round(entry * 1.020, 2)
+                if s2_sl > desired_sl:
+                    desired_sl = s2_sl
+                    stage_lbl = "Stage-2 (+2.0% Profit Lock)"
+            elif ret_pct >= 0.020:
+                s1_sl = round(entry * 1.002, 2)
+                if s1_sl > desired_sl:
+                    desired_sl = s1_sl
+                    stage_lbl = "Stage-1 Break-Even"
 
         desired_tp = current_tp if current_tp is not None else base_tp
 
         missing_leg = (current_sl is None) or (current_tp is None)
         needs_ratchet = (
-            is_nyse_open
+            (not is_tail_hedge)
+            and is_nyse_open
             and (current_sl is not None)
             and (desired_sl > current_sl + 0.05)
             and (desired_sl < live - 0.05)
@@ -1405,10 +1454,26 @@ def enforce_oco_protection_all_positions(is_nyse_open=True):
 
     return guard_alerts
 
-def find_last_buy_fill_price(symbol, closed_orders):
+def find_last_buy_fill_price(symbol, closed_orders, sell_time=None):
     norm = to_alpaca_pos_symbol(symbol)
+    sell_ts = None
+    if sell_time is not None:
+        try:
+            st_ts = pd.Timestamp(sell_time)
+            sell_ts = st_ts.tz_localize("UTC") if st_ts.tzinfo is None else st_ts.tz_convert("UTC")
+        except Exception:
+            sell_ts = None
+
     for o in closed_orders:
         if to_alpaca_pos_symbol(o.symbol) == norm and o.side == 'buy' and o.status in ['filled', 'partially_filled', 'canceled', 'expired'] and getattr(o, 'filled_avg_price', None):
+            if sell_ts is not None and getattr(o, 'filled_at', None) is not None:
+                try:
+                    bt_ts = pd.Timestamp(o.filled_at)
+                    bt_ts = bt_ts.tz_localize("UTC") if bt_ts.tzinfo is None else bt_ts.tz_convert("UTC")
+                    if bt_ts > sell_ts:
+                        continue
+                except Exception:
+                    pass
             return float(o.filled_avg_price)
     return 0.0
 
@@ -1430,7 +1495,7 @@ def compute_live_fill_slippage_bps(order):
         slip_bps = ((ref_px - fill_px) / ref_px) * 10000.0
     return round(slip_bps, 2), ref_px
 
-def sync_recent_closed_sells(closed_orders, active_orders=None):
+def sync_recent_closed_sells(closed_orders, active_orders=None, buy_lookup_orders=None):
     if not closed_sheet:
         return []
     new_fill_alerts = []
@@ -1450,6 +1515,7 @@ def sync_recent_closed_sells(closed_orders, active_orders=None):
                 logged_qty_by_order[base_id] = logged_qty_by_order.get(base_id, 0.0) + q_logged
 
         existing_slip_ids = set(slippage_sheet.col_values(10)) if slippage_sheet else set()
+        lookup_pool = buy_lookup_orders if buy_lookup_orders is not None else (closed_orders or [])
 
         # Combine closed orders and active orders so partial fills are logged immediately without waiting for completion
         combined_by_id = {}
@@ -1492,7 +1558,7 @@ def sync_recent_closed_sells(closed_orders, active_orders=None):
             filled_time = str(o.filled_at)[:19] if getattr(o, 'filled_at', None) else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             fill_price = float(o.filled_avg_price) if getattr(o, 'filled_avg_price', None) else 0.0
             engine_tag = classify_symbol(o.symbol)
-            entry_est = find_last_buy_fill_price(o.symbol, closed_orders or [])
+            entry_est = find_last_buy_fill_price(o.symbol, lookup_pool, sell_time=getattr(o, 'filled_at', None))
             if entry_est > 0 and fill_price > 0:
                 realized_pl = (fill_price - entry_est) * delta_qty
                 realized_pct = ((fill_price - entry_est) / entry_est) * 100.0
@@ -1559,7 +1625,8 @@ def run_equity_tranche(
     strategy_mode="core",
     reserved_exposure_pct=0.0,
     spy_5d_ret=0.0,
-    ny_now=None
+    ny_now=None,
+    next_close_ny=None
 ):
     tranche_alerts = []
     scan_lines = []
@@ -1690,11 +1757,11 @@ def run_equity_tranche(
                     pending_tranche_spend=pending_tranche_spend,
                     reserved_exposure_pct=reserved_exposure_pct
                 )
-                # MEAN_REV is allowed to buy oversold snapbacks during elevated VIX unless Circuit Breaker or SPY Panic Block tripped
+                # MEAN_REV buys snapbacks under elevated VIX (unless Circuit Breaker / SPY Panic);
+                # COMMODITIES & DEFENSE stay unlocked under NEG-GEX/VIX blocks (blocked only on Portfolio Circuit Breaker)
                 macro_blocked = (not macro_ok) and not (
-                    strategy_mode == "mean_rev"
-                    and "CIRCUIT BREAKER" not in macro_reason
-                    and "PANIC BLOCK" not in macro_reason
+                    (strategy_mode == "mean_rev" and "CIRCUIT BREAKER" not in macro_reason and "PANIC BLOCK" not in macro_reason)
+                    or (tranche_name in ["COMMODITIES", "DEFENSE"] and "CIRCUIT BREAKER" not in macro_reason)
                 )
                 # CORE strictly enforces 20-EMA >= 50-SMA (even on NEWS-90/10) for multi-week drawdown validation
                 core_trend_fail = (tranche_name == "CORE" and tech is not None and tech['ema20'] < tech['sma50'])
@@ -1737,7 +1804,7 @@ def run_equity_tranche(
                 elif tech['rsi14'] > arb["rsi_max"]:
                     decision = f"BULLISH (Blocked: RSI {tech['rsi14']:.1f} > {arb['rsi_max']:.0f})"
                 else:
-                    # v8.7 Multi-Timeframe Confirmation, 5D RS vs SPY, Sentiment Drift & Persistence Gate
+                    # v8.8 Multi-Timeframe Confirmation, Dynamic EOD Close, 5D RS vs SPY & Fast-Track Gate
                     mtf_ok, mtf_status, mtf_note = evaluate_multi_timeframe_confirmation(
                         ticker=ticker,
                         tranche_name=tranche_name,
@@ -1746,7 +1813,9 @@ def run_equity_tranche(
                         tech=tech,
                         spy_5d_ret=spy_5d_ret,
                         hist_entry=signal_history.get(ticker.upper()),
-                        ny_now=ny_clock
+                        ny_now=ny_clock,
+                        regime_tag=regime_tag,
+                        next_close_ny=next_close_ny
                     )
                     if not mtf_ok:
                         decision = f"BULLISH ({mtf_status})"
@@ -1996,7 +2065,7 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                 elif tech["price"] < tech["ema20"]:
                     decision = f"BULLISH (Blocked: Below 1h 20-EMA ${tech['ema20']:.2f})"
                 else:
-                    # v8.7 Crypto 2-Scan Persistence & Anti-'Sell the News' Filter
+                    # v8.8 Crypto 2-Scan Persistence & Anti-'Sell the News' Filter
                     mtf_ok, mtf_status, mtf_note = evaluate_multi_timeframe_confirmation(
                         ticker=pair,
                         tranche_name="CRYPTO",
@@ -2005,7 +2074,8 @@ def run_crypto_tranche(crypto_candidates, raw_positions, positions_map, held_ret
                         tech=tech,
                         spy_5d_ret=0.0,
                         hist_entry=crypto_history.get(pair.upper()),
-                        ny_now=ny_clock
+                        ny_now=ny_clock,
+                        regime_tag=regime_tag
                     )
                     if not mtf_ok:
                         decision = f"BULLISH ({mtf_status})"
@@ -2250,6 +2320,14 @@ def run_bot(mode="auto"):
 
     is_nyse_open = bool(clock.is_open)
     ny_now = datetime.now(ZoneInfo("America/New_York"))
+    next_close_ny = None
+    if is_nyse_open and getattr(clock, 'next_close', None) is not None:
+        try:
+            nc_ts = pd.Timestamp(clock.next_close)
+            nc_ts = nc_ts.tz_localize("UTC") if nc_ts.tzinfo is None else nc_ts.tz_convert("UTC")
+            next_close_ny = nc_ts.tz_convert("America/New_York").to_pydatetime()
+        except Exception as e:
+            logging.warning(f"clock.next_close parse note: {e}")
 
     # If triggered by fallback schedule while NYSE is closed, only run Crypto
     if mode in ["auto", "intraday"] and not is_nyse_open:
@@ -2299,10 +2377,29 @@ def run_bot(mode="auto"):
             logging.warning(f"Held return history note for {disp_sym}: {e}")
 
     active_orders = fetch_active_and_held_orders()
-    since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    closed_orders_24h = api.list_orders(status='closed', after=since_24h, limit=100)
 
-    automated_exit_alerts = sync_recent_closed_sells(closed_orders_24h, active_orders=active_orders)
+    # Fetch 30-day closed orders once so multi-day positions resolve real buy fills, and slice 24h for cooldowns
+    now_utc = datetime.now(timezone.utc)
+    since_30d = (now_utc - timedelta(days=30)).isoformat()
+    cutoff_24h = now_utc - timedelta(hours=24)
+    closed_orders_30d = api.list_orders(status='closed', after=since_30d, limit=300)
+    closed_orders_24h = []
+    for o in closed_orders_30d:
+        ts_ref = getattr(o, 'filled_at', None) or getattr(o, 'updated_at', None) or getattr(o, 'submitted_at', None)
+        if ts_ref is not None:
+            try:
+                ts_utc = pd.Timestamp(ts_ref)
+                ts_utc = ts_utc.tz_localize("UTC") if ts_utc.tzinfo is None else ts_utc.tz_convert("UTC")
+                if ts_utc.to_pydatetime() >= cutoff_24h:
+                    closed_orders_24h.append(o)
+            except Exception:
+                closed_orders_24h.append(o)
+
+    automated_exit_alerts = sync_recent_closed_sells(
+        closed_orders_24h,
+        active_orders=active_orders,
+        buy_lookup_orders=closed_orders_30d
+    )
     all_alerts = list(automated_exit_alerts)
     section_reports = []
 
@@ -2360,7 +2457,7 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=-0.10, exit_score_max=-0.30,
             sl_atr_mult=1.0, tp_atr_mult=1.8, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("MEAN_REV", {}).get("risk_bps", 0.0035), require_sma200=False,
-            strategy_mode="mean_rev", spy_5d_ret=spy_5d_ret, ny_now=ny_now
+            strategy_mode="mean_rev", spy_5d_ret=spy_5d_ret, ny_now=ny_now, next_close_ny=next_close_ny
         )
         all_alerts.extend(mr_alerts)
         if mr_lines:
@@ -2377,7 +2474,7 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.12,
             sl_atr_mult=1.2, tp_atr_mult=2.5, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("SMALL_CAP", {}).get("risk_bps", 0.0030), require_sma200=False,
-            strategy_mode="small_cap", spy_5d_ret=spy_5d_ret, ny_now=ny_now
+            strategy_mode="small_cap", spy_5d_ret=spy_5d_ret, ny_now=ny_now, next_close_ny=next_close_ny
         )
         all_alerts.extend(sc_alerts)
         if sc_lines:
@@ -2396,7 +2493,7 @@ def run_bot(mode="auto"):
                 is_nyse_open=is_nyse_open, buy_score_min=0.15, exit_score_max=-0.15,
                 sl_atr_mult=1.2, tp_atr_mult=2.8, ratchet_trigger_pct=0.020,
                 risk_bps=engine_cfg.get("DISCOVERY", {}).get("risk_bps", 0.0035), require_sma200=False,
-                strategy_mode="discovery", spy_5d_ret=spy_5d_ret, ny_now=ny_now
+                strategy_mode="discovery", spy_5d_ret=spy_5d_ret, ny_now=ny_now, next_close_ny=next_close_ny
             )
             all_alerts.extend(disc_alerts)
             if disc_lines:
@@ -2413,7 +2510,7 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
             sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("COMMODITIES", {}).get("risk_bps", 0.0035), require_sma200=True,
-            strategy_mode="core", spy_5d_ret=spy_5d_ret, ny_now=ny_now
+            strategy_mode="core", spy_5d_ret=spy_5d_ret, ny_now=ny_now, next_close_ny=next_close_ny
         )
         all_alerts.extend(comm_alerts)
         if comm_lines:
@@ -2430,7 +2527,7 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.20,
             sl_atr_mult=1.5, tp_atr_mult=3.0, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("DEFENSE", {}).get("risk_bps", 0.0035), require_sma200=True,
-            strategy_mode="core", spy_5d_ret=spy_5d_ret, ny_now=ny_now
+            strategy_mode="core", spy_5d_ret=spy_5d_ret, ny_now=ny_now, next_close_ny=next_close_ny
         )
         all_alerts.extend(def_alerts)
         if def_lines:
@@ -2448,7 +2545,8 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.10, exit_score_max=-0.15,
             sl_atr_mult=1.5, tp_atr_mult=3.5, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("CORE", {}).get("risk_bps", 0.0050), require_sma200=True, strategy_mode="core",
-            reserved_exposure_pct=calc_reserved_opportunity_headroom(), spy_5d_ret=spy_5d_ret, ny_now=ny_now
+            reserved_exposure_pct=calc_reserved_opportunity_headroom(), spy_5d_ret=spy_5d_ret,
+            ny_now=ny_now, next_close_ny=next_close_ny
         )
         all_alerts.extend(core_alerts)
         if core_lines:
@@ -2465,7 +2563,8 @@ def run_bot(mode="auto"):
             is_nyse_open=is_nyse_open, buy_score_min=0.05, exit_score_max=-0.12,
             sl_atr_mult=1.0, tp_atr_mult=2.0, ratchet_trigger_pct=0.020,
             risk_bps=engine_cfg.get("MOMENTUM", {}).get("risk_bps", 0.0040), require_sma200=False, strategy_mode="momentum",
-            reserved_exposure_pct=calc_reserved_opportunity_headroom(), spy_5d_ret=spy_5d_ret, ny_now=ny_now
+            reserved_exposure_pct=calc_reserved_opportunity_headroom(), spy_5d_ret=spy_5d_ret,
+            ny_now=ny_now, next_close_ny=next_close_ny
         )
         all_alerts.extend(mom_alerts)
         if mom_lines:
@@ -2483,7 +2582,7 @@ def run_bot(mode="auto"):
         if pred_lines:
             section_reports.append("🩸 **Engine 8 — Liquidity Predator (Flush Hunter):**\n" + "\n".join(pred_lines))
 
-    # 7. Universal OCO Self-Healer & 3-Stage Ratchet Safety Net (Immediate, covers ALL open equities incl. SH & PREDATOR fills)
+    # 7. Universal OCO Self-Healer & 3-Stage Ratchet Safety Net (TAIL_HEDGE exempt from ratcheting)
     try:
         oco_alerts = enforce_oco_protection_all_positions(is_nyse_open=is_nyse_open)
         all_alerts.extend(oco_alerts)
@@ -2491,7 +2590,7 @@ def run_bot(mode="auto"):
         logging.error(f"[OCO-GUARD] Top-level safety net error: {e}")
 
     if all_alerts:
-        send_discord_alert("🚨 **AETHER QUANT v8.7 Execution Alert (Multi-Timeframe Persistence • RL Defensive Meta • OCO Guard):**\n" + "\n".join(all_alerts))
+        send_discord_alert("🚨 **AETHER QUANT v8.8 Execution Alert (Calibrated Persistence • Safe-Haven Unlock • No-Churn Hedge):**\n" + "\n".join(all_alerts))
 
     try:
         time.sleep(2)
@@ -2512,7 +2611,7 @@ def run_bot(mode="auto"):
         enabled_list = [k for k, v in engine_cfg.items() if v["enabled"]]
 
         detailed_report = (
-            f"💠 **AETHER QUANT v8.7 OMEGA Telemetry (Multi-Timeframe Persistence • GEX Defensive Meta)**\n"
+            f"💠 **AETHER QUANT v8.8 OMEGA Telemetry (Dynamic EOD • Safe-Haven Unlock • No-Churn Hedge)**\n"
             f"🕒 **Time (NY):** `{ny_time.strftime('%Y-%m-%d %I:%M %p')}` | 🏦 **NYSE:** `{'OPEN' if is_nyse_open else 'CLOSED (24/7 Radar & Crypto)'}` | 🌍 **Regime:** `{macro_reason}` | 🧭 **SPY 5D:** `{spy_5d_ret*100:+.2f}%`\n"
             f"🎛️ **Active Engines ({len(enabled_list)}/10):** `{', '.join(enabled_list)}`\n"
             f"💰 **Total Equity:** `${equity:,.2f}` (All-Time: `${total_pl:+,.2f}` / `{total_pl_pct:+.2f}%`)\n"

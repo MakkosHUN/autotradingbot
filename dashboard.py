@@ -19,7 +19,7 @@ from google.oauth2.service_account import Credentials
 # 1. PAGE CONFIG & MILLION-DOLLAR OBSIDIAN QUANT CSS
 # =====================================================================
 st.set_page_config(
-    page_title="AETHER QUANT v8.6 // Omega Institutional Terminal",
+    page_title="AETHER QUANT v8.8 // Omega Institutional Terminal",
     page_icon="💠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -314,7 +314,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 10-Engine Disjoint Asset Pools (Strictly Synced with bot.py v8.6)
+# 10-Engine Disjoint Asset Pools (Strictly Synced with bot.py v8.8)
 CORE_TICKERS = [
     'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'JPM', 'WMT', 'JNJ', 'XOM', 'PG',
     'CAT', 'DIS', 'V', 'MA', 'UNH', 'HD', 'COST', 'ABBV', 'KO', 'PEP',
@@ -348,15 +348,15 @@ ALL_ASSETS = list(dict.fromkeys(
 ))
 
 DEFAULT_ENGINE_CONFIG = {
-    "CORE":        {"enabled": True, "cap": 0.35, "risk_bps": 0.0050, "freq": "2x/Day + Intraday",       "desc": "S&P 500 Blue-Chip Trend Equities"},
-    "MOMENTUM":    {"enabled": True, "cap": 0.25, "risk_bps": 0.0040, "freq": "14x/Day (Every 30m NYSE)", "desc": "High-Beta Tech & Growth Breakouts"},
-    "CRYPTO":      {"enabled": True, "cap": 0.15, "risk_bps": 0.0045, "freq": "48x/Day (Every 30m 24/7)", "desc": "24/7 Digital Asset Quant (48x/Day)"},
-    "DISCOVERY":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Real-Time Feed)", "desc": "Unconstrained Market-Wide News Catalyst Agent"},
-    "MEAN_REV":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Priority Scan)",  "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
-    "SMALL_CAP":   {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "freq": "14x/Day (Priority Scan)",  "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
-    "TAIL_HEDGE":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "freq": "Continuous Macro/GEX",     "desc": "v8.0 Options GEX & Inverse ETF Crash Shield"},
-    "COMMODITIES": {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "freq": "14x/Day (Safe Haven)",     "desc": "Precious Metals & Energy Hard Assets"},
-    "DEFENSE":     {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "freq": "14x/Day (Safe Haven)",     "desc": "Aerospace & Defense Safe Haven"},
+    "CORE":        {"enabled": True, "cap": 0.35, "risk_bps": 0.0050, "freq": "Dynamic EOD Window",       "desc": "S&P 500 Blue-Chip Trend Equities"},
+    "MOMENTUM":    {"enabled": True, "cap": 0.25, "risk_bps": 0.0040, "freq": "14x/Day (2-Scan Persist)", "desc": "High-Beta Tech & Growth Breakouts"},
+    "CRYPTO":      {"enabled": True, "cap": 0.15, "risk_bps": 0.0045, "freq": "48x/Day (2-Scan Persist)", "desc": "24/7 Digital Asset Quant (48x/Day)"},
+    "DISCOVERY":   {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (Fast-Track 90/10)","desc": "Unconstrained Market-Wide News Catalyst Agent"},
+    "MEAN_REV":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0035, "freq": "14x/Day (5D Pullback)",    "desc": "Statistical Arbitrage / Bollinger Oversold Snapback"},
+    "SMALL_CAP":   {"enabled": True, "cap": 0.10, "risk_bps": 0.0030, "freq": "14x/Day (2-Scan Persist)", "desc": "Russell 2000 & High-Velocity Speculative Breakouts"},
+    "TAIL_HEDGE":  {"enabled": True, "cap": 0.10, "risk_bps": 0.0050, "freq": "Continuous (No-Churn OCO)","desc": "v8.8 Options GEX & Inverse ETF Crash Shield"},
+    "COMMODITIES": {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "freq": "Dynamic EOD (VIX-Unlocked)","desc": "Precious Metals & Energy Hard Assets"},
+    "DEFENSE":     {"enabled": True, "cap": 0.10, "risk_bps": 0.0035, "freq": "Dynamic EOD (VIX-Unlocked)","desc": "Aerospace & Defense Safe Haven"},
     "PREDATOR":    {"enabled": True, "cap": 0.15, "risk_bps": 0.0050, "freq": "14x/Day (Limit Brackets)", "desc": "Engine 8: Retail Stop-Loss & Liquidity Flush Trapper"}
 }
 
@@ -393,6 +393,7 @@ def get_secret(key, default=""):
 API_KEY = str(get_secret("APCA_API_KEY_ID", "")).strip()
 API_SECRET = str(get_secret("APCA_API_SECRET_KEY", "")).strip()
 GOOGLE_CREDS_RAW = get_secret("GOOGLE_CREDENTIALS", "")
+GOOGLE_SHEET_ID = str(get_secret("GOOGLE_SHEET_ID", "")).strip()
 GITHUB_PAT_SECRET = str(get_secret("GITHUB_PAT", "")).strip().strip('"').strip("'")
 DISCORD_WEBHOOK_SECRET = str(get_secret("DISCORD_WEBHOOK_URL", "")).strip()
 BASE_URL = "https://paper-api.alpaca.markets"
@@ -448,14 +449,22 @@ def connect_gsheets():
         if not creds_dict:
             return None, "Invalid Google Credentials format."
 
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
+        # Drop Google Drive API scope completely whenever GOOGLE_SHEET_ID is configured
+        scopes = (
+            ["https://www.googleapis.com/auth/spreadsheets"]
+            if GOOGLE_SHEET_ID
+            else [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+        )
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
+        if GOOGLE_SHEET_ID:
+            sh = gc.open_by_key(GOOGLE_SHEET_ID)
+            return sh, "Connected (Sheets-Only)"
         sh = gc.open("Auto-Trading Bot Log")
-        return sh, "Connected"
+        return sh, "Connected (Drive Fallback)"
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
@@ -789,7 +798,7 @@ def fetch_macro_and_gex_telemetry():
     spy_chg, vix_val, spy_30d, net_gex = 0.0, 0.0, 0.0, 0.0
     try:
         spy_tk = yf.Ticker("SPY")
-        spy = spy_tk.history(period="1mo").dropna(subset=["Close"])
+        spy = spy_tk.history(period="1mo", auto_adjust=True).dropna(subset=["Close"])
         vix = yf.Ticker("^VIX").history(period="5d").dropna(subset=["Close"])
         spot_spy = 0.0
         if len(spy) >= 2:
@@ -862,6 +871,23 @@ def fetch_macro_and_gex_telemetry():
     macro_ok = (spy_chg > -1.5) and (vix_val <= 28.0) and not (vix_val > 24.0 and net_gex < -0.15)
     return macro_ok, spy_chg, vix_val, spy_30d, net_gex
 
+@st.cache_data(ttl=120)
+def fetch_spy_adj_history(period="3mo"):
+    """Fetches dividend-adjusted SPY daily close series indexed by naive NY trading date."""
+    try:
+        df = yf.Ticker("SPY").history(period=period, auto_adjust=True)
+        if not df.empty and "Close" in df.columns:
+            s = df["Close"].dropna().astype(float).copy()
+            idx = pd.to_datetime(s.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert("America/New_York").tz_localize(None)
+            s.index = idx.normalize()
+            s = s[~s.index.duplicated(keep="last")].sort_index()
+            return s
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
 @st.cache_data(ttl=300)
 def fetch_ticker_history(ticker, period="1y"):
     try:
@@ -905,21 +931,63 @@ def compute_portfolio_var_and_correlation(positions_tuple, equity):
 
     return round(var_95, 2), round(var_99, 2), round(cvar_95, 2), corr_matrix
 
-def compute_quant_metrics(port_hist, equity, spy_30d):
-    port_ret = ((equity - 100000.0) / 100000.0) * 100.0
-    alpha = port_ret - spy_30d
+def compute_quant_metrics(port_hist, equity, spy_30d, spy_adj_hist=None):
+    """
+    Computes annualized Sharpe, 30D Max Drawdown, annualized Volatility, and
+    exact date-matched Time-Weighted Return (TWR) Alpha against SPY Adjusted Close.
+    """
+    fallback_ret = ((equity - 100000.0) / 100000.0) * 100.0
+    fallback_alpha = fallback_ret - spy_30d
     if port_hist.empty or "equity" not in port_hist.columns:
-        return 0.0, 0.0, 0.0, alpha
-    eq_series = port_hist[port_hist["equity"] > 0]["equity"]
-    if len(eq_series) < 3:
-        return 0.0, 0.0, 0.0, alpha
+        return 0.0, 0.0, 0.0, fallback_alpha, fallback_ret, spy_30d, "30D Est."
+
+    df_valid = port_hist[port_hist["equity"] > 0].copy()
+    if len(df_valid) < 2:
+        return 0.0, 0.0, 0.0, fallback_alpha, fallback_ret, spy_30d, "30D Est."
+
+    idx_p = pd.to_datetime(df_valid.index)
+    if idx_p.tz is not None:
+        idx_p = idx_p.tz_convert("America/New_York").tz_localize(None)
+    df_valid.index = idx_p.normalize()
+    df_valid = df_valid[~df_valid.index.duplicated(keep="last")].sort_index()
+
+    eq_series = df_valid["equity"].astype(float).copy()
+    today_ny = pd.Timestamp(datetime.now(ZoneInfo("America/New_York")).date())
+    if equity > 0:
+        if today_ny == eq_series.index[-1]:
+            eq_series.loc[today_ny] = float(equity)
+        elif today_ny > eq_series.index[-1] and abs(float(equity) - float(eq_series.iloc[-1])) > 0.01:
+            eq_series.loc[today_ny] = float(equity)
+
+    if len(eq_series) < 2:
+        return 0.0, 0.0, 0.0, fallback_alpha, fallback_ret, spy_30d, "30D Est."
+
     rets = eq_series.pct_change().dropna()
+    port_twr_pct = float(((1.0 + rets).prod() - 1.0) * 100.0)
+
+    start_dt = eq_series.index[0]
+    end_dt = eq_series.index[-1]
+    window_lbl = f"{start_dt.strftime('%b %d')}–{end_dt.strftime('%b %d')}"
+    spy_matched_pct = spy_30d
+
+    if spy_adj_hist is not None and not spy_adj_hist.empty:
+        s_start = spy_adj_hist[spy_adj_hist.index <= start_dt]
+        s_end = spy_adj_hist[spy_adj_hist.index <= end_dt]
+        if s_start.empty:
+            s_start = spy_adj_hist.iloc[:1]
+        if not s_start.empty and not s_end.empty:
+            p0 = float(s_start.iloc[-1])
+            p1 = float(s_end.iloc[-1])
+            if p0 > 0:
+                spy_matched_pct = ((p1 - p0) / p0) * 100.0
+
+    alpha = port_twr_pct - spy_matched_pct
     vol = float(rets.std() * np.sqrt(252) * 100.0) if len(rets) > 1 and rets.std() > 0 else 0.0
     sharpe = float((rets.mean() / rets.std()) * np.sqrt(252)) if len(rets) > 1 and rets.std() > 0 else 0.0
     roll_max = eq_series.cummax()
     dd = ((eq_series - roll_max) / roll_max) * 100.0
     max_dd = float(dd.min()) if not dd.empty else 0.0
-    return sharpe, max_dd, vol, alpha
+    return sharpe, max_dd, vol, alpha, port_twr_pct, spy_matched_pct, window_lbl
 
 def parse_sheet_tab(ws):
     try:
@@ -1073,8 +1141,8 @@ if "discord_cmd" in st.query_params:
 # =====================================================================
 if IS_ADMIN:
     with st.sidebar:
-        st.markdown("### 💠 AETHER QUANT `v8.6 OMEGA`")
-        st.caption("10-Engine Pod • L2 OBI • BS GEX • OCO Guard • 10k MC")
+        st.markdown("### 💠 AETHER QUANT `v8.8 OMEGA`")
+        st.caption("10-Engine Pod • MTF Persistence • BS GEX • OCO Guard • 10k MC")
 
         @st.fragment(run_every="30s")
         def sidebar_clocks():
@@ -1164,7 +1232,7 @@ if IS_ADMIN:
 
         st.markdown("#### 🛡️ System Safeguards")
         if spreadsheet:
-            st.caption("🟢 **Cloud Audit & Config Ledger:** `Connected`")
+            st.caption(f"🟢 **Cloud Audit & Config Ledger:** `{sheet_status}`")
         else:
             st.warning(f"🔴 **Sheets Disconnected:** `{sheet_status}`")
 
@@ -1529,8 +1597,8 @@ def render_strategy_engine_view(
         </div>
         <div class="kpi-card">
             <div class="kpi-label"><span>MICROSTRUCTURE & RATCHET</span><span>⚖️</span></div>
-            <div class="kpi-value">OCO + L2 OBI</div>
-            <span class="kpi-delta delta-neu">VWAP • Corr Guard • Atomic OCO</span>
+            <div class="kpi-value">OCO + MTF Gate</div>
+            <span class="kpi-delta delta-neu">5D-RS • Corr Guard • Atomic OCO</span>
         </div>
         <div class="kpi-card">
             <div class="kpi-label"><span>LATEST AI SIGNAL BREADTH</span><span>🧠</span></div>
@@ -1580,9 +1648,17 @@ def render_strategy_engine_view(
                 else:
                     range_progress = 50.0
 
-                if pl_pct >= 6.0:
+                # Reflect true broker stop-loss state; TAIL_HEDGE is exempt from ratcheting in v8.8
+                if tranche_key == "TAIL_HEDGE" or sym in TAIL_HEDGE_TICKERS:
+                    shield_status = "🛡️ Crash Shield OCO (No Ratchet)"
+                elif is_crypto:
+                    if pl_pct >= 3.0:
+                        shield_status = f"🛡️ +{pl_pct:.1f}% Open Gain (2x/4x ATR)"
+                    else:
+                        shield_status = "Dynamic 2x/4x ATR Guard"
+                elif sl_price and sl_price >= entry * 1.032:
                     shield_status = "🔥 STAGE-3 CHANDELIER TRAIL"
-                elif pl_pct >= 4.0 or (sl_price and sl_price >= entry * 1.015):
+                elif sl_price and sl_price >= entry * 1.015:
                     shield_status = "🔒 STAGE-2 (+2% PROFIT LOCKED)"
                 elif sl_price and sl_price >= entry - 0.01:
                     shield_status = "🛡️ STAGE-1 BREAK-EVEN LOCKED"
@@ -1688,6 +1764,7 @@ def render_live_terminal():
 
     is_open, account, positions, active_orders, recent_orders, port_hist = fetch_alpaca_state()
     macro_ok, spy_chg, vix_val, spy_30d, net_gex = fetch_macro_and_gex_telemetry()
+    spy_adj_hist = fetch_spy_adj_history(period="3mo")
     logs = fetch_all_sheet_logs()
     df_core = logs["CORE"]
     df_mom = logs["MOMENTUM"]
@@ -1719,7 +1796,9 @@ def render_live_terminal():
     invested = sum(p['market_value'] for p in positions)
     exposure_pct = (invested / equity) * 100 if equity > 0 else 0.0
 
-    sharpe, max_dd, ann_vol, bench_alpha = compute_quant_metrics(port_hist, equity, spy_30d)
+    sharpe, max_dd, ann_vol, bench_alpha, port_twr_pct, spy_matched_pct, alpha_win_lbl = compute_quant_metrics(
+        port_hist, equity, spy_30d, spy_adj_hist=spy_adj_hist
+    )
     pos_tuple = tuple((p["symbol"], float(p["market_value"])) for p in positions)
     var_95, var_99, cvar_95, corr_matrix = compute_portfolio_var_and_correlation(pos_tuple, equity)
     breaker_ok = day_pl_pct > -2.0
@@ -1774,8 +1853,8 @@ def render_live_terminal():
         <div class="brand-cluster">
             <div class="brand-orb"></div>
             <div>
-                <div class="brand-title">AETHER QUANTITATIVE COMMAND <span class="brand-version">v8.6 OMEGA INSTITUTIONAL</span></div>
-                <div class="brand-sub">10-Engine Multi-Asset Pod • Atomic OCO Self-Healer • Multi-Expiry BS GEX • RL Defensive Meta • Slippage Audit • 10k Monte Carlo</div>
+                <div class="brand-title">AETHER QUANTITATIVE COMMAND <span class="brand-version">v8.8 OMEGA INSTITUTIONAL</span></div>
+                <div class="brand-sub">10-Engine Multi-Asset Pod • Multi-Timeframe Persistence • Safe-Haven VIX Unlock • No-Churn Hedge • Multi-Expiry BS GEX • 10k Monte Carlo</div>
             </div>
         </div>
         <div class="badge-cluster">
@@ -1827,7 +1906,7 @@ def render_live_terminal():
     </div>
     """, unsafe_allow_html=True)
 
-    # 4. Quantitative Risk & Benchmark Alpha Telemetry Strip
+    # 4. Quantitative Risk & Date-Matched TWR Benchmark Alpha Telemetry Strip
     alpha_color = "#10B981" if bench_alpha >= 0 else "#F43F5E"
     st.markdown(f"""
     <div class="alpha-strip">
@@ -1844,8 +1923,8 @@ def render_live_terminal():
             <span class="alpha-val" style="color:{'#10B981' if net_gex>=0 else '#F43F5E'};">{net_gex:+.3f}</span>
         </div>
         <div class="alpha-item">
-            <span class="alpha-lbl">ALPHA VS. S&P 500 (30D):</span>
-            <span class="alpha-val" style="color:{alpha_color};">{bench_alpha:+.2f}%</span>
+            <span class="alpha-lbl">ALPHA VS. SPY ({alpha_win_lbl} TWR):</span>
+            <span class="alpha-val" style="color:{alpha_color};">{bench_alpha:+.2f}% <span style="color:#64748B; font-size:0.74rem; font-weight:500;">(Port {port_twr_pct:+.2f}% vs SPY {spy_matched_pct:+.2f}%)</span></span>
         </div>
         <div class="alpha-item">
             <span class="alpha-lbl">LIQUID DRY POWDER:</span>
@@ -1890,7 +1969,7 @@ def render_live_terminal():
     # VIEW 1: MASTER HEDGE FUND OVERVIEW & RL ATTRIBUTION
     # =================================================================
     if selected_page == nav_options[0]:
-        st.markdown('<div class="sec-title"><span class="sec-dot"></span>10-Engine Performance Attribution & v8.6 RL Policy Meta-Allocator</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-title"><span class="sec-dot"></span>10-Engine Performance Attribution & v8.8 RL Policy Meta-Allocator</div>', unsafe_allow_html=True)
         st.dataframe(
             df_attr,
             use_container_width=True,
@@ -2138,8 +2217,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[2]:
         render_strategy_engine_view(
-            engine_title="Engine 1: Core Blue-Chip Trend Equities (Arbiter + Strict 20-EMA >= 50-SMA + Atomic OCO)",
-            engine_subtitle="Mandate: S&P 500 Leaders • Price > 200-SMA & Strict 20-EMA >= 50-SMA Guard • 1.5x / 3.5x ATR Atomic GTC OCO Brackets",
+            engine_title="Engine 1: Core Blue-Chip Trend Equities (Dynamic EOD + 5D-RS + Strict 20-EMA >= 50-SMA)",
+            engine_subtitle="Mandate: S&P 500 Leaders • Dynamic Last-45m EOD Window + 5D-RS vs SPY • 1.5x / 3.5x ATR Atomic GTC OCO Brackets",
             tranche_key="CORE",
             universe_tickers=CORE_TICKERS,
             positions=positions,
@@ -2157,8 +2236,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[3]:
         render_strategy_engine_view(
-            engine_title="Engine 2: Tactical Short-Term Momentum (14x/Day High-Frequency • L2 OBI • 3-Stage Ratchet)",
-            engine_subtitle="Mandate: High-Beta Tech & Growth • Scans Every 30 Mins During NYSE Hours • 90/10 News Catalyst Runner or 10/90 VWAP Scalp",
+            engine_title="Engine 2: Tactical Short-Term Momentum (2-Scan Persistence • 5D-RS • 3-Stage Ratchet)",
+            engine_subtitle="Mandate: High-Beta Tech & Growth • 2-Scan Persistence Filter • 90/10 News Catalyst Runner or 10/90 VWAP Scalp",
             tranche_key="MOMENTUM",
             universe_tickers=MOMENTUM_TICKERS,
             positions=positions,
@@ -2176,8 +2255,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[4]:
         render_strategy_engine_view(
-            engine_title="Engine 3: 24/7 Crypto AI Quant (48x/Day Every 30 Mins • Spread Guard • BTC Regime Shield)",
-            engine_subtitle="Mandate: Round-the-Clock Liquid Crypto (Zero PDT) • 1h Candles • Max 0.35% Spread Guard • Dynamic 2.0x / 4.0x ATR Stops",
+            engine_title="Engine 3: 24/7 Crypto AI Quant (2-Scan Persistence • Spread Guard • BTC Regime Shield)",
+            engine_subtitle="Mandate: Round-the-Clock Liquid Crypto (Zero PDT) • 1h Candles • 2-Scan Confirm • Max 0.35% Spread • 2.0x / 4.0x ATR Stops",
             tranche_key="CRYPTO",
             universe_tickers=CRYPTO_PAIRS,
             positions=positions,
@@ -2196,8 +2275,8 @@ def render_live_terminal():
     elif selected_page == nav_options[5]:
         df_sub_disc = filter_sub_engine_log(df_disc, df_disc, "DISCOVERY")
         render_strategy_engine_view(
-            engine_title="Engine 4: Market-Wide AI Discovery Agent (Unconstrained Global Breaking News Hunter)",
-            engine_subtitle="Mandate: Scans Yahoo Gainers/Actives + Alpaca News Firehose • Owned Positions Pinned for Guaranteed Stage-3 OCO Ratchets",
+            engine_title="Engine 4: Market-Wide AI Discovery Agent (NEWS-90/10 Fast-Track 1/1 + 2-Scan Persistence)",
+            engine_subtitle="Mandate: Yahoo Gainers/Actives + Alpaca Firehose • Instant 1-Scan Fill on High-Conviction NEWS-90/10 • Owned Tickers Pinned",
             tranche_key="DISCOVERY",
             universe_tickers=MOMENTUM_TICKERS[:10] + SMALL_CAP_TICKERS[:10],
             positions=positions,
@@ -2215,8 +2294,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[6]:
         render_strategy_engine_view(
-            engine_title="Engine 5: Statistical Mean-Reversion (Priority Scan • Oversold Bollinger & RSI <= 38 Snapback)",
-            engine_subtitle="Mandate: Sector ETFs & Value Pullbacks • Scans Ahead of Core/Momentum • 92% 200-SMA Floor • VIX-Aware Snapback Entries",
+            engine_title="Engine 5: Statistical Mean-Reversion (5D Exhaustion + Intraday Stabilization Snapback)",
+            engine_subtitle="Mandate: Sector ETFs & Value Pullbacks • Requires >= 1% 5D Pullback + Buyers Off Lows • 92% 200-SMA Floor • VIX-Aware",
             tranche_key="MEAN_REV",
             universe_tickers=MEAN_REV_TICKERS,
             positions=positions,
@@ -2234,7 +2313,7 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[7]:
         render_strategy_engine_view(
-            engine_title="Engine 6: Small-Cap & High-Beta Speculative Breakouts (Priority Scan • Russell 2000 / AI / Space)",
+            engine_title="Engine 6: Small-Cap & High-Beta Speculative Breakouts (2-Scan Persistence • 5D-RS vs SPY)",
             engine_subtitle="Mandate: High-Velocity Volume Surges (IONQ, RKLB, ASTS, SMR, OKLO, HIMS) • Reserved Exposure Headroom • 0.30% Risk/Trade",
             tranche_key="SMALL_CAP",
             universe_tickers=SMALL_CAP_TICKERS,
@@ -2253,8 +2332,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[8]:
         render_strategy_engine_view(
-            engine_title="Engine 7: v8.6 Multi-Expiry BS Options GEX & Inverse ETF Tail-Hedge Shield (SH / PSQ)",
-            engine_subtitle="Mandate: Automated Crash Protection • Deploys Bracketed SH (-3.5% SL / +12% TP) When Macro Shield Trips or SPY BS-GEX <= -0.18",
+            engine_title="Engine 7: v8.8 Multi-Expiry BS Options GEX & Inverse ETF Tail-Hedge Shield (SH / PSQ)",
+            engine_subtitle="Mandate: Automated Crash Protection • Bracketed SH (-3.5% SL / +12% TP, Exempt From Ratchet Churn) When Macro Trips or GEX <= -0.18",
             tranche_key="TAIL_HEDGE",
             universe_tickers=TAIL_HEDGE_TICKERS,
             positions=positions,
@@ -2272,8 +2351,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[9]:
         render_strategy_engine_view(
-            engine_title="Engine 8: Commodities & Hard Assets Safe Haven (GLD / SLV / USO)",
-            engine_subtitle="Mandate: Precious Metals & Energy Inflation / Risk-Off Hedge • RL Defensive Boost (+50% Cap) When SPY GEX <= -0.15",
+            engine_title="Engine 8: Commodities & Hard Assets Safe Haven (GLD / SLV / USO — VIX-Unlocked)",
+            engine_subtitle="Mandate: Precious Metals & Energy Hedge • Unlocked Under NEG-GEX/VIX Blocks • Dynamic EOD + 5D-RS + RL Defensive Boost (+50% Cap)",
             tranche_key="COMMODITIES",
             universe_tickers=COMMODITY_TICKERS,
             positions=positions,
@@ -2291,8 +2370,8 @@ def render_live_terminal():
     # =================================================================
     elif selected_page == nav_options[10]:
         render_strategy_engine_view(
-            engine_title="Engine 9: Aerospace & Defense Safe Haven (LMT / RTX / NOC / GD)",
-            engine_subtitle="Mandate: Geopolitical & Macro Stress Alpha • RL Defensive Boost (+50% Cap) When SPY GEX <= -0.15 • 1.5x / 3.0x ATR Brackets",
+            engine_title="Engine 9: Aerospace & Defense Safe Haven (LMT / RTX / NOC / GD — VIX-Unlocked)",
+            engine_subtitle="Mandate: Geopolitical & Macro Stress Alpha • Unlocked Under NEG-GEX/VIX Blocks • Dynamic EOD + 5D-RS + 1.5x / 3.0x ATR Brackets",
             tranche_key="DEFENSE",
             universe_tickers=DEFENSE_TICKERS,
             positions=positions,
